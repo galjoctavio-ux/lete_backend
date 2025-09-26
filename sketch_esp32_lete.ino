@@ -718,22 +718,18 @@ void setup() {
     checkForHttpUpdate();
 }
 
-// --- FUNCIÓN DE LOOP PRINCIPAL ---
+// --- FUNCIÓN DE LOOP PRINCIPAL (VERSIÓN FINAL CORREGIDA) ---
 void loop() {
-    // 1. Tareas de Mantenimiento Esenciales (se ejecutan en cada ciclo)
+    // 1. Tareas de Mantenimiento Esenciales
     esp_task_wdt_reset();
     unsigned long currentMillis = millis();
-    ArduinoOTA.handle();
-    server.handleClient();
 
     // 2. Lógica de Pulsación Larga (Modo Configuración)
     if (digitalRead(BUTTON_PIN) == LOW) {
         if (!button_is_pressed) {
-            // Se acaba de presionar el botón, iniciar el temporizador
             button_press_start_time = currentMillis;
             button_is_pressed = true;
         } else {
-            // El botón se mantiene presionado, verificar si ya pasaron los 10 segundos
             if (currentMillis - button_press_start_time > LONG_PRESS_DURATION_MS) {
                 if (DEBUG_MODE) Serial.println("Pulsacion larga detectada. Iniciando modo configuracion...");
                 if(OLED_CONECTADA) drawGenericMessage("Modo Configuracion", "Soltar boton...");
@@ -750,13 +746,16 @@ void loop() {
             }
         }
     } else {
-        // El botón no está presionado, resetear el estado
         button_is_pressed = false;
     }
 
-    // 3. Tareas Periódicas (se ejecutan cada cierto tiempo)
+    // --> AJUSTE FINAL: Las tareas de red se ejecutan SÓLO si hay WiFi
+    if (WiFi.status() == WL_CONNECTED) {
+        ArduinoOTA.handle();
+        server.handleClient();
+    }
     
-    // Chequeo de conexión WiFi
+    // 3. Tareas Periódicas
     if (currentMillis - last_wifi_check > WIFI_CHECK_INTERVAL_MS) {
         last_wifi_check = currentMillis;
         if (WiFi.status() != WL_CONNECTED) {
@@ -765,26 +764,22 @@ void loop() {
         }
     }
 
-    // Chequeo de suscripción (lógica adaptable)
     unsigned long next_check_interval = subscription_active ? ACTIVE_SUB_CHECK_INTERVAL_MS : INACTIVE_SUB_CHECK_INTERVAL_MS;
     if (currentMillis - last_activation_check > next_check_interval) {
         last_activation_check = currentMillis;
         checkSubscriptionStatus();
     }
 
-    // Chequeo de actualización de firmware
     if (currentMillis - last_update_check > UPDATE_CHECK_INTERVAL_MS) {
         last_update_check = currentMillis;
         checkForHttpUpdate();
     }
 
-    // Chequeo de calibración remota (placeholder)
     if (currentMillis - last_remote_cal_check > REMOTE_CAL_CHECK_INTERVAL_MS) {
         last_remote_cal_check = currentMillis;
         checkForRemoteCalibration();
     }
 
-    // Medición y almacenamiento de datos
     if (currentMillis - last_measurement_time > MEASUREMENT_INTERVAL_MS) {
         last_measurement_time = currentMillis;
         if (lecturas_descartadas < LECTURAS_A_DESCARTAR) {
@@ -795,28 +790,25 @@ void loop() {
         }
     }
 
-    // 4. Procesamiento de la Cola del Buffer y actualización del contador
+    // 4. Procesamiento de la Cola del Buffer
     processBufferQueue();
     buffer_file_count = countBufferFiles();
 
-    // 5. Lógica de Pantalla OLED (con rotación dinámica)
+    // 5. Lógica de Pantalla OLED
     if (OLED_CONECTADA) {
         unsigned long current_rotation_interval = (screen_mode == 0) ? SCREEN_CONSUMPTION_INTERVAL_MS : SCREEN_OTHER_INTERVAL_MS;
         
-        // Cambiar de pantalla si el botón se presiona brevemente
         if (digitalRead(BUTTON_PIN) == LOW && (currentMillis - last_button_press > 500)) {
             last_button_press = currentMillis;
             screen_mode = (screen_mode + 1) % 3;
-            last_screen_change_time = currentMillis; // Resetear timer de rotación
+            last_screen_change_time = currentMillis;
         }
         
-        // Rotar pantalla automáticamente si ha pasado el tiempo
         if (currentMillis - last_screen_change_time > current_rotation_interval) {
             screen_mode = (screen_mode + 1) % 3;
             last_screen_change_time = currentMillis;
         }
 
-        // Mostrar la pantalla correspondiente
         if (pago_vencido) {
             drawPaymentDueScreen();
         } else {
@@ -828,7 +820,7 @@ void loop() {
         }
     }
     
-    // 6. Reinicio diario programado (última comprobación)
+    // 6. Reinicio diario programado
     if (currentMillis > DAILY_RESTART_INTERVAL_MS) {
         if (DEBUG_MODE) Serial.println("Reinicio diario programado. Reiniciando...");
         delay(1000);
