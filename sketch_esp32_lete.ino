@@ -1,6 +1,6 @@
 /*
 ==========================================================================
-== FIRMWARE LETE - MONITOR DE ENERGÍA v8.0
+== FIRMWARE LETE - MONITOR DE ENERGÍA v8.1
 ==
 == RESUMEN DE CAMBIOS v8.0 (Basado en análisis de robustez):
 == - SINCRONIZACIÓN DE NÚCLEOS: Implementados Mutex para proteger el acceso
@@ -58,7 +58,7 @@ const unsigned long SCREEN_OTHER_INTERVAL_MS = 15000;
 const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 15 * 60 * 1000; // --> AÑADIDO v7.0: Reintento de NTP cada 15 min
-const unsigned long SERVER_TASKS_INTERVAL_MS = 4 * 3600 * 1000UL; // --> AÑADIDO v7.0: Chequeos al servidor cada 4h
+const unsigned long SERVER_TASKS_INTERVAL_MS = 900 * 1000UL; // --> AÑADIDO v7.0: Chequeos al servidor cada 4h
 unsigned long bootTime = 0;
 
 // Configuración del Watchdog y Pulsación Larga
@@ -66,7 +66,7 @@ unsigned long bootTime = 0;
 #define LONG_PRESS_DURATION_MS 10000 // 10 segundos
 
 // Configuración del buffer en cola
-#define MAX_BUFFER_FILE_SIZE 8192 // 8 KB por archivo
+#define MAX_BUFFER_FILE_SIZE 4096 // 8 KB por archivo
 #define MAX_BUFFER_FILES 50       // Máximo de 50 archivos (50 * 8KB = 400 KB)
 
 // --- 3. CONFIGURACIÓN DE PINES ---
@@ -75,7 +75,6 @@ unsigned long bootTime = 0;
 #define OLED_RESET -1
 #define I2C_SDA 21
 #define I2C_SCL 22
-#define BUTTON_PIN 0
 const int VOLTAGE_SENSOR_PIN = 34;
 const int CURRENT_SENSOR_PIN_1 = 35;
 const int CURRENT_SENSOR_PIN_2 = 32;
@@ -180,22 +179,19 @@ const char* getWifiIcon(int rssi);
 
 // --- FUNCIONES DE LÓGICA PRINCIPAL ---
 
-// --- Tarea dedicada para el Núcleo 0 (Comunicaciones) con Watchdog ---
+// --- Tarea de Red con Lógica de Prioridad a la Cola en Vivo ---
 void networkTask(void * pvParameters) {
     if (DEBUG_MODE) Serial.println("Tarea de Red iniciada en Núcleo 0.");
-    
-    // --> AÑADIDO: Registrar esta tarea en el Watchdog
     esp_task_wdt_add(NULL);
 
     unsigned long last_ntp_sync_attempt = 0;
+
     for (;;) { // Bucle infinito para la tarea de red
-        
-        // --> AÑADIDO: Reiniciar el Watchdog en cada ciclo de la tarea
         esp_task_wdt_reset();
 
         if (WiFi.status() == WL_CONNECTED) {
             
-            // --- Lógica de Sincronización NTP Periódica ---
+            // --- Lógica de Sincronización NTP (no cambia) ---
             if (!time_synced && millis() - last_ntp_sync_attempt > NTP_RETRY_INTERVAL_MS) {
                 last_ntp_sync_attempt = millis();
                 if (DEBUG_MODE) Serial.println("[N0] Reintentando sincronizacion de hora NTP...");
@@ -203,7 +199,6 @@ void networkTask(void * pvParameters) {
                 
                 struct tm timeinfo;
                 if (getLocalTime(&timeinfo)) {
-                    // Protegemos la escritura de la variable compartida
                     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                         time_synced = true;
                         xSemaphoreGive(sharedVarsMutex);
@@ -214,25 +209,32 @@ void networkTask(void * pvParameters) {
                 }
             }
 
-            // --- Lógica de Procesamiento de Datos ---
+            // --- LÓGICA DE PROCESAMIENTO CON PRIORIDAD ABSOLUTA ---
             MeasurementData receivedData;
+            
+            // Primero, intentamos leer un dato de la cola en vivo.
             if (xQueueReceive(dataQueue, &receivedData, 0) == pdTRUE) {
+                // Si había un dato, lo enviamos. Damos prioridad a vaciar la cola.
                 sendDataToInflux(receivedData);
-            }
-            // Si no hay datos en vivo, intentar vaciar el buffer de archivos
-            else if (countBufferFiles() > 0) {
-                processBufferQueue();
+            } else {
+                // Si la cola en vivo está VACÍA, entonces y solo entonces,
+                // revisamos si hay trabajo pendiente en el buffer.
+                if (countBufferFiles() > 0) {
+                    if (DEBUG_MODE) Serial.println("[N0] Cola en vivo vacía. Procesando un archivo del buffer...");
+                    processBufferQueue();
+                }
             }
 
-            // --- Lógica de Tareas de Servidor (cada 4 horas) ---
+            // --- Lógica de Tareas de Servidor (no cambia) ---
             if (millis() - last_server_tasks_check > SERVER_TASKS_INTERVAL_MS) {
                 last_server_tasks_check = millis();
-                checkServerTasks(); // Esta función agrupa todas las llamadas a Supabase
+                checkServerTasks();
             }
         }
         
-        // Pausa para ceder tiempo al procesador
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // Reducimos el delay para que la tarea sea más responsiva y pueda vaciar
+        // la cola más rápido si es necesario.
+        vTaskDelay(pdMS_TO_TICKS(500)); // Delay reducido a 0.5 segundos
     }
 }
 
@@ -370,7 +372,7 @@ void writeToBuffer(const char* data_payload) {
     }
 }
 
-// --> Envía un struct de datos a InfluxDB (con escritura segura de server_status)
+// --> Envía un struct de datos a InfluxDB (con lógica de período de gracia)
 void sendDataToInflux(MeasurementData data) {
     char data_payload[300]; 
     int chars_written = snprintf(data_payload, sizeof(data_payload), 
@@ -383,14 +385,25 @@ void sendDataToInflux(MeasurementData data) {
         return;
     }
     
-    if (WiFi.status() != WL_CONNECTED || !subscription_active) {
-        if (DEBUG_MODE) Serial.println("[N0] Envío omitido. Guardando en buffer.");
+    // --- LECTURA SEGURA DE LAS VARIABLES DE ESTADO ---
+    bool sub_activa_local = false;
+    int dias_gracia_local = 0;
+    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        sub_activa_local = subscription_active;
+        dias_gracia_local = dias_de_gracia_restantes;
+        xSemaphoreGive(sharedVarsMutex);
+    }
+    
+    // --- LÓGICA DE DECISIÓN CORRECTA ---
+    // Enviar si el WiFi está conectado Y (la suscripción está activa O quedan días de gracia)
+    if (WiFi.status() != WL_CONNECTED || (!sub_activa_local && dias_gracia_local <= 0)) {
+        if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi o suscripción/gracia). Guardando en buffer.");
         writeToBuffer(data_payload);
         return;
     }
     
     HTTPClient http;
-    http.setTimeout(5000); // Timeout un poco más generoso
+    http.setTimeout(5000);
     http.begin(INFLUXDB_URL);
     http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
     http.addHeader("Content-Type", "text/plain");
@@ -412,14 +425,25 @@ void sendDataToInflux(MeasurementData data) {
     }
 }
 
-// --> Lógica segura y sin bloqueos para procesar la cola del buffer
+// --> Lógica segura para procesar la cola del buffer (con log de confirmación)
 void processBufferQueue() {
-    if (WiFi.status() != WL_CONNECTED || !subscription_active) return;
+    // --- Lógica de decisión ---
+    bool sub_activa_local = false;
+    int dias_gracia_local = 0;
+    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        sub_activa_local = subscription_active;
+        dias_gracia_local = dias_de_gracia_restantes;
+        xSemaphoreGive(sharedVarsMutex);
+    }
+
+    if (WiFi.status() != WL_CONNECTED || (!sub_activa_local && dias_gracia_local <= 0)) {
+        return;
+    }
 
     String filename_to_process;
     String payload_to_send;
 
-    // --- SECCIÓN CRÍTICA: SOLO LECTURA DEL ARCHIVO ---
+    // --- SECCIÓN CRÍTICA: LECTURA DEL ARCHIVO ---
     if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         File bufferFile;
         for (int i = 0; i < MAX_BUFFER_FILES; i++) {
@@ -430,23 +454,24 @@ void processBufferQueue() {
                     filename_to_process = current_filename;
                     payload_to_send = bufferFile.readString();
                     bufferFile.close();
-                    break; // Salimos al encontrar y leer el primer archivo
+                    break;
                 }
                 if(bufferFile) bufferFile.close();
             }
         }
-        // ¡LIBERAMOS EL MUTEX ANTES DE LA OPERACIÓN DE RED!
         xSemaphoreGive(spiffsMutex);
     } else {
         if (DEBUG_MODE) Serial.println("Timeout al esperar mutex en processBufferQueue (lectura).");
         return;
     }
-    // --- FIN DE LA SECCIÓN CRÍTICA ---
 
-    // --- OPERACIÓN DE RED: FUERA DEL MUTEX ---
+    // --- OPERACIÓN DE RED ---
     if (!payload_to_send.isEmpty()) {
+        
+        if (DEBUG_MODE) Serial.printf("[N0] Archivo %s leído (%d bytes). Intentando enviar...\n", filename_to_process.c_str(), payload_to_send.length());
+
         HTTPClient http;
-        http.setTimeout(8000); // Timeout más largo para archivos de buffer
+        http.setTimeout(8000);
         http.begin(INFLUXDB_URL);
         http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
         http.addHeader("Content-Type", "text/plain");
@@ -461,13 +486,13 @@ void processBufferQueue() {
         }
 
         if (status) {
-            if (DEBUG_MODE) Serial.printf("[N0] Buffer %s enviado. Eliminando archivo.\n", filename_to_process.c_str());
+            if (DEBUG_MODE) Serial.printf("[N0] ÉXITO: Buffer %s enviado. Eliminando archivo.\n", filename_to_process.c_str());
             if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 SPIFFS.remove(filename_to_process);
                 xSemaphoreGive(spiffsMutex);
             }
         } else {
-            if (DEBUG_MODE) Serial.printf("[N0] Error al enviar buffer %s. HTTP: %d.\n", filename_to_process.c_str(), httpCode);
+            if (DEBUG_MODE) Serial.printf("[N0] FALLO: Error al enviar buffer %s. HTTP: %d.\n", filename_to_process.c_str(), httpCode);
         }
     }
 }
@@ -483,8 +508,11 @@ void checkServerTasks() {
 
     HTTPClient http;
     http.setTimeout(8000); // Aumentamos timeout para robustez
+    //http.begin(TEST_FUNCTION_URL); 
     http.begin(urlConId);
+    http.addHeader("apikey", String(SUPABASE_ANON_KEY));
     http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
+
     int httpCode = http.GET();
 
     if (httpCode == HTTP_CODE_OK) {
@@ -541,7 +569,7 @@ void checkServerTasks() {
     http.end();
     
     // El chequeo de actualización de firmware (OTA) se mantiene separado
-    checkForHttpUpdate();
+    //checkForHttpUpdate();
 }
 
 // Busca actualizaciones de firmware remotas vía HTTP
@@ -874,7 +902,7 @@ void setup() {
 
     // 5. Intento de conexión WiFi
     WiFi.mode(WIFI_STA);
-    WiFi.begin();
+    WiFi.begin("Bitavo_red_2.4Gnormal", "Pegaso18");
     if (DEBUG_MODE) Serial.print("Conectando a WiFi...");
     byte Cnt = 0;
     while (WiFi.status() != WL_CONNECTED && Cnt < 30) {
