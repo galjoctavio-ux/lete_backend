@@ -98,6 +98,7 @@ struct MeasurementData {
     float irms2;
     float power;
     float leakage;
+    float temp_cpu;
 };
 QueueHandle_t dataQueue;
 
@@ -238,31 +239,26 @@ void saveCalibration() {
             xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
             return;
         }
-        
-    File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-    if (!file) {
-        if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-        return;
-    }
-    StaticJsonDocument<256> doc;
-    doc["voltage_cal"] = voltage_cal;
-    doc["current_cal_1"] = current_cal_1;
-    doc["current_cal_2"] = current_cal_2;
 
-    if (serializeJson(doc, file) == 0) {
-        if (DEBUG_MODE) Serial.println("Error al escribir en archivo temporal de calibracion");
-    } else {
-        if (DEBUG_MODE) Serial.println("Calibracion guardada en archivo temporal.");
-        file.close();
-        // Si la escritura fue exitosa, reemplazar el archivo original
-        SPIFFS.remove("/calibracion.json");
-        SPIFFS.rename("/calibracion.tmp", "/calibracion.json");
-        if (DEBUG_MODE) Serial.println("Archivo de calibracion actualizado.");
-    }
-    if(file) file.close();
-    // Liberamos el control de SPIFFS
+        StaticJsonDocument<256> doc;
+        doc["voltage_cal"] = voltage_cal;
+        doc["current_cal_1"] = current_cal_1;
+        doc["current_cal_2"] = current_cal_2;
+
+        if (serializeJson(doc, file) == 0) {
+            if (DEBUG_MODE) Serial.println("Error al escribir en archivo temporal de calibracion");
+        } else {
+            if (DEBUG_MODE) Serial.println("Calibracion guardada en archivo temporal.");
+            // Si la escritura fue exitosa, reemplazar el archivo original
+            SPIFFS.remove("/calibracion.json");
+            SPIFFS.rename("/calibracion.tmp", "/calibracion.json");
+            if (DEBUG_MODE) Serial.println("Archivo de calibracion actualizado.");
+        }
+        file.close(); // Siempre cerramos el archivo
+
+        // Liberamos el control de SPIFFS
         xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado en saveCalibration.");
     } else {
         if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
     }
@@ -270,161 +266,127 @@ void saveCalibration() {
 
 // --> Carga los valores de calibración desde SPIFFS al arrancar
 void loadCalibration() {
-    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
     if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
-            return;
-        }
-    if (SPIFFS.exists("/calibracion.json")) {
-        File file = SPIFFS.open("/calibracion.json", FILE_READ);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("No se pudo abrir el archivo de calibracion");
-            return;
-        }
-        StaticJsonDocument<256> doc;
-        DeserializationError error = deserializeJson(doc, file);
-        if (error) {
-            if (DEBUG_MODE) Serial.printf("Error al leer archivo de calibracion: %s\n", error.c_str());
+        if (SPIFFS.exists("/calibracion.json")) {
+            File file = SPIFFS.open("/calibracion.json", FILE_READ);
+            if (!file) {
+                if (DEBUG_MODE) Serial.println("No se pudo abrir el archivo de calibracion");
+                xSemaphoreGive(spiffsMutex); // Liberar en caso de error
+                return;
+            }
+
+            StaticJsonDocument<256> doc;
+            DeserializationError error = deserializeJson(doc, file);
+            if (error) {
+                if (DEBUG_MODE) Serial.printf("Error al leer archivo de calibracion: %s\n", error.c_str());
+                file.close();
+                xSemaphoreGive(spiffsMutex); // Liberar en caso de error
+                return;
+            }
+            
+            if (doc.containsKey("voltage_cal")) voltage_cal = doc["voltage_cal"];
+            if (doc.containsKey("current_cal_1")) current_cal_1 = doc["current_cal_1"];
+            if (doc.containsKey("current_cal_2")) current_cal_2 = doc["current_cal_2"];
+            
+            if (DEBUG_MODE) Serial.println("Calibracion cargada desde SPIFFS.");
             file.close();
-            return;
+        } else {
+            if (DEBUG_MODE) Serial.println("No se encontro archivo de calibracion, guardando valores por defecto.");
+            // saveCalibration() ya maneja su propio mutex, pero como ya lo tenemos,
+            // lo liberamos antes de llamar para evitar un deadlock.
+            xSemaphoreGive(spiffsMutex);
+            saveCalibration();
+            // Como saveCalibration ya liberó su propio mutex, no necesitamos liberarlo de nuevo.
+            // Retornamos para evitar la doble liberación al final de la función.
+            return; 
         }
-        
-        // Asignación segura, solo si la clave existe en el JSON
-        if (doc.containsKey("voltage_cal")) voltage_cal = doc["voltage_cal"];
-        if (doc.containsKey("current_cal_1")) current_cal_1 = doc["current_cal_1"];
-        if (doc.containsKey("current_cal_2")) current_cal_2 = doc["current_cal_2"];
-        
-        if (DEBUG_MODE) Serial.println("Calibracion cargada desde SPIFFS.");
-        file.close();
-    } else {
-        if (DEBUG_MODE) Serial.println("No se encontro archivo de calibracion, guardando valores por defecto.");
-        saveCalibration();
-    }
-    // Liberamos el control de SPIFFS
+
         xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado en loadCalibration.");
     } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en loadCalibration.");
     }
 }
 
-// --> MEJORA v6.0: Cuenta cuántos archivos de buffer existen
+// --> Cuenta cuántos archivos de buffer existen de forma segura
 int countBufferFiles() {
-    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
-    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
-            return;
-        }
     int count = 0;
-    for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-        String filename = "/buffer_" + String(i) + ".txt";
-        if (SPIFFS.exists(filename)) {
-            count++;
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+            String filename = "/buffer_" + String(i) + ".txt";
+            if (SPIFFS.exists(filename)) {
+                count++;
+            }
         }
+        // Liberamos el control de SPIFFS ANTES de salir de la función
+        xSemaphoreGive(spiffsMutex);
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en countBufferFiles.");
     }
     return count;
-    // Liberamos el control de SPIFFS
-        xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
-    } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
-    }
 }
 
-// --> MEJORA v6.0: Lógica para escribir datos en la cola del buffer
+// --> Lógica segura para escribir datos en la cola del buffer
 void writeToBuffer(const char* data_payload) {
-     // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
     if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
-            return;
+        String filename;
+        bool file_found = false;
+        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+            filename = "/buffer_" + String(i) + ".txt";
+            if (!SPIFFS.exists(filename)) {
+                file_found = true;
+                break;
+            }
+            File file = SPIFFS.open(filename, FILE_READ);
+            if (file && file.size() < MAX_BUFFER_FILE_SIZE) {
+                file.close();
+                file_found = true;
+                break;
+            }
+            if(file) file.close();
         }
-    String filename;
-    bool file_found = false;
-    for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-        filename = "/buffer_" + String(i) + ".txt";
-        if (!SPIFFS.exists(filename)) {
-            file_found = true;
-            break;
-        }
-        File file = SPIFFS.open(filename, FILE_READ);
-        if (file && file.size() < MAX_BUFFER_FILE_SIZE) {
-            file.close();
-            file_found = true;
-            break;
-        }
-        if(file) file.close();
-    }
 
-    if (!file_found) {
-        if (DEBUG_MODE) Serial.println("[N0] Buffer lleno, no se pueden crear más archivos. Dato descartado.");
-        return;
-    }
-
-    File bufferFile = SPIFFS.open(filename, FILE_APPEND);
-    if (bufferFile) {
-        bufferFile.print(data_payload);
-        bufferFile.close();
-        if (DEBUG_MODE) Serial.printf("[N0] Dato guardado en buffer: %s\n", filename.c_str());
-    }
-    // Liberamos el control de SPIFFS
+        if (!file_found) {
+            if (DEBUG_MODE) Serial.println("[N0] Buffer lleno. Dato descartado.");
+        } else {
+            File bufferFile = SPIFFS.open(filename, FILE_APPEND);
+            if (bufferFile) {
+                bufferFile.print(data_payload);
+                bufferFile.close();
+                if (DEBUG_MODE) Serial.printf("[N0] Dato guardado en buffer: %s\n", filename.c_str());
+            }
+        }
+        
         xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
     } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en writeToBuffer.");
     }
 }
 
 // Nueva función que envía un struct de datos a InfluxDB
 void sendDataToInflux(MeasurementData data) {
-    // --> MEJORA v7.0: Doble chequeo de seguridad al inicio de la función
-    if (WiFi.status() != WL_CONNECTED || !subscription_active) {
-          // --> MEJORA v8.0: Tamaño de buffer calculado y uso de snprintf
-        char data_payload[300];
-
- // --> MEJORA v8.0: Tamaño de buffer calculado y uso de snprintf
     char data_payload[300]; 
     
-    // snprintf previene desbordamientos. Devuelve el número de caracteres que se habrían escrito.
+    // Usamos snprintf para construir el payload de forma segura, previniendo desbordamientos.
+    // Añadimos el campo cpu_temp y un salto de línea (\n) al final, requerido por InfluxDB Line Protocol.
     int chars_written = snprintf(data_payload, sizeof(data_payload), 
-             "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f",
+             "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f\n",
              INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
              data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu);
 
-    // --> AÑADIDO v8.0: Validar que el buffer no se truncó
+    // Verificamos si hubo un error o si el texto fue truncado
     if (chars_written < 0 || chars_written >= sizeof(data_payload)) {
-        if (DEBUG_MODE) Serial.println("[N0] Error: El payload de datos era demasiado grande para el buffer.");
+        if (DEBUG_MODE) Serial.println("[N0] Error: El payload de datos era demasiado grande y fue truncado.");
         return; // No intentar enviar un payload corrupto
     }
     
-    // --> MEJORA v7.0: Doble chequeo de seguridad al inicio de la función
+    // Si no hay WiFi o la suscripción no está activa, guardamos en el buffer en lugar de enviar.
     if (WiFi.status() != WL_CONNECTED || !subscription_active) {
         if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi/suscripción). Guardando en buffer.");
         writeToBuffer(data_payload);
         return;
     }
-
-        sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
-                INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
-                data.vrms, data.irms1, data.irms2, data.power, data.leakage);
-        if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi/suscripción). Guardando en buffer.");
-        writeToBuffer(data_payload);
-        return; 
-    }
     
-    char data_payload[256];
-    sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
-            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
-            data.vrms, data.irms1, data.irms2, data.power, data.leakage);
-
     HTTPClient http;
     http.setTimeout(2000);
     http.begin(INFLUXDB_URL);
@@ -443,59 +405,55 @@ void sendDataToInflux(MeasurementData data) {
     http.end();
 }
 
-// --> MEJORA v6.0: Lógica para procesar y enviar datos desde la cola del buffer
+// --> Lógica segura para procesar y enviar datos desde la cola del buffer
 void processBufferQueue() {
-    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
-    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
-            return;
-        }
     if (WiFi.status() != WL_CONNECTED || !subscription_active) {
-        return; // No intentar enviar si no hay conexión o suscripción
+        return;
     }
 
     String filename;
-    File bufferFile;
-    bool file_found = false;
-    for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-        filename = "/buffer_" + String(i) + ".txt";
-        if (SPIFFS.exists(filename)) {
-            bufferFile = SPIFFS.open(filename, FILE_READ);
-            if (bufferFile && bufferFile.size() > 0) {
-                file_found = true;
-                break;
+    String payload_to_send;
+    bool file_processed = false;
+
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File bufferFile;
+        bool file_found = false;
+        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+            filename = "/buffer_" + String(i) + ".txt";
+            if (SPIFFS.exists(filename)) {
+                bufferFile = SPIFFS.open(filename, FILE_READ);
+                if (bufferFile && bufferFile.size() > 0) {
+                    file_found = true;
+                    break;
+                }
+                if(bufferFile) bufferFile.close();
             }
-            if(bufferFile) bufferFile.close();
         }
-    }
-    if (!file_found) return;
+        
+        if (file_found) {
+            payload_to_send = bufferFile.readString();
+            bufferFile.close();
 
-    String payload_to_send = bufferFile.readString();
-    bufferFile.close();
+            HTTPClient http;
+            http.setTimeout(4000);
+            http.begin(INFLUXDB_URL);
+            http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
+            http.addHeader("Content-Type", "text/plain");
+            
+            int httpCode = http.POST(payload_to_send);
+            server_status = (httpCode >= 200 && httpCode < 300);
 
-    HTTPClient http;
-    http.setTimeout(4000); // Damos un poco más de tiempo para archivos más grandes
-    http.begin(INFLUXDB_URL);
-    http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
-    http.addHeader("Content-Type", "text/plain");
-    
-    int httpCode = http.POST(payload_to_send);
-    server_status = (httpCode >= 200 && httpCode < 300);
-
-    if (server_status) {
-        if (DEBUG_MODE) Serial.printf("[N0] Buffer %s enviado. Eliminando archivo.\n", filename.c_str());
-        SPIFFS.remove(filename);
+            if (server_status) {
+                if (DEBUG_MODE) Serial.printf("[N0] Buffer %s enviado. Eliminando archivo.\n", filename.c_str());
+                SPIFFS.remove(filename);
+            } else {
+                if (DEBUG_MODE) Serial.printf("[N0] Error al enviar buffer %s. Codigo HTTP: %d.\n", filename.c_str(), httpCode);
+            }
+            http.end();
+        }
+        xSemaphoreGive(spiffsMutex);
     } else {
-        if (DEBUG_MODE) Serial.printf("[N0] Error al enviar buffer %s. Codigo HTTP: %d.\n", filename.c_str(), httpCode);
-    }
-    http.end();
-     xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
-    } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en processBufferQueue.");
     }
 }
 
@@ -635,6 +593,7 @@ void measureAndStoreData() {
     dataToSend.irms2 = latest_irms2;
     dataToSend.power = latest_power;
     dataToSend.leakage = latest_leakage;
+    dataToSend.temp_cpu = latest_temp_cpu;
 
     if (xQueueSend(dataQueue, &dataToSend, pdMS_TO_TICKS(100)) != pdTRUE) {
         if (DEBUG_MODE) Serial.println("[N1] La cola de datos está llena, medida descartada.");
@@ -643,72 +602,73 @@ void measureAndStoreData() {
 
 // --- FUNCIONES DE INTERFAZ WEB (SERVIDOR) ---
 
-// --> Página principal de la interfaz web
+// --> Página principal de la interfaz web, optimizada para evitar fragmentación de memoria
 void handleRoot() {
     if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
         return server.requestAuthentication();
     }
 
+    // Iniciamos la transmisión sin conocer la longitud total
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
 
-    String chunk;
+    // Buffer para construir pequeños trozos de HTML de forma segura
+    char chunk_buffer[512];
 
-    chunk = "<html><head><title>Monitor LETE</title>";
-    chunk += "<meta http-equiv='refresh' content='5'>";
+    // --- ENCABEZADO Y ESTILOS ---
+    server.sendContent("<html><head><title>Monitor LETE</title>");
+    server.sendContent("<meta http-equiv='refresh' content='5'>");
+    server.sendContent("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+    server.sendContent("<style>body{font-family:sans-serif;} h2{color:#005b96;}</style></head><body>");
 
-    char uptime_str[20];
+    // --- TÍTULO ---
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<h1>Monitor LETE v%.1f</h1>", FIRMWARE_VERSION);
+    server.sendContent(chunk_buffer);
+
+    // --- SECCIÓN DE ESTADO PRINCIPAL ---
+    server.sendContent("<h2>Estado Principal</h2>");
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Voltaje:</b> %.1f V</p>", latest_vrms);
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Corriente:</b> %.2f A</p>", latest_irms1);
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Potencia:</b> %.0f W</p>", latest_power);
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Fuga:</b> %.3f A</p>", latest_leakage);
+    server.sendContent(chunk_buffer);
+
+    // --- SECCIÓN DE CONECTIVIDAD ---
+    server.sendContent("<h2>Conectividad</h2>");
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Red:</b> %s (%d dBm)</p>", WiFi.SSID().c_str(), WiFi.RSSI());
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>IP:</b> %s</p>", WiFi.localIP().toString().c_str());
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Nube:</b> %s</p>", (server_status ? "OK" : "Error"));
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Suscripci&oacute;n:</b> %s</p>", (subscription_active ? "Activa" : "Inactiva"));
+    server.sendContent(chunk_buffer);
+
+    // --- SECCIÓN DE DIAGNÓSTICO DEL SISTEMA ---
+    server.sendContent("<h2>Diagnostico del Sistema</h2>");
     long uptime_seconds = millis() / 1000;
-    sprintf(uptime_str, "%dd %dh %dm", uptime_seconds / 86400, (uptime_seconds % 86400) / 3600, (uptime_seconds % 3600) / 60);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Uptime:</b> %ldd %ldh %ldm</p>", uptime_seconds / 86400, (uptime_seconds % 86400) / 3600, (uptime_seconds % 3600) / 60);
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Memoria Libre:</b> %u KB</p>", ESP.getFreeHeap() / 1024);
+    server.sendContent(chunk_buffer);
+    snprintf(chunk_buffer, sizeof(chunk_buffer), "<p><b>Archivos en Buffer:</b> %d</p>", buffer_file_count);
+    server.sendContent(chunk_buffer);
 
-    server.sendContent(chunk);
-    
-    chunk = "<h1>Monitor LETE v" + String(FIRMWARE_VERSION, 1) + "</h1>";
-    server.sendContent(chunk);
+    // --- SECCIÓN DE ACCIONES ---
+    server.sendContent("<h2>Acciones</h2>");
+    server.sendContent("<p><a href='/calibracion'>Ajustar Calibracion</a></p>");
+    server.sendContent("<p><a href='/update'>Buscar Actualizaciones de Firmware</a></p>");
+    server.sendContent("<p><a href='/reset-wifi'>Borrar Credenciales Wi-Fi</a></p>");
+    server.sendContent("<p><a href='/restart' onclick='return confirm(\"¿Estás seguro de que quieres reiniciar el dispositivo?\");'>Reiniciar Dispositivo</a></p>");
+    server.sendContent("<p style='color:red;'><a href='/factory-reset' onclick='return confirm(\"¡ACCIÓN DESTRUCTIVA!\\n¿Estás SEGURO de que quieres borrar TODOS los datos y reiniciar?\");'>Reseteo de Fábrica</a></p>");
 
-
-    String html = "<html><head><title>Monitor LETE</title>";
-    html += "<meta http-equiv='refresh' content='5'>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<style>body{font-family:sans-serif;} h2{color:#005b96;}</style></head><body>"; // Pequeño ajuste de estilo
-    html += "<h1>Monitor LETE v" + String(FIRMWARE_VERSION, 1) + "</h1>";
-    
-    html += "<h2>Estado Principal</h2>";
-    html += "<p><b>Voltaje:</b> " + String(latest_vrms, 1) + " V</p>";
-    html += "<p><b>Corriente:</b> " + String(latest_irms1, 2) + " A</p>";
-    html += "<p><b>Potencia:</b> " + String(latest_power, 0) + " W</p>";
-    html += "<p><b>Fuga:</b> " + String(latest_leakage, 3) + " A</p>";
-
-    html += "<h2>Conectividad</h2>";
-    html += "<p><b>Red:</b> " + WiFi.SSID() + " (" + String(WiFi.RSSI()) + " dBm)</p>";
-    html += "<p><b>IP:</b> " + WiFi.localIP().toString() + "</p>";
-    html += "<p><b>Nube:</b> " + String(server_status ? "OK" : "Error") + "</p>";
-    html += "<p><b>Suscripci&oacute;n:</b> " + String(subscription_active ? "Activa" : "Inactiva") + "</p>";
-
-    html += "<h2>Diagnostico del Sistema</h2>";
-    html += "<p><b>Uptime:</b> " + String(uptime_str) + "</p>";
-    html += "<p><b>Memoria Libre:</b> " + String(ESP.getFreeHeap() / 1024) + " KB</p>";
-
-    html += "<p><b>Archivos en Buffer:</b> " + String(buffer_file_count) + "</p>";
-
-    html += "<h2>Acciones</h2>";
-    html += "<p><a href='/calibracion'>Ajustar Calibracion</a></p>";
-    html += "<p><a href='/update'>Buscar Actualizaciones de Firmware</a></p>";
-    html += "<p><a href='/reset-wifi'>Borrar Credenciales Wi-Fi</a></p>";
-    html += "<p><a href='/restart' onclick='return confirm(\"¿Estás seguro de que quieres reiniciar el dispositivo?\");'>Reiniciar Dispositivo</a></p>";
-    // --- LÍNEA AÑADIDA ---
-    html += "<p style='color:red;'><a href='/factory-reset' onclick='return confirm(\"¡ACCIÓN DESTRUCTIVA!\\n¿Estás SEGURO de que quieres borrar TODOS los datos (WiFi, calibración) y reiniciar?\");'>Reseteo de Fábrica</a></p>";
-
-    html += "</body></html>";
-
-    char buffer[100];
-    snprintf(buffer, sizeof(buffer), "<h2>Estado Principal</h2><p><b>Voltaje:</b> %.1f V</p>", latest_vrms);
-    server.sendContent(buffer);
-
+    // --- FINAL DE LA PÁGINA ---
     server.sendContent("</body></html>");
-    server.sendContent(""); // Finaliza la transmisión
-
-    server.send(200, "text/html", html);
+    // Finalizamos la transmisión enviando un chunk vacío
+    server.sendContent("");
 }
 
 // --> Inicia una búsqueda de actualizaciones de firmware
@@ -780,50 +740,47 @@ void handleRestart() {
     ESP.restart();
 }
 
-// --> Borra todos los datos y reinicia (Wi-Fi y Calibración)
+// --> Borra todos los datos y reinicia (Wi-Fi y Calibración) de forma segura
 void handleFactoryReset() {
-    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
-    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
-        if (!file) {
-            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
-            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
-            return;
-        }
     if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
         return server.requestAuthentication();
     }
 
     if (DEBUG_MODE) Serial.println("Iniciando reseteo de fábrica...");
 
-    // Borrar credenciales de Wi-Fi
+    // Tomamos el control de SPIFFS para borrar los archivos de forma segura.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(5000)) == pdTRUE) { // Damos más tiempo para esta operación crítica
+        // Borrar archivo de calibración
+        if (SPIFFS.exists("/calibracion.json")) {
+            SPIFFS.remove("/calibracion.json");
+            if (DEBUG_MODE) Serial.println("Archivo de calibracion borrado.");
+        }
+
+        // Borrar todos los archivos del buffer en cola
+        if (DEBUG_MODE) Serial.println("Borrando archivos de buffer...");
+        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+            String filename = "/buffer_" + String(i) + ".txt";
+            if (SPIFFS.exists(filename)) {
+                SPIFFS.remove(filename);
+            }
+        }
+        
+        // Liberamos el mutex antes de las operaciones de red y reinicio.
+        xSemaphoreGive(spiffsMutex);
+    } else {
+        if (DEBUG_MODE) Serial.println("CRITICAL: Timeout al esperar el mutex en handleFactoryReset. Abortando borrado de archivos.");
+        server.send(500, "text/html", "<h1>Error Crítico</h1><p>No se pudo acceder al sistema de archivos para el reseteo. Inténtelo de nuevo.</p>");
+        return;
+    }
+
+    // Borrar credenciales de Wi-Fi (esto no toca SPIFFS)
     WiFiManager wm;
     wm.resetSettings();
     if (DEBUG_MODE) Serial.println("Credenciales Wi-Fi borradas.");
 
-    // Borrar archivo de calibración
-    if (SPIFFS.exists("/calibracion.json")) {
-        SPIFFS.remove("/calibracion.json");
-        if (DEBUG_MODE) Serial.println("Archivo de calibracion borrado.");
-    }
-
-    // --> MEJORA v6.0: Borrar todos los archivos del buffer en cola
-    if (DEBUG_MODE) Serial.println("Borrando archivos de buffer...");
-    for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-    String filename = "/buffer_" + String(i) + ".txt";
-    if (SPIFFS.exists(filename)) {
-        SPIFFS.remove(filename);
-    }
- }
-
-    server.send(200, "text/html", "<h1>Reseteo de Fábrica Completo</h1><p>El dispositivo se reiniciará en 2 segundos en modo de configuración.</p>");
+    server.send(200, "text/html", "<h1>Reseteo de Fábrica Completo</h1><p>El dispositivo se reiniciará en 2 segundos.</p>");
     delay(2000);
     ESP.restart();
-    xSemaphoreGive(spiffsMutex);
-        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
-    } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
-    }
 }
 
 // --- FUNCIÓN DE SETUP (VERSIÓN FINAL Y PULIDA) ---
@@ -946,7 +903,7 @@ void setup() {
  if (WiFi.status() == WL_CONNECTED) {
     if (DEBUG_MODE) Serial.println("Realizando chequeo inicial de tareas del servidor...");
     checkServerTasks();
-}
+ }
 
     // 9. Chequeo inicial de actualización de firmware
     delay(100);
