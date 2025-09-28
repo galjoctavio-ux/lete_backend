@@ -6,8 +6,9 @@
 
 void setupOLED() {
     if (OLED_CONECTADA) {
+        // --> AÑADIDO v8.0 (CRÍTICO)
+        Wire.begin(I2C_SDA, I2C_SCL); 
         delay(100); // --> MEJORA v7.0: Da tiempo al display para estabilizarse
-        Wire.begin(I2C_SDA, I2C_SCL);
         if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
             if (DEBUG_MODE) Serial.println(F("Fallo al iniciar SSD1306"));
         }

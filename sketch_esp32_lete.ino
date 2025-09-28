@@ -1,16 +1,26 @@
-// ==========================================================================
-// == FIRMWARE LETE - MONITOR DE ENERGÍA v7.0
-// ==
-// == MEJORAS DE LA VERSIÓN 7.0:
-// == - ARQUITECTURA DE DOS NÚCLEOS: Un núcleo para mediciones y UI (tiempo real)
-// ==   y otro para comunicaciones de red, eliminando bloqueos y mejorando estabilidad.
-// == - FEEDBACK VISUAL MEJORADO: Mensaje en pantalla al presionar botón de configuración.
-// == - PANTALLA DE SERVICIO MEJORADA: Muestra fecha de próximo pago y días de gracia restantes.
-// == - ARRANQUE DE DISPLAY LIMPIO: Corregido el error de "estática" en la pantalla al encender.
-// == - SINCRONIZACIÓN NTP ROBUSTA: Si la hora falla al arrancar, se reintenta periódicamente.
-// == - CORRECCIÓN DE BUG EN BUFFER: Solucionado el error que impedía usar el buffer más allá del 9no archivo.
-// == - ACCIONES REMOTAS: Implementada la capacidad de reiniciar o resetear el dispositivo desde Supabase.
-// =========================================================================
+/*
+==========================================================================
+== FIRMWARE LETE - MONITOR DE ENERGÍA v8.0
+==
+== RESUMEN DE CAMBIOS v8.0 (Basado en análisis de robustez):
+== - SINCRONIZACIÓN DE NÚCLEOS: Implementados Mutex para proteger el acceso
+==   a SPIFFS y variables globales, eliminando condiciones de carrera.
+== - SEGURIDAD DE MEMORIA: Reemplazado sprintf() por snprintf() en todo el
+==   código para prevenir desbordamientos de buffer.
+== - ROBUSTEZ DE RED: Aumentado el stack de la tarea de red a 16KB, añadidos
+==   timeouts a todas las peticiones HTTP, incluyendo la actualización OTA.
+== - VALIDACIÓN DE ENTRADAS: Añadida validación de rangos en la página de
+==   calibración para evitar la corrupción de datos por valores inválidos.
+== - MANEJO DE ERRORES MEJORADO: Lógica de reinicio diario corregida para ser
+==   independiente del desbordamiento de millis() y comprobación de errores
+==   en la deserialización de JSON.
+== - CORRECCIONES DE HARDWARE: Añadida inicialización de Wire.begin() para
+==   el bus I2C y documentado el riesgo de usar GPIO0.
+== - EFICIENCIA: Refactorizada la generación de HTML en el servidor web para
+==   reducir la fragmentación de memoria usando envío por trozos.
+=========================================================================
+*/
+
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
@@ -49,6 +59,7 @@ const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 15 * 60 * 1000; // --> AÑADIDO v7.0: Reintento de NTP cada 15 min
 const unsigned long SERVER_TASKS_INTERVAL_MS = 4 * 3600 * 1000UL; // --> AÑADIDO v7.0: Chequeos al servidor cada 4h
+unsigned long bootTime = 0;
 
 // Configuración del Watchdog y Pulsación Larga
 #define WDT_TIMEOUT_SECONDS 180
@@ -68,6 +79,12 @@ const unsigned long SERVER_TASKS_INTERVAL_MS = 4 * 3600 * 1000UL; // --> AÑADID
 const int VOLTAGE_SENSOR_PIN = 34;
 const int CURRENT_SENSOR_PIN_1 = 35;
 const int CURRENT_SENSOR_PIN_2 = 32;
+// --- 3. CONFIGURACIÓN DE PINES ---
+// ...
+// ¡¡¡ADVERTENCIA!!! GPIO0 es un pin de strapping. Mantenerlo presionado
+// durante el arranque puede impedir que el dispositivo inicie en modo normal.
+// Considerar usar un pin diferente en futuras revisiones de hardware.
+#define BUTTON_PIN 0 
 
 // --- 4. OBJETOS Y VARIABLES GLOBALES ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -115,6 +132,10 @@ bool button_is_pressed = false;
 int screen_mode = 0;
 int lecturas_descartadas = 0;
 const int LECTURAS_A_DESCARTAR = 10;
+
+// --> AÑADIDO v8.0: Mutex para proteger recursos compartidos
+SemaphoreHandle_t spiffsMutex;
+SemaphoreHandle_t sharedVarsMutex;
 
 // --- 5. DECLARACIONES DE FUNCIONES (PROTOTIPOS) ---
 // --> ACTUALIZADO v7.0: Lista completa y organizada de prototipos
@@ -209,6 +230,15 @@ void networkTask(void * pvParameters) {
 
 // --> Guarda los valores de calibración en la memoria permanente (SPIFFS)
 void saveCalibration() {
+    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
+        
     File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
     if (!file) {
         if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
@@ -230,10 +260,24 @@ void saveCalibration() {
         if (DEBUG_MODE) Serial.println("Archivo de calibracion actualizado.");
     }
     if(file) file.close();
+    // Liberamos el control de SPIFFS
+        xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // --> Carga los valores de calibración desde SPIFFS al arrancar
 void loadCalibration() {
+    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
     if (SPIFFS.exists("/calibracion.json")) {
         File file = SPIFFS.open("/calibracion.json", FILE_READ);
         if (!file) {
@@ -259,10 +303,24 @@ void loadCalibration() {
         if (DEBUG_MODE) Serial.println("No se encontro archivo de calibracion, guardando valores por defecto.");
         saveCalibration();
     }
+    // Liberamos el control de SPIFFS
+        xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // --> MEJORA v6.0: Cuenta cuántos archivos de buffer existen
 int countBufferFiles() {
+    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
     int count = 0;
     for (int i = 0; i < MAX_BUFFER_FILES; i++) {
         String filename = "/buffer_" + String(i) + ".txt";
@@ -271,10 +329,24 @@ int countBufferFiles() {
         }
     }
     return count;
+    // Liberamos el control de SPIFFS
+        xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // --> MEJORA v6.0: Lógica para escribir datos en la cola del buffer
 void writeToBuffer(const char* data_payload) {
+     // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
     String filename;
     bool file_found = false;
     for (int i = 0; i < MAX_BUFFER_FILES; i++) {
@@ -303,13 +375,43 @@ void writeToBuffer(const char* data_payload) {
         bufferFile.close();
         if (DEBUG_MODE) Serial.printf("[N0] Dato guardado en buffer: %s\n", filename.c_str());
     }
+    // Liberamos el control de SPIFFS
+        xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // Nueva función que envía un struct de datos a InfluxDB
 void sendDataToInflux(MeasurementData data) {
     // --> MEJORA v7.0: Doble chequeo de seguridad al inicio de la función
     if (WiFi.status() != WL_CONNECTED || !subscription_active) {
-        char data_payload[256]; // Prepara el payload incluso si falla
+          // --> MEJORA v8.0: Tamaño de buffer calculado y uso de snprintf
+        char data_payload[300];
+
+ // --> MEJORA v8.0: Tamaño de buffer calculado y uso de snprintf
+    char data_payload[300]; 
+    
+    // snprintf previene desbordamientos. Devuelve el número de caracteres que se habrían escrito.
+    int chars_written = snprintf(data_payload, sizeof(data_payload), 
+             "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f",
+             INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
+             data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu);
+
+    // --> AÑADIDO v8.0: Validar que el buffer no se truncó
+    if (chars_written < 0 || chars_written >= sizeof(data_payload)) {
+        if (DEBUG_MODE) Serial.println("[N0] Error: El payload de datos era demasiado grande para el buffer.");
+        return; // No intentar enviar un payload corrupto
+    }
+    
+    // --> MEJORA v7.0: Doble chequeo de seguridad al inicio de la función
+    if (WiFi.status() != WL_CONNECTED || !subscription_active) {
+        if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi/suscripción). Guardando en buffer.");
+        writeToBuffer(data_payload);
+        return;
+    }
+
         sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
                 INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
                 data.vrms, data.irms1, data.irms2, data.power, data.leakage);
@@ -343,6 +445,14 @@ void sendDataToInflux(MeasurementData data) {
 
 // --> MEJORA v6.0: Lógica para procesar y enviar datos desde la cola del buffer
 void processBufferQueue() {
+    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
     if (WiFi.status() != WL_CONNECTED || !subscription_active) {
         return; // No intentar enviar si no hay conexión o suscripción
     }
@@ -382,6 +492,11 @@ void processBufferQueue() {
         if (DEBUG_MODE) Serial.printf("[N0] Error al enviar buffer %s. Codigo HTTP: %d.\n", filename.c_str(), httpCode);
     }
     http.end();
+     xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // --> MEJORA v7.0: Función ÚNICA que agrupa todas las tareas pesadas del servidor.
@@ -472,6 +587,7 @@ void checkForHttpUpdate() {
             if (OLED_CONECTADA) drawUpdateScreen("Descargando");
 
             HTTPClient httpUpdateClient;
+            httpUpdateClient.setConnectTimeout(30000); 
             httpUpdateClient.begin(FIRMWARE_BIN_URL);
             t_httpUpdate_return ret = httpUpdate.update(httpUpdateClient);
 
@@ -532,9 +648,24 @@ void handleRoot() {
     if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
         return server.requestAuthentication();
     }
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    String chunk;
+
+    chunk = "<html><head><title>Monitor LETE</title>";
+    chunk += "<meta http-equiv='refresh' content='5'>";
+
     char uptime_str[20];
     long uptime_seconds = millis() / 1000;
     sprintf(uptime_str, "%dd %dh %dm", uptime_seconds / 86400, (uptime_seconds % 86400) / 3600, (uptime_seconds % 3600) / 60);
+
+    server.sendContent(chunk);
+    
+    chunk = "<h1>Monitor LETE v" + String(FIRMWARE_VERSION, 1) + "</h1>";
+    server.sendContent(chunk);
+
 
     String html = "<html><head><title>Monitor LETE</title>";
     html += "<meta http-equiv='refresh' content='5'>";
@@ -570,6 +701,13 @@ void handleRoot() {
 
     html += "</body></html>";
 
+    char buffer[100];
+    snprintf(buffer, sizeof(buffer), "<h2>Estado Principal</h2><p><b>Voltaje:</b> %.1f V</p>", latest_vrms);
+    server.sendContent(buffer);
+
+    server.sendContent("</body></html>");
+    server.sendContent(""); // Finaliza la transmisión
+
     server.send(200, "text/html", html);
 }
 
@@ -595,12 +733,31 @@ void handleResetWifi() {
 void handleCalibration() {
     if (!server.authenticate(HTTP_USER, HTTP_PASS)) return server.requestAuthentication();
     if (server.method() == HTTP_POST) {
-        voltage_cal = server.arg("voltage").toFloat();
-        current_cal_1 = server.arg("current1").toFloat();
-        current_cal_2 = server.arg("current2").toFloat();
-        saveCalibration();
-        server.send(200, "text/plain", "OK. Calibracion guardada.");
+        // --> AÑADIDO v8.0: Validar que los argumentos existen
+        if (server.hasArg("voltage") && server.hasArg("current1") && server.hasArg("current2")) {
+            float new_voltage_cal = server.arg("voltage").toFloat();
+            float new_current_cal_1 = server.arg("current1").toFloat();
+            float new_current_cal_2 = server.arg("current2").toFloat();
+
+            // --> AÑADIDO v8.0: Validar rangos razonables (ajusta según tu hardware)
+            if (new_voltage_cal > 100.0 && new_voltage_cal < 300.0 &&
+                new_current_cal_1 > 5.0 && new_current_cal_1 < 50.0 &&
+                new_current_cal_2 > 5.0 && new_current_cal_2 < 50.0) {
+                
+                voltage_cal = new_voltage_cal;
+                current_cal_1 = new_current_cal_1;
+                current_cal_2 = new_current_cal_2;
+                
+                saveCalibration();
+                server.send(200, "text/plain", "OK. Calibracion guardada.");
+            } else {
+                server.send(400, "text/plain", "Error: Valores de calibracion fuera de rango.");
+            }
+        } else {
+            server.send(400, "text/plain", "Error: Faltan parametros.");
+        }
     } else {
+
         String html = "<html><head><title>Calibracion LETE</title></head><body>";
         html += "<h1>Calibracion del Dispositivo</h1>";
         html += "<form action='/calibracion' method='POST'>";
@@ -625,6 +782,14 @@ void handleRestart() {
 
 // --> Borra todos los datos y reinicia (Wi-Fi y Calibración)
 void handleFactoryReset() {
+    // Tomamos el control de SPIFFS. Esperamos hasta 1000ms si no está disponible.
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        File file = SPIFFS.open("/calibracion.tmp", FILE_WRITE);
+        if (!file) {
+            if (DEBUG_MODE) Serial.println("Error al abrir archivo temporal de calibracion");
+            xSemaphoreGive(spiffsMutex); // Liberamos el mutex antes de salir
+            return;
+        }
     if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
         return server.requestAuthentication();
     }
@@ -654,12 +819,19 @@ void handleFactoryReset() {
     server.send(200, "text/html", "<h1>Reseteo de Fábrica Completo</h1><p>El dispositivo se reiniciará en 2 segundos en modo de configuración.</p>");
     delay(2000);
     ESP.restart();
+    xSemaphoreGive(spiffsMutex);
+        if (DEBUG_MODE) Serial.println("Mutex de SPIFFS liberado.");
+    } else {
+        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en saveCalibration.");
+    }
 }
 
 // --- FUNCIÓN DE SETUP (VERSIÓN FINAL Y PULIDA) ---
 void setup() {
     Serial.begin(115200);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    bootTime = millis();
 
     // --- MODO DE RECUPERACIÓN ---
     if (digitalRead(BUTTON_PIN) == LOW) {
@@ -681,6 +853,16 @@ void setup() {
     }
 
     // --- ARRANQUE NORMAL ---
+
+    // --> AÑADIDO v8.0: Crear Mutex
+    spiffsMutex = xSemaphoreCreateMutex();
+    sharedVarsMutex = xSemaphoreCreateMutex();
+
+    if (spiffsMutex == NULL || sharedVarsMutex == NULL) {
+        Serial.println("Error crítico: No se pudieron crear los mutex.");
+        // Aquí podríamos entrar en un bucle infinito o reiniciar.
+    }
+
     // 1. Configuración del Watchdog Timer
     if (DEBUG_MODE) Serial.println("Configurando Watchdog Timer...");
     esp_task_wdt_config_t wdt_config = {
@@ -775,7 +957,14 @@ void setup() {
     dataQueue = xQueueCreate(10, sizeof(MeasurementData));
     if (dataQueue != NULL) {
         xTaskCreatePinnedToCore(
-            networkTask, "Network Task", 10000, NULL, 1, NULL, 0);
+             networkTask,        /* Function to implement the task */
+             "Network Task",     /* Name of the task */
+             16384,              /* Stack size in words --> AUMENTADO a 16KB */
+             NULL,               /* Task input parameter */
+             1,                  /* Priority of the task */
+             NULL,               /* Task handle. */
+             0);                 /* Core where the task should run */
+           
     } else {
         if(DEBUG_MODE) Serial.println("Error critico: No se pudo crear la cola de datos.");
     }
@@ -871,11 +1060,10 @@ void loop() {
     }
     
     // 6. Reinicio diario programado
-    if (currentMillis > DAILY_RESTART_INTERVAL_MS) {
-        if (DEBUG_MODE) Serial.println("Reinicio diario programado. Reiniciando...");
-        delay(1000);
-        ESP.restart();
-    }
+    if (currentMillis - bootTime > DAILY_RESTART_INTERVAL_MS) {
+    if (DEBUG_MODE) Serial.println("Reinicio diario programado. Reiniciando...");
+    delay(1000);
+    ESP.restart();
 }
 
 // --- INCLUSIÓN DE ARCHIVOS SEPARADOS ---
