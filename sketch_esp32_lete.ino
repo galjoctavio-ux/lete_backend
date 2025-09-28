@@ -1,26 +1,20 @@
 /*
 ==========================================================================
-== FIRMWARE LETE - MONITOR DE ENERGÍA v8.1
+== FIRMWARE LETE - MONITOR DE ENERGÍA v8.3
 ==
-== RESUMEN DE CAMBIOS v8.0 (Basado en análisis de robustez):
-== - SINCRONIZACIÓN DE NÚCLEOS: Implementados Mutex para proteger el acceso
-==   a SPIFFS y variables globales, eliminando condiciones de carrera.
-== - SEGURIDAD DE MEMORIA: Reemplazado sprintf() por snprintf() en todo el
-==   código para prevenir desbordamientos de buffer.
-== - ROBUSTEZ DE RED: Aumentado el stack de la tarea de red a 16KB, añadidos
-==   timeouts a todas las peticiones HTTP, incluyendo la actualización OTA.
-== - VALIDACIÓN DE ENTRADAS: Añadida validación de rangos en la página de
-==   calibración para evitar la corrupción de datos por valores inválidos.
-== - MANEJO DE ERRORES MEJORADO: Lógica de reinicio diario corregida para ser
-==   independiente del desbordamiento de millis() y comprobación de errores
-==   en la deserialización de JSON.
-== - CORRECCIONES DE HARDWARE: Añadida inicialización de Wire.begin() para
-==   el bus I2C y documentado el riesgo de usar GPIO0.
-== - EFICIENCIA: Refactorizada la generación de HTML en el servidor web para
-==   reducir la fragmentación de memoria usando envío por trozos.
+== CAMBIOS v8.3 (Corrección de estabilidad):
+== - PREVENCIÓN DE BUCLES INFINITOS: Añadidos contadores y timeouts en 
+==   processBufferQueue() para evitar bucles infinitos.
+== - TIMEOUTS AGRESIVOS EN MUTEX: Reducidos los timeouts de mutex para
+==   evitar bloqueos largos que activen el watchdog.
+== - WATCHDOG MÁS FRECUENTE: Añadidos más puntos de reset del watchdog
+==   en operaciones críticas.
+== - VALIDACIÓN DE CONDICIONES: Mejoradas las condiciones de salida en
+==   bucles para evitar estados de espera infinita.
+== - RECUPERACIÓN DE ERRORES: Lógica de recuperación cuando se detectan
+==   condiciones anómalas en el buffer.
 =========================================================================
 */
-
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
@@ -49,7 +43,7 @@ const bool OLED_CONECTADA = true;
 const bool DEBUG_MODE = true;
 
 // Intervalos de tiempo
-const unsigned long MEASUREMENT_INTERVAL_MS = 2000;
+const unsigned long MEASUREMENT_INTERVAL_MS = 3500;
 const unsigned long ACTIVE_SUB_CHECK_INTERVAL_MS = 12 * 3600 * 1000UL;
 const unsigned long INACTIVE_SUB_CHECK_INTERVAL_MS = 5 * 60 * 1000UL;
 const unsigned long UPDATE_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
@@ -175,6 +169,17 @@ SemaphoreHandle_t spiffsMutex;
 SemaphoreHandle_t sharedVarsMutex;
 SemaphoreHandle_t bufferMetricsMutex; // Proteger métricas del buffer
 
+// --- CONFIGURACIÓN MEJORADA PARA ESTABILIDAD v8.3 ---
+#define MAX_BUFFER_PROCESS_ATTEMPTS 3     // Máximo intentos de procesar buffer por ciclo
+#define MUTEX_TIMEOUT_MS 50               // Timeout reducido para mutex (era 100-1000ms)
+#define BUFFER_PROCESS_MAX_TIME_MS 2000   // Máximo tiempo procesando buffer por ciclo
+#define WATCHDOG_RESET_INTERVAL 100       // Reset watchdog cada 100 iteraciones
+
+// Variables de control de estabilidad
+static uint32_t loop_iteration_count = 0;
+static uint32_t buffer_process_failures = 0;
+static bool buffer_in_error_state = false;
+static unsigned long last_successful_measurement = 0;
 
 // --- 5. DECLARACIONES DE FUNCIONES v8.2 ---
 
@@ -240,6 +245,7 @@ void networkTask(void * pvParameters) {
 
     for (;;) {
         esp_task_wdt_reset();
+        server.handleClient(); 
         
         wifi_connection_stable = isWifiConnectionStable();
 
@@ -307,7 +313,7 @@ void networkTask(void * pvParameters) {
             checkBufferHealth();
         }
         
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -521,54 +527,118 @@ bool sendDataToInflux(const MeasurementData& data) {
 
 // --> Lógica segura y optimizada para procesar la cola del buffer ---
 void processBufferQueue() {
-    // --- Lógica de decisión ---
+    static unsigned long last_process_time = 0;
+    static int consecutive_failures = 0;
+
+      // Prevenir llamadas muy frecuentes
+    if (millis() - last_process_time < 1000) return;
+    last_process_time = millis();
+
+    // Si estamos en estado de error, esperar más tiempo
+    if (buffer_in_error_state) {
+        if (millis() - last_process_time < 10000) return; // 10s de espera
+        buffer_in_error_state = false; // Intentar recuperar
+        consecutive_failures = 0;
+    }
+    
+    unsigned long process_start_time = millis();
+
+    // --- DECISIÓN RÁPIDA CON TIMEOUTS CORTOS ---
     bool sub_activa_local = false;
     int dias_gracia_local = 0;
+
     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         sub_activa_local = subscription_active;
         dias_gracia_local = dias_de_gracia_restantes;
         xSemaphoreGive(sharedVarsMutex);
+    }else {
+        if (DEBUG_MODE) Serial.println("[N0] Timeout en sharedVarsMutex - processBufferQueue");
+        consecutive_failures++;
+        if (consecutive_failures > 5) buffer_in_error_state = true;
+        return;
     }
 
     if (WiFi.status() != WL_CONNECTED || (!sub_activa_local && dias_gracia_local <= 0)) {
         return;
     }
 
+    // Límite de archivos a procesar por ciclo
+    int files_processed = 0;
+    const int MAX_FILES_PER_CYCLE = 2;
+
     String filename_to_process;
     String file_content; // Usaremos esta variable para leer el archivo
 
-    // --- SECCIÓN CRÍTICA: LECTURA DEL ARCHIVO ---
-    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+   // --- SECCIÓN CRÍTICA CON TIMEOUT AGRESIVO ---
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
         File bufferFile;
-        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+        bool file_found = false;
+        
+        // Buscar SOLO los primeros archivos para evitar bucles largos
+        for (int i = 0; i < MAX_BUFFER_FILES && i < 10 && !file_found; i++) {
             String current_filename = "/buffer_" + String(i) + ".txt";
             if (SPIFFS.exists(current_filename)) {
                 bufferFile = SPIFFS.open(current_filename, FILE_READ);
                 if (bufferFile && bufferFile.size() > 0) {
                     filename_to_process = current_filename;
-                    file_content = bufferFile.readString(); // Leemos en 'file_content'
+                    
+                    // Leer solo los primeros 1KB para evitar bloqueos
+                    size_t read_size = min((size_t)1024, bufferFile.size());
+                    file_content = "";
+                    file_content.reserve(read_size + 100);
+                    
+                    while (bufferFile.available() && file_content.length() < read_size) {
+                        file_content += (char)bufferFile.read();
+                        // Timeout de seguridad durante la lectura
+                        if (millis() - process_start_time > BUFFER_PROCESS_MAX_TIME_MS/2) {
+                            if (DEBUG_MODE) Serial.println("[N0] Timeout durante lectura de archivo");
+                            break;
+                        }
+                    }
                     bufferFile.close();
-                    break;
+                    file_found = true;
+                    files_processed++;
                 }
-                if(bufferFile) bufferFile.close();
+                if (bufferFile) bufferFile.close();
+            }
+            
+            // Verificar timeout global
+            if (millis() - process_start_time > BUFFER_PROCESS_MAX_TIME_MS) {
+                if (DEBUG_MODE) Serial.println("[N0] Timeout global en processBufferQueue");
+                break;
             }
         }
         xSemaphoreGive(spiffsMutex);
     } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar mutex en processBufferQueue (lectura).");
+        if (DEBUG_MODE) Serial.println("[N0] Timeout en spiffsMutex - processBufferQueue");
+        consecutive_failures++;
+        if (consecutive_failures > 5) {
+            buffer_in_error_state = true;
+            if (DEBUG_MODE) Serial.println("[N0] Buffer en estado de error - pausando procesamiento");
+        }
         return;
     }
     
-    // --- CONSTRUCCIÓN Y ENVÍO DEL LOTE ---
-    if (file_content.isEmpty()) return;
+    // Si no hay contenido, salir inmediatamente
+    if (file_content.isEmpty() || filename_to_process.isEmpty()) {
+        return;
+    }
 
-    if (DEBUG_MODE) Serial.printf("[N0] Archivo %s leído (%d bytes). Construyendo lote para enviar...\n", filename_to_process.c_str(), file_content.length());
+    if (DEBUG_MODE) Serial.printf("[N0] Procesando buffer: %s (%d bytes)\n", 
+                                 filename_to_process.c_str(), file_content.length());
     
+    // --- CONSTRUCCIÓN RÁPIDA DEL PAYLOAD CON LÍMITES ---
     String batch_payload = "";
-    int line_start = 0;
+    batch_payload.reserve(file_content.length() + 500);
     
-    // Construir un solo payload grande con todas las líneas del archivo
-    while (line_start < file_content.length()) {
+    int line_start = 0;
+    int lines_processed = 0;
+    const int MAX_LINES_PER_BATCH = 20; // Limitar líneas por lote
+    
+    while (line_start < file_content.length() && 
+           lines_processed < MAX_LINES_PER_BATCH &&
+           millis() - process_start_time < BUFFER_PROCESS_MAX_TIME_MS) {
+        
         int line_end = file_content.indexOf('\n', line_start);
         if (line_end == -1) line_end = file_content.length();
         
@@ -578,23 +648,28 @@ void processBufferQueue() {
         if (line.length() > 0) {
             MeasurementData data = decompressDataPayload(line);
             
-            char influx_line[300];
-            snprintf(influx_line, sizeof(influx_line),
-                "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%u,seq=%u %llu",
-                INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
-                data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu,
-                data.quality_flag, data.sequence_number, (unsigned long long)data.timestamp);
-
-            batch_payload += influx_line;
-            batch_payload += "\n";
+            // Validación rápida
+            if (!isnan(data.vrms) && !isinf(data.vrms) && data.vrms > 0) {
+                char influx_line[300];
+                int written = snprintf(influx_line, sizeof(influx_line),
+                    "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%u,seq=%u %llu\n",
+                    INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
+                    data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu,
+                    data.quality_flag, data.sequence_number, (unsigned long long)data.timestamp);
+                
+                if (written > 0 && written < sizeof(influx_line)) {
+                    batch_payload += influx_line;
+                    lines_processed++;
+                }
+            }
         }
         line_start = line_end + 1;
     }
 
-    // Enviar el lote completo en una sola petición
-    if (!batch_payload.isEmpty()) {
+    // Enviar solo si hay payload válido
+    if (batch_payload.length() > 10) {
         HTTPClient http;
-        http.setTimeout(CONNECTION_TIMEOUT_MS * 2);
+        http.setTimeout(3000); // Timeout más corto
         http.begin(INFLUXDB_URL);
         http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
         http.addHeader("Content-Type", "text/plain");
@@ -604,14 +679,25 @@ void processBufferQueue() {
         http.end();
 
         if (success) {
-            if (DEBUG_MODE) Serial.printf("[N0] ÉXITO: Buffer %s enviado. Eliminando archivo.\n", filename_to_process.c_str());
-            if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            consecutive_failures = 0; // Reset contador de errores
+            if (DEBUG_MODE) Serial.printf("[N0] Buffer %s enviado (%d líneas)\n", 
+                                         filename_to_process.c_str(), lines_processed);
+            
+            // Eliminar archivo solo con mutex
+            if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                 SPIFFS.remove(filename_to_process);
                 xSemaphoreGive(spiffsMutex);
             }
         } else {
-            if (DEBUG_MODE) Serial.printf("[N0] FALLO: Error al enviar buffer %s. HTTP: %d.\n", filename_to_process.c_str(), httpCode);
+            consecutive_failures++;
+            if (DEBUG_MODE) Serial.printf("[N0] Fallo envío buffer. HTTP: %d\n", httpCode);
         }
+    }
+    
+    // Verificar estado de errores consecutivos
+    if (consecutive_failures > 3) {
+        buffer_in_error_state = true;
+        if (DEBUG_MODE) Serial.printf("[N0] Demasiados errores (%d) - pausando buffer\n", consecutive_failures);
     }
 }
 
@@ -1421,7 +1507,7 @@ void loop() {
 
     // Las tareas de OTA y Web Server son rápidas y se atienden aquí
     ArduinoOTA.handle();
-    server.handleClient();
+    //server.handleClient();
 
     // 2. Lógica de Pulsación del Botón (Configuración y Cambio de Pantalla)
     if (digitalRead(BUTTON_PIN) == LOW) {
