@@ -456,13 +456,26 @@ bool sendDataToInflux(const MeasurementData& data) {
         writeToBuffer(data);
         return false;
     }
-    // --- TRADUCCIÓN A INFLUXDB LINE PROTOCOL ---
-    char influx_payload[300];
+
+    // VALIDACIÓN ADICIONAL DE DATOS
+    if (isnan(data.vrms) || isinf(data.vrms) || isnan(data.power) || isinf(data.power)) {
+        if (DEBUG_MODE) Serial.printf("[N0] Datos inválidos en medición %u, descartando.\n", data.sequence_number);
+        return false;
+    }
+
+    // --- FORMATO FINAL Y CORRECTO DE INFLUXDB LINE PROTOCOL ---
+    // Sintaxis: measurement,tag_set field_set timestamp
+    // Nota el ESPACIO entre el tag (device) y el primer field (vrms)
+    char influx_payload[400];
     snprintf(influx_payload, sizeof(influx_payload),
-        "%s,device=LETE-%04X,seq=%u vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%ui %llu",
-        INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(), data.sequence_number,
+        "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%u,seq=%u %llu",
+        INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
         data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu,
-        data.quality_flag, (unsigned long long)data.timestamp * 1000000000ULL);
+        data.quality_flag, data.sequence_number, (unsigned long long)data.timestamp);
+
+    if (DEBUG_MODE) {
+        Serial.printf("[N0] Payload InfluxDB: %s\n", influx_payload);
+    }
 
     for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
         HTTPClient http;
@@ -506,7 +519,7 @@ bool sendDataToInflux(const MeasurementData& data) {
     return false;
 }
 
-// --> Lógica segura para procesar la cola del buffer (con log de confirmación)
+// --> Lógica segura y optimizada para procesar la cola del buffer ---
 void processBufferQueue() {
     // --- Lógica de decisión ---
     bool sub_activa_local = false;
@@ -522,7 +535,7 @@ void processBufferQueue() {
     }
 
     String filename_to_process;
-    String payload_to_send;
+    String file_content; // Usaremos esta variable para leer el archivo
 
     // --- SECCIÓN CRÍTICA: LECTURA DEL ARCHIVO ---
     if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -533,7 +546,7 @@ void processBufferQueue() {
                 bufferFile = SPIFFS.open(current_filename, FILE_READ);
                 if (bufferFile && bufferFile.size() > 0) {
                     filename_to_process = current_filename;
-                    payload_to_send = bufferFile.readString();
+                    file_content = bufferFile.readString(); // Leemos en 'file_content'
                     bufferFile.close();
                     break;
                 }
@@ -545,28 +558,52 @@ void processBufferQueue() {
         if (DEBUG_MODE) Serial.println("Timeout al esperar mutex en processBufferQueue (lectura).");
         return;
     }
+    
+    // --- CONSTRUCCIÓN Y ENVÍO DEL LOTE ---
+    if (file_content.isEmpty()) return;
 
-    // --- OPERACIÓN DE RED ---
-    if (!payload_to_send.isEmpty()) {
+    if (DEBUG_MODE) Serial.printf("[N0] Archivo %s leído (%d bytes). Construyendo lote para enviar...\n", filename_to_process.c_str(), file_content.length());
+    
+    String batch_payload = "";
+    int line_start = 0;
+    
+    // Construir un solo payload grande con todas las líneas del archivo
+    while (line_start < file_content.length()) {
+        int line_end = file_content.indexOf('\n', line_start);
+        if (line_end == -1) line_end = file_content.length();
         
-        if (DEBUG_MODE) Serial.printf("[N0] Archivo %s leído (%d bytes). Intentando enviar...\n", filename_to_process.c_str(), payload_to_send.length());
+        String line = file_content.substring(line_start, line_end);
+        line.trim();
+        
+        if (line.length() > 0) {
+            MeasurementData data = decompressDataPayload(line);
+            
+            char influx_line[300];
+            snprintf(influx_line, sizeof(influx_line),
+                "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%u,seq=%u %llu",
+                INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
+                data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu,
+                data.quality_flag, data.sequence_number, (unsigned long long)data.timestamp);
 
+            batch_payload += influx_line;
+            batch_payload += "\n";
+        }
+        line_start = line_end + 1;
+    }
+
+    // Enviar el lote completo en una sola petición
+    if (!batch_payload.isEmpty()) {
         HTTPClient http;
-        http.setTimeout(8000);
+        http.setTimeout(CONNECTION_TIMEOUT_MS * 2);
         http.begin(INFLUXDB_URL);
         http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
         http.addHeader("Content-Type", "text/plain");
         
-        int httpCode = http.POST(payload_to_send);
-        bool status = (httpCode >= 200 && httpCode < 300);
+        int httpCode = http.POST(batch_payload);
+        bool success = (httpCode >= 200 && httpCode < 300);
         http.end();
 
-        if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            server_status = status;
-            xSemaphoreGive(sharedVarsMutex);
-        }
-
-        if (status) {
+        if (success) {
             if (DEBUG_MODE) Serial.printf("[N0] ÉXITO: Buffer %s enviado. Eliminando archivo.\n", filename_to_process.c_str());
             if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                 SPIFFS.remove(filename_to_process);
@@ -934,23 +971,29 @@ void handleFactoryReset() {
 bool sendBatchToInflux(const MeasurementData* dataArray, int count) {
     if (count <= 0) return false;
 
-    // --- TRADUCCIÓN DEL LOTE A INFLUXDB LINE PROTOCOL ---
     String batch_payload = "";
+    batch_payload.reserve(count * 200);
+
     for (int i = 0; i < count; i++) {
-        char influx_line[300];
+        if (isnan(dataArray[i].vrms) || isinf(dataArray[i].vrms)) {
+            if (DEBUG_MODE) Serial.printf("[N0] Saltando medición inválida %u en lote.\n", dataArray[i].sequence_number);
+            continue;
+        }
+
+        char influx_line[400];
         snprintf(influx_line, sizeof(influx_line),
-            "%s,device=LETE-%04X,seq=%u vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%ui %llu",
-            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(), dataArray[i].sequence_number,
+            "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%u,seq=%u %llu",
+            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
             dataArray[i].vrms, dataArray[i].irms1, dataArray[i].irms2, dataArray[i].power, dataArray[i].leakage, dataArray[i].temp_cpu,
-            dataArray[i].quality_flag, (unsigned long long)dataArray[i].timestamp * 1000000000ULL);
+            dataArray[i].quality_flag, dataArray[i].sequence_number, (unsigned long long)dataArray[i].timestamp);
         
         batch_payload += influx_line;
         if (i < count - 1) batch_payload += "\n";
     }
-    
-    for (int i = 0; i < count; i++) {
-        batch_payload += compressDataPayload(dataArray[i]);
-        if (i < count - 1) batch_payload += "\n";
+
+    if (batch_payload.isEmpty()) {
+        if (DEBUG_MODE) Serial.println("[N0] Lote vacío después de validaciones.");
+        return false;
     }
     
     HTTPClient http;
