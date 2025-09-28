@@ -1,17 +1,15 @@
 // ==========================================================================
-// == FIRMWARE LETE - MONITOR DE ENERGÍA v6.0
+// == FIRMWARE LETE - MONITOR DE ENERGÍA v7.0
 // ==
-// == MEJORAS DE LA VERSIÓN:
-// == - Versión del firmware actualizada a 6.0.
-// == - Activación de modo configuración WiFi por pulsación larga (10s) en cualquier momento.
-// == - Lógica de reintentos de suscripción adaptable (rápida si está inactiva, lenta si está activa).
-// == - Guardado "atómico" de calibración en SPIFFS para prevenir corrupción de archivos.
-// == - Carga robusta de calibración con validación de datos y mejores diagnósticos de error.
-// == - Rediseño completo del sistema de buffer a una cola de archivos para bajo uso de RAM y envío seguro.
-// == - Arquitectura base para futura calibración remota desde un servidor.
-// == - Rediseño completo de las pantallas OLED a 3 modos más útiles: Consumo, Diagnóstico y Servicio.
-// == - La pantalla de Consumo ahora tiene mayor duración en la rotación automática.
-// == - Indicador visual del buffer de datos en la pantalla OLED.
+// == MEJORAS DE LA VERSIÓN 7.0:
+// == - ARQUITECTURA DE DOS NÚCLEOS: Un núcleo para mediciones y UI (tiempo real)
+// ==   y otro para comunicaciones de red, eliminando bloqueos y mejorando estabilidad.
+// == - FEEDBACK VISUAL MEJORADO: Mensaje en pantalla al presionar botón de configuración.
+// == - PANTALLA DE SERVICIO MEJORADA: Muestra fecha de próximo pago y días de gracia restantes.
+// == - ARRANQUE DE DISPLAY LIMPIO: Corregido el error de "estática" en la pantalla al encender.
+// == - SINCRONIZACIÓN NTP ROBUSTA: Si la hora falla al arrancar, se reintenta periódicamente.
+// == - CORRECCIÓN DE BUG EN BUFFER: Solucionado el error que impedía usar el buffer más allá del 9no archivo.
+// == - ACCIONES REMOTAS: Implementada la capacidad de reiniciar o resetear el dispositivo desde Supabase.
 // =========================================================================
 
 // --- 1. LIBRERÍAS ---
@@ -35,29 +33,28 @@
 #include <esp_task_wdt.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 6.0;
+const float FIRMWARE_VERSION = 7.0; // --> ACTUALIZADO v7.0
 #define SERVICE_TYPE "1F"
 const bool OLED_CONECTADA = true;
 const bool DEBUG_MODE = true;
 
 // Intervalos de tiempo
 const unsigned long MEASUREMENT_INTERVAL_MS = 2000;
-// --> MEJORA v6.0: Intervalos de chequeo de suscripción adaptables
 const unsigned long ACTIVE_SUB_CHECK_INTERVAL_MS = 12 * 3600 * 1000UL;
-const unsigned long INACTIVE_SUB_CHECK_INTERVAL_MS = 5 * 60 * 1000UL; // 5 minutos
+const unsigned long INACTIVE_SUB_CHECK_INTERVAL_MS = 5 * 60 * 1000UL;
 const unsigned long UPDATE_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
-// --> MEJORA v6.0: Intervalos de rotación de pantalla dinámicos
-const unsigned long SCREEN_CONSUMPTION_INTERVAL_MS = 30000; // 30 segundos
-const unsigned long SCREEN_OTHER_INTERVAL_MS = 15000; // 15 segundos
+const unsigned long SCREEN_CONSUMPTION_INTERVAL_MS = 30000;
+const unsigned long SCREEN_OTHER_INTERVAL_MS = 15000;
 const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
-const unsigned long REMOTE_CAL_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL; // --> MEJORA v6.0: Intervalo para chequeo de calibración remota
+const unsigned long NTP_RETRY_INTERVAL_MS = 15 * 60 * 1000; // --> AÑADIDO v7.0: Reintento de NTP cada 15 min
+const unsigned long SERVER_TASKS_INTERVAL_MS = 4 * 3600 * 1000UL; // --> AÑADIDO v7.0: Chequeos al servidor cada 4h
 
 // Configuración del Watchdog y Pulsación Larga
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000 // 10 segundos
 
-// --> MEJORA v6.0: Configuración del buffer en cola
+// Configuración del buffer en cola
 #define MAX_BUFFER_FILE_SIZE 8192 // 8 KB por archivo
 #define MAX_BUFFER_FILES 50       // Máximo de 50 archivos (50 * 8KB = 400 KB)
 
@@ -77,6 +74,16 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
 EnergyMonitor emon1, emon2;
 
+// --> AÑADIDO v7.0: Estructura y Cola para comunicación entre núcleos
+struct MeasurementData {
+    float vrms;
+    float irms1;
+    float irms2;
+    float power;
+    float leakage;
+};
+QueueHandle_t dataQueue;
+
 // Variables de Calibración
 float voltage_cal = 265.0;
 float current_cal_1 = 11.07;
@@ -94,27 +101,53 @@ bool time_synced = false;
 bool subscription_active = false;
 bool pago_vencido = false;
 int dias_de_gracia_restantes = 0;
-int buffer_file_count = 0; // --> MEJORA v6.0: Contador de archivos en buffer
+String proximo_pago_str = "--/--/----"; // --> AÑADIDO v7.0
+int buffer_file_count = 0;
 
 // Variables de Control
 unsigned long last_measurement_time = 0;
-unsigned long last_update_check = 0;
-unsigned long last_activation_check = 0;
+unsigned long last_server_tasks_check = 0; // --> ACTUALIZADO v7.0: Un solo timer para tareas de servidor
 unsigned long last_button_press = 0;
 unsigned long last_screen_change_time = 0;
 unsigned long last_wifi_check = 0;
-unsigned long last_remote_cal_check = 0; // --> MEJORA v6.0: Timer para calibración remota
-unsigned long button_press_start_time = 0; // --> MEJORA v6.0: Timer para pulsación larga
-bool button_is_pressed = false; // --> MEJORA v6.0: Estado del botón
+unsigned long button_press_start_time = 0;
+bool button_is_pressed = false;
 int screen_mode = 0;
 int lecturas_descartadas = 0;
 const int LECTURAS_A_DESCARTAR = 10;
 
-
 // --- 5. DECLARACIONES DE FUNCIONES (PROTOTIPOS) ---
+// --> ACTUALIZADO v7.0: Lista completa y organizada de prototipos
+
+// Tarea del Núcleo 0
+void networkTask(void * pvParameters);
+
+// Lógica Principal y de Medición
+void saveCalibration();
+void loadCalibration();
+int countBufferFiles();
+void writeToBuffer(const char* data_payload);
+void processBufferQueue();
+void sendDataToInflux(MeasurementData data);
+void measureAndStoreData();
+
+// Tareas de Servidor (llamadas por networkTask)
+void checkServerTasks();
+void checkSubscriptionStatus();
+void checkForHttpUpdate();
+
+// Funciones de Servidor Web (Web Handlers)
+void handleRoot();
+void handleUpdate();
+void handleResetWifi();
+void handleCalibration();
+void handleRestart();
+void handleFactoryReset();
+
+// Funciones de Pantalla OLED
 void setupOLED();
 void drawConsumptionScreen();
-void drawDiagnosticsScreen(); // Dejar solo una
+void drawDiagnosticsScreen();
 void drawServiceScreen();
 void drawBootScreen();
 void drawConfigScreen(const char* apName);
@@ -122,10 +155,57 @@ void drawUpdateScreen(String text);
 void drawGenericMessage(String line1, String line2);
 void drawPaymentDueScreen();
 const char* getWifiIcon(int rssi);
-void handleRestart();
-void handleFactoryReset();
 
 // --- FUNCIONES DE LÓGICA PRINCIPAL ---
+
+// --- MEJORA v7.0: Tarea dedicada para el Núcleo 0 (Comunicaciones) ---
+void networkTask(void * pvParameters) {
+    if (DEBUG_MODE) Serial.println("Tarea de Red iniciada en Núcleo 0.");
+    
+    // Temporizadores para tareas dentro del Núcleo 0
+    unsigned long last_ntp_sync_attempt = 0;
+
+    for (;;) { // Bucle infinito para la tarea de red
+        if (WiFi.status() == WL_CONNECTED) {
+            
+            // --- Lógica de Sincronización NTP Periódica ---
+            if (!time_synced && millis() - last_ntp_sync_attempt > NTP_RETRY_INTERVAL_MS) {
+                last_ntp_sync_attempt = millis();
+                if (DEBUG_MODE) Serial.println("[N0] Reintentando sincronizacion de hora NTP...");
+                configTime(0, 0, NTP_SERVER);
+                
+                struct tm timeinfo;
+                if (getLocalTime(&timeinfo)) {
+                    time_synced = true;
+                    if (DEBUG_MODE) Serial.println("[N0] Hora NTP sincronizada exitosamente.");
+                } else {
+                    if (DEBUG_MODE) Serial.println("[N0] Fallo al reintentar la sincronizacion NTP.");
+                }
+            }
+
+            // --- Lógica de Procesamiento de Datos ---
+            // 1. Prioridad: procesar datos en tiempo real que lleguen por la cola
+            MeasurementData receivedData;
+            if (xQueueReceive(dataQueue, &receivedData, 0) == pdTRUE) {
+                sendDataToInflux(receivedData);
+            }
+
+            // 2. Si no hay datos en vivo, intentar vaciar el buffer de archivos
+            else if (countBufferFiles() > 0) {
+                processBufferQueue();
+            }
+
+            // --- Lógica de Tareas de Servidor (cada 4 horas) ---
+            if (millis() - last_server_tasks_check > SERVER_TASKS_INTERVAL_MS) {
+                last_server_tasks_check = millis();
+                checkServerTasks(); // Esta función agrupa todas las llamadas a Supabase
+            }
+        }
+        
+        // Pausa corta para que la tarea sea muy responsiva
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Revisar la cola cada segundo
+    }
+}
 
 // --> Guarda los valores de calibración en la memoria permanente (SPIFFS)
 void saveCalibration() {
@@ -197,15 +277,12 @@ int countBufferFiles() {
 void writeToBuffer(const char* data_payload) {
     String filename;
     bool file_found = false;
-
-    // Busca el último archivo para seguir escribiendo o crea uno nuevo
     for (int i = 0; i < MAX_BUFFER_FILES; i++) {
         filename = "/buffer_" + String(i) + ".txt";
         if (!SPIFFS.exists(filename)) {
             file_found = true;
             break;
         }
-        // Si existe, revisa su tamaño
         File file = SPIFFS.open(filename, FILE_READ);
         if (file && file.size() < MAX_BUFFER_FILE_SIZE) {
             file.close();
@@ -216,7 +293,7 @@ void writeToBuffer(const char* data_payload) {
     }
 
     if (!file_found) {
-        if (DEBUG_MODE) Serial.println("Buffer lleno, no se pueden crear más archivos. Dato descartado.");
+        if (DEBUG_MODE) Serial.println("[N0] Buffer lleno, no se pueden crear más archivos. Dato descartado.");
         return;
     }
 
@@ -224,10 +301,44 @@ void writeToBuffer(const char* data_payload) {
     if (bufferFile) {
         bufferFile.print(data_payload);
         bufferFile.close();
-        if (DEBUG_MODE) Serial.printf("Dato guardado en buffer: %s\n", filename.c_str());
-    } else {
-        if (DEBUG_MODE) Serial.printf("Error al abrir %s para escritura.\n", filename.c_str());
+        if (DEBUG_MODE) Serial.printf("[N0] Dato guardado en buffer: %s\n", filename.c_str());
     }
+}
+
+// Nueva función que envía un struct de datos a InfluxDB
+void sendDataToInflux(MeasurementData data) {
+    // --> MEJORA v7.0: Doble chequeo de seguridad al inicio de la función
+    if (WiFi.status() != WL_CONNECTED || !subscription_active) {
+        char data_payload[256]; // Prepara el payload incluso si falla
+        sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
+                INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
+                data.vrms, data.irms1, data.irms2, data.power, data.leakage);
+        if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi/suscripción). Guardando en buffer.");
+        writeToBuffer(data_payload);
+        return; 
+    }
+    
+    char data_payload[256];
+    sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
+            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
+            data.vrms, data.irms1, data.irms2, data.power, data.leakage);
+
+    HTTPClient http;
+    http.setTimeout(2000);
+    http.begin(INFLUXDB_URL);
+    http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
+    http.addHeader("Content-Type", "text/plain");
+    
+    int httpCode = http.POST(data_payload);
+    server_status = (httpCode >= 200 && httpCode < 300);
+
+    if (server_status) {
+        if (DEBUG_MODE) Serial.println("[N0] Dato en vivo enviado a InfluxDB correctamente.");
+    } else {
+        if (DEBUG_MODE) Serial.printf("[N0] Error al enviar dato en vivo. Codigo HTTP: %d. Guardando en buffer.\n", httpCode);
+        writeToBuffer(data_payload);
+    }
+    http.end();
 }
 
 // --> MEJORA v6.0: Lógica para procesar y enviar datos desde la cola del buffer
@@ -238,31 +349,25 @@ void processBufferQueue() {
 
     String filename;
     File bufferFile;
-    bool file_to_send_found = false;
-
-    // Buscar el archivo más antiguo para enviar
+    bool file_found = false;
     for (int i = 0; i < MAX_BUFFER_FILES; i++) {
         filename = "/buffer_" + String(i) + ".txt";
         if (SPIFFS.exists(filename)) {
             bufferFile = SPIFFS.open(filename, FILE_READ);
             if (bufferFile && bufferFile.size() > 0) {
-                file_to_send_found = true;
+                file_found = true;
                 break;
             }
             if(bufferFile) bufferFile.close();
         }
     }
-    
-    if (!file_to_send_found) {
-        return; // No hay nada que enviar
-    }
-
-    if (DEBUG_MODE) Serial.printf("Intentando enviar buffer: %s\n", filename.c_str());
+    if (!file_found) return;
 
     String payload_to_send = bufferFile.readString();
     bufferFile.close();
 
     HTTPClient http;
+    http.setTimeout(4000); // Damos un poco más de tiempo para archivos más grandes
     http.begin(INFLUXDB_URL);
     http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
     http.addHeader("Content-Type", "text/plain");
@@ -271,70 +376,88 @@ void processBufferQueue() {
     server_status = (httpCode >= 200 && httpCode < 300);
 
     if (server_status) {
-        if (DEBUG_MODE) Serial.printf("Buffer %s enviado a InfluxDB correctamente. Eliminando archivo.\n", filename.c_str());
+        if (DEBUG_MODE) Serial.printf("[N0] Buffer %s enviado. Eliminando archivo.\n", filename.c_str());
         SPIFFS.remove(filename);
     } else {
-        if (DEBUG_MODE) Serial.printf("Error al enviar buffer %s. Codigo HTTP: %d. Reintentando más tarde.\n", filename.c_str(), httpCode);
+        if (DEBUG_MODE) Serial.printf("[N0] Error al enviar buffer %s. Codigo HTTP: %d.\n", filename.c_str(), httpCode);
     }
     http.end();
 }
 
-// --> Contacta al servidor para verificar el estado de la suscripción
-void checkSubscriptionStatus() {
-    if (WiFi.status() != WL_CONNECTED) {
-        if (DEBUG_MODE) Serial.println("Chequeo de suscripción omitido: sin WiFi.");
-        return;
-    }
-    if (DEBUG_MODE) Serial.println("Verificando estado de la suscripcion...");
-    
+// --> MEJORA v7.0: Función ÚNICA que agrupa todas las tareas pesadas del servidor.
+void checkServerTasks() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (DEBUG_MODE) Serial.println("\n[N0] Ejecutando tareas periódicas de servidor...");
+
     String deviceId = WiFi.macAddress();
     deviceId.replace(":", "");
-    String urlConId = String(ACTIVATION_CHECK_URL) + "?deviceId=" + deviceId;
-    
-    if (DEBUG_MODE) Serial.printf("URL de petición: %s\n", urlConId.c_str());
+    String urlConId = String(SERVER_TASKS_URL) + "?deviceId=" + deviceId;
 
     HTTPClient http;
+    http.setTimeout(4000);
     http.begin(urlConId);
     http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
     int httpCode = http.GET();
 
     if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
-        payload.trim();
-        if (DEBUG_MODE) Serial.printf("Respuesta del servidor de suscripción: %s\n", payload.c_str());
+        StaticJsonDocument<512> doc;
+        deserializeJson(doc, payload);
 
-        int delimiterPos = payload.indexOf('|');
-        if (delimiterPos > -1) {
-            String statusStr = payload.substring(0, delimiterPos);
-            String daysStr = payload.substring(delimiterPos + 1);
-            subscription_active = (statusStr == "active");
-            dias_de_gracia_restantes = daysStr.toInt();
-            pago_vencido = !subscription_active;
-        } else {
-            if(DEBUG_MODE) Serial.println("Respuesta del servidor con formato inesperado.");
-            subscription_active = false;
-            pago_vencido = true;
-            dias_de_gracia_restantes = 0;
+        // --- Tarea 1: Procesar Suscripción ---
+        if (doc.containsKey("subscription_payload")) {
+            String sub_payload = doc["subscription_payload"];
+            int first_pipe = sub_payload.indexOf('|');
+            int second_pipe = sub_payload.indexOf('|', first_pipe + 1);
+            if (first_pipe > 0 && second_pipe > first_pipe) {
+                subscription_active = (sub_payload.substring(0, first_pipe) == "active");
+                dias_de_gracia_restantes = sub_payload.substring(first_pipe + 1, second_pipe).toInt();
+                proximo_pago_str = sub_payload.substring(second_pipe + 1);
+                pago_vencido = !subscription_active;
+                if(DEBUG_MODE) Serial.println("[N0] Datos de suscripción actualizados.");
+            }
         }
 
-        if (DEBUG_MODE) {
-            Serial.printf("Estado de la suscripción: %s\n", subscription_active ? "ACTIVA" : "INACTIVA");
-            if (pago_vencido) Serial.printf("Días de gracia restantes: %d\n", dias_de_gracia_restantes);
+        // --- Tarea 2: Procesar Calibración Remota ---
+        if (doc["calibration"]["update_available"] == true) {
+            if (DEBUG_MODE) Serial.println("[N0] ¡Nuevos datos de calibracion recibidos!");
+            voltage_cal = doc["calibration"]["values"]["voltage"];
+            current_cal_1 = doc["calibration"]["values"]["current1"];
+            current_cal_2 = doc["calibration"]["values"]["current2"];
+            saveCalibration();
+        }
+
+        // --- Tarea 3: Procesar Comandos Remotos ---
+        if (doc.containsKey("command") && doc["command"] != nullptr) {
+            String command = doc["command"];
+            if (command == "reboot") {
+                if (DEBUG_MODE) Serial.println("[N0] Comando 'reboot' recibido. Reiniciando en 3s...");
+                delay(3000);
+                ESP.restart();
+            } else if (command == "factory_reset") {
+                if (DEBUG_MODE) Serial.println("[N0] Comando 'factory_reset' recibido. Ejecutando...");
+                handleFactoryReset();
+            }
         }
     } else {
-        if (DEBUG_MODE) Serial.printf("Error al verificar suscripcion. Codigo HTTP: %d. Payload: %s\n", httpCode, http.getString().c_str());
-        server_status = false;
+        if (DEBUG_MODE) Serial.printf("[N0] Error al chequear tareas del servidor. Codigo HTTP: %d\n", httpCode);
     }
     http.end();
+    
+    // El chequeo de actualización de firmware (OTA) lo dejamos separado porque no depende de Supabase
+    checkForHttpUpdate();
 }
 
-// --> Busca actualizaciones de firmware remotas vía HTTP
+// Busca actualizaciones de firmware remotas vía HTTP
 void checkForHttpUpdate() {
     if (WiFi.status() != WL_CONNECTED) return;
-    if (DEBUG_MODE) Serial.println("Buscando actualizaciones de firmware...");
-    if (OLED_CONECTADA) drawUpdateScreen("Buscando...");
+    if (DEBUG_MODE) Serial.println("[N0] Buscando actualizaciones de firmware...");
+    
+    // En el futuro, considera mostrar un ícono en la pantalla OLED
+    // if (OLED_CONECTADA) drawUpdateScreen("Buscando...");
 
     HTTPClient http;
+    http.setTimeout(2000); // --> MEJORA v7.0: Añadido timeout
     http.begin(FIRMWARE_VERSION_URL);
     int httpCode = http.GET();
 
@@ -342,10 +465,10 @@ void checkForHttpUpdate() {
         String version_str = http.getString();
         version_str.trim();
         float new_version = version_str.toFloat();
-        if (DEBUG_MODE) Serial.printf("Version actual: %.1f, Version en servidor: %.1f\n", FIRMWARE_VERSION, new_version);
+        if (DEBUG_MODE) Serial.printf("[N0] Version actual: %.1f, Version en servidor: %.1f\n", FIRMWARE_VERSION, new_version);
 
         if (new_version > FIRMWARE_VERSION) {
-            if (DEBUG_MODE) Serial.println("Nueva version disponible. Actualizando...");
+            if (DEBUG_MODE) Serial.println("[N0] Nueva version disponible. Actualizando...");
             if (OLED_CONECTADA) drawUpdateScreen("Descargando");
 
             HTTPClient httpUpdateClient;
@@ -353,80 +476,22 @@ void checkForHttpUpdate() {
             t_httpUpdate_return ret = httpUpdate.update(httpUpdateClient);
 
             if (ret == HTTP_UPDATE_FAILED) {
-                if (DEBUG_MODE) Serial.printf("Actualizacion Fallida. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+                if (DEBUG_MODE) Serial.printf("[N0] Actualizacion Fallida. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
                 if (OLED_CONECTADA) drawUpdateScreen("Error!");
                 delay(2000);
             }
         } else {
-            if (DEBUG_MODE) Serial.println("El firmware ya esta actualizado.");
+            if (DEBUG_MODE) Serial.println("[N0] El firmware ya esta actualizado.");
         }
     } else {
-        if (DEBUG_MODE) Serial.printf("Error al verificar version. Codigo HTTP: %d\n", httpCode);
+        if (DEBUG_MODE) Serial.printf("[N0] Error al verificar version. Codigo HTTP: %d\n", httpCode);
     }
     http.end();
 }
 
-// --> MEJORA v6.0: Arquitectura para futura calibración remota
-void checkForRemoteCalibration() {
-    if (WiFi.status() != WL_CONNECTED) {
-        if (DEBUG_MODE) Serial.println("Chequeo de calibracion remota omitido: sin WiFi.");
-        return;
-    }
-
-    if (DEBUG_MODE) Serial.println("Buscando calibracion remota...");
-
-    String deviceId = WiFi.macAddress();
-    deviceId.replace(":", "");
-    String urlConId = String(CALIBRATION_CHECK_URL) + "?deviceId=" + deviceId;
-
-    HTTPClient http;
-    http.begin(urlConId);
-    http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        StaticJsonDocument<256> doc;
-        DeserializationError error = deserializeJson(doc, payload);
-
-        if (error) {
-            if (DEBUG_MODE) Serial.printf("Error al parsear JSON de calibracion: %s\n", error.c_str());
-            http.end();
-            return;
-        }
-
-        bool update_available = doc["update_available"];
-
-        if (update_available) {
-            if (DEBUG_MODE) Serial.println("¡Nuevos datos de calibracion recibidos del servidor!");
-            
-            // Extraer y aplicar los nuevos valores
-            voltage_cal = doc["values"]["voltage"];
-            current_cal_1 = doc["values"]["current1"];
-            current_cal_2 = doc["values"]["current2"];
-
-            if (DEBUG_MODE) {
-                Serial.printf("Nuevos valores -> V_CAL: %.2f, I_CAL1: %.2f, I_CAL2: %.2f\n", voltage_cal, current_cal_1, current_cal_2);
-            }
-            
-            // Guardar permanentemente la nueva calibración en SPIFFS
-            saveCalibration();
-            if (DEBUG_MODE) Serial.println("Nueva calibracion guardada en memoria.");
-
-        } else {
-            if (DEBUG_MODE) Serial.println("No hay actualizaciones de calibracion pendientes.");
-        }
-
-    } else {
-        if (DEBUG_MODE) Serial.printf("Error al chequear calibracion remota. Codigo HTTP: %d\n", httpCode);
-    }
-
-    http.end();
-}
-
-// --> Realiza las mediciones y decide si enviar los datos o guardarlos en el buffer
-// --> MEJORA v6.0: La función ahora solo mide y decide si enviar en vivo o guardar en buffer.
+// Mide los sensores y pone los datos en la cola para el Núcleo 0
 void measureAndStoreData() {
+    // Esta función está perfecta, no necesita cambios.
     emon1.calcVI(20, 2000);
     emon1.calcIrms(1480);
     emon2.calcIrms(1480);
@@ -438,7 +503,7 @@ void measureAndStoreData() {
     latest_temp_cpu = temperatureRead();
 
     if (isnan(latest_vrms) || isinf(latest_vrms) || isnan(latest_irms1) || isinf(latest_irms1)) {
-        if (DEBUG_MODE) Serial.println("Lectura inválida (NaN/Inf) descartada.");
+        if (DEBUG_MODE) Serial.println("[N1] Lectura inválida (NaN/Inf) descartada.");
         return;
     }
 
@@ -448,37 +513,15 @@ void measureAndStoreData() {
     if (latest_vrms == 0.0 || latest_irms1 == 0.0) latest_power = 0.0;
     latest_leakage = abs(latest_irms1 - latest_irms2);
 
-    if (DEBUG_MODE) {
-        Serial.println("\n--- Telemetria de Estado ---");
-        Serial.printf("Voltaje: %.1f V | Potencia: %.0f W\n", latest_vrms, latest_power);
-        Serial.printf("C. Fase: %.3f A | C. Neutro: %.3f A | Fuga: %.3f A\n", latest_irms1, latest_irms2, latest_leakage);
-    }
+    MeasurementData dataToSend;
+    dataToSend.vrms = latest_vrms;
+    dataToSend.irms1 = latest_irms1;
+    dataToSend.irms2 = latest_irms2;
+    dataToSend.power = latest_power;
+    dataToSend.leakage = latest_leakage;
 
-    char data_payload[256];
-    sprintf(data_payload, "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f\n",
-            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
-            latest_vrms, latest_irms1, latest_irms2, latest_power, latest_leakage);
-
-    // Intenta enviar en vivo si hay conexión y suscripción
-    if (WiFi.status() == WL_CONNECTED && subscription_active) {
-        HTTPClient http;
-        http.begin(INFLUXDB_URL);
-        http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
-        http.addHeader("Content-Type", "text/plain");
-        int httpCode = http.POST(data_payload);
-        server_status = (httpCode >= 200 && httpCode < 300);
-
-        if (server_status) {
-            if (DEBUG_MODE) Serial.println("Dato en vivo enviado a InfluxDB correctamente.");
-        } else {
-            if (DEBUG_MODE) Serial.printf("Error al enviar dato en vivo. Codigo HTTP: %d. Guardando en buffer.\n", httpCode);
-            writeToBuffer(data_payload);
-        }
-        http.end();
-    } else {
-        // Si no hay conexión o suscripción, guarda directamente en el buffer
-        server_status = false;
-        writeToBuffer(data_payload);
+    if (xQueueSend(dataQueue, &dataToSend, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (DEBUG_MODE) Serial.println("[N1] La cola de datos está llena, medida descartada.");
     }
 }
 
@@ -613,63 +656,79 @@ void handleFactoryReset() {
     ESP.restart();
 }
 
-// --- FUNCIÓN DE SETUP ---
+// --- FUNCIÓN DE SETUP (VERSIÓN FINAL Y PULIDA) ---
 void setup() {
     Serial.begin(115200);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    // 1. Configuración del Watchdog Timer (Correcta y conservada)
+    // --- MODO DE RECUPERACIÓN ---
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        setupOLED();
+        if (DEBUG_MODE) Serial.println("Boton presionado al arranque. Forzando modo de configuracion...");
+        drawGenericMessage("Modo Configuracion", "Forzado al arranque");
+        
+        WiFiManager wm;
+        wm.setConfigPortalTimeout(300);
+
+        // --> CORRECCIÓN: Usamos startConfigPortal para forzar el portal directamente
+        if (!wm.startConfigPortal("LETE-Monitor-Config")) {
+            if (DEBUG_MODE) Serial.println("Fallo al conectar desde el portal. Reiniciando.");
+        } else {
+            if (DEBUG_MODE) Serial.println("WiFi configurado exitosamente. Reiniciando.");
+        }
+        delay(2000);
+        ESP.restart();
+    }
+
+    // --- ARRANQUE NORMAL ---
+    // 1. Configuración del Watchdog Timer
     if (DEBUG_MODE) Serial.println("Configurando Watchdog Timer...");
     esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // <-- Orden correcto
-    .trigger_panic = true,
+        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+        .trigger_panic = true,
     };
-    esp_task_wdt_init(&wdt_config); // Se inicializa pasando la configuración
-    esp_task_wdt_add(NULL);         // Se añade la tarea actual a la vigilancia
+    esp_task_wdt_reconfigure(&wdt_config);
+    esp_task_wdt_add(NULL);
 
-    // 2. Inicialización de periféricos básicos
+    // 2. Inicialización de periféricos
     setupOLED();
-
     if (!SPIFFS.begin(true)) {
         if (DEBUG_MODE) Serial.println("Error crítico al montar SPIFFS. Reiniciando en 5s...");
-        delay(5000);
-        ESP.restart();
+        delay(5000); ESP.restart();
     }
     if (DEBUG_MODE) Serial.println("SPIFFS montado.");
 
-    // 3. Carga de configuración y mensaje de arranque
+    // 3. Carga de configuración y mensaje
     loadCalibration();
     drawGenericMessage("Luz en tu Espacio", "Iniciando...");
     
-    // 4. Inicialización de los sensores de EmonLib (se hace una sola vez)
+    // 4. Inicialización de sensores
     emon1.voltage(VOLTAGE_SENSOR_PIN, voltage_cal, 1.7);
     emon1.current(CURRENT_SENSOR_PIN_1, current_cal_1);
     emon2.current(CURRENT_SENSOR_PIN_2, current_cal_2);
 
-    // 5. Nuevo método de conexión WiFi (sin autoConnect que bloquea)
+    // 5. Intento de conexión WiFi
     WiFi.mode(WIFI_STA);
-    WiFi.begin(); // Intenta conectar con las credenciales guardadas
-
+    WiFi.begin();
     if (DEBUG_MODE) Serial.print("Conectando a WiFi...");
-    
     byte Cnt = 0;
-    while (WiFi.status() != WL_CONNECTED && Cnt < 30) { // Intenta por ~15 segundos
+    while (WiFi.status() != WL_CONNECTED && Cnt < 30) {
         Cnt++;
         delay(500);
         Serial.print(".");
-        esp_task_wdt_reset(); // Alimenta al watchdog durante la espera
+        esp_task_wdt_reset();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
         if (DEBUG_MODE) {
             Serial.println("\nConectado a la red Wi-Fi!");
-            Serial.print("Dirección IP: ");
-            Serial.println(WiFi.localIP());
+            Serial.print("Dirección IP: "); Serial.println(WiFi.localIP());
         }
     } else {
         if (DEBUG_MODE) Serial.println("\nNo se pudo conectar al WiFi guardado. Se reintentará en el loop.");
     }
+    esp_task_wdt_reset();
     
     // 6. Sincronización de hora (NTP)
     configTime(0, 0, NTP_SERVER);
@@ -682,12 +741,11 @@ void setup() {
         esp_task_wdt_reset();
     }
     if (getLocalTime(&timeinfo)) {
-        if (DEBUG_MODE) Serial.println("Hora sincronizada con NTP.");
         time_synced = true;
     } else {
-        if (DEBUG_MODE) Serial.println("Fallo al sincronizar hora NTP después de 5 intentos.");
         time_synced = false;
     }
+    esp_task_wdt_reset();
     
     // 7. Inicialización de OTA y Servidor Web
     ArduinoOTA.setHostname("lete-monitor");
@@ -702,84 +760,85 @@ void setup() {
     server.on("/factory-reset", handleFactoryReset);
     server.begin();
 
-    // 8. Chequeo inicial de la suscripción
-    int sub_retry_count = 0;
-    while (!subscription_active && sub_retry_count < 3) {
-        if (DEBUG_MODE && sub_retry_count > 0) Serial.printf("Suscripción inactiva. Reintentando... (%d/3)\n", sub_retry_count + 1);
-        checkSubscriptionStatus();
-        if (subscription_active) break;
-        sub_retry_count++;
-        delay(2000);
-        esp_task_wdt_reset();
-    }
+    // 8. Chequeo inicial de tareas del servidor (suscripción, etc.)
+ if (WiFi.status() == WL_CONNECTED) {
+    if (DEBUG_MODE) Serial.println("Realizando chequeo inicial de tareas del servidor...");
+    checkServerTasks();
+}
 
     // 9. Chequeo inicial de actualización de firmware
     delay(100);
     checkForHttpUpdate();
+    esp_task_wdt_reset();
+
+    // 10. (ÚLTIMO PASO) Crear cola y lanzar la tarea del Núcleo 0
+    dataQueue = xQueueCreate(10, sizeof(MeasurementData));
+    if (dataQueue != NULL) {
+        xTaskCreatePinnedToCore(
+            networkTask, "Network Task", 10000, NULL, 1, NULL, 0);
+    } else {
+        if(DEBUG_MODE) Serial.println("Error critico: No se pudo crear la cola de datos.");
+    }
 }
 
-// --- FUNCIÓN DE LOOP PRINCIPAL (VERSIÓN FINAL CORREGIDA) ---
+// --- FUNCIÓN DE LOOP PRINCIPAL (VERSIÓN FINAL v7.0 PARA NÚCLEO 1) ---
 void loop() {
     // 1. Tareas de Mantenimiento Esenciales
     esp_task_wdt_reset();
     unsigned long currentMillis = millis();
 
-    // 2. Lógica de Pulsación Larga (Modo Configuración)
+    // Las tareas de OTA y Web Server son rápidas y se atienden aquí
+    ArduinoOTA.handle();
+    server.handleClient();
+
+    // 2. Lógica de Pulsación del Botón (Configuración y Cambio de Pantalla)
     if (digitalRead(BUTTON_PIN) == LOW) {
         if (!button_is_pressed) {
+            // Se acaba de presionar, iniciar temporizadores
             button_press_start_time = currentMillis;
+            last_button_press = currentMillis;
             button_is_pressed = true;
         } else {
+            // El botón se mantiene presionado, verificar para feedback y acción
+            if ((currentMillis - button_press_start_time > 5000) && (currentMillis - button_press_start_time < 5500)) {
+                if (OLED_CONECTADA) drawGenericMessage("Siga presionando", "para configurar...");
+            }
             if (currentMillis - button_press_start_time > LONG_PRESS_DURATION_MS) {
-                if (DEBUG_MODE) Serial.println("Pulsacion larga detectada. Iniciando modo configuracion...");
-                if(OLED_CONECTADA) drawGenericMessage("Modo Configuracion", "Soltar boton...");
+                if (OLED_CONECTADA) drawGenericMessage("Modo Configuracion", "Soltar boton...");
                 
                 WiFiManager wm;
                 wm.setConfigPortalTimeout(180);
                 if (wm.startConfigPortal("LETE-Monitor-Config")) {
-                    if(OLED_CONECTADA) drawGenericMessage("Config OK", "Reiniciando...");
+                    if (OLED_CONECTADA) drawGenericMessage("Config OK", "Reiniciando...");
                 } else {
-                    if(OLED_CONECTADA) drawGenericMessage("Config Fallo", "Reiniciando...");
+                    if (OLED_CONECTADA) drawGenericMessage("Config Fallo", "Reiniciando...");
                 }
                 delay(2000);
                 ESP.restart();
             }
         }
     } else {
+        // El botón se soltó
+        if (button_is_pressed) {
+            // Si fue una pulsación corta, cambiar de pantalla
+            if (currentMillis - last_button_press < 2000) { // Menos de 2 segundos
+                screen_mode = (screen_mode + 1) % 3;
+                last_screen_change_time = currentMillis;
+            }
+        }
         button_is_pressed = false;
     }
 
-    // --> AJUSTE FINAL: Las tareas de red se ejecutan SÓLO si hay WiFi
-    if (WiFi.status() == WL_CONNECTED) {
-        ArduinoOTA.handle();
-        server.handleClient();
-    }
-    
-    // 3. Tareas Periódicas
+    // 3. Chequeo de reconexión WiFi
     if (currentMillis - last_wifi_check > WIFI_CHECK_INTERVAL_MS) {
         last_wifi_check = currentMillis;
         if (WiFi.status() != WL_CONNECTED) {
-            if (DEBUG_MODE) Serial.println("Wi-Fi desconectado. Intentando reconectar...");
+            if (DEBUG_MODE) Serial.println("[N1] Wi-Fi desconectado. Intentando reconectar...");
             WiFi.reconnect();
         }
     }
 
-    unsigned long next_check_interval = subscription_active ? ACTIVE_SUB_CHECK_INTERVAL_MS : INACTIVE_SUB_CHECK_INTERVAL_MS;
-    if (currentMillis - last_activation_check > next_check_interval) {
-        last_activation_check = currentMillis;
-        checkSubscriptionStatus();
-    }
-
-    if (currentMillis - last_update_check > UPDATE_CHECK_INTERVAL_MS) {
-        last_update_check = currentMillis;
-        checkForHttpUpdate();
-    }
-
-    if (currentMillis - last_remote_cal_check > REMOTE_CAL_CHECK_INTERVAL_MS) {
-        last_remote_cal_check = currentMillis;
-        checkForRemoteCalibration();
-    }
-
+    // 4. Medición y envío de datos a la cola
     if (currentMillis - last_measurement_time > MEASUREMENT_INTERVAL_MS) {
         last_measurement_time = currentMillis;
         if (lecturas_descartadas < LECTURAS_A_DESCARTAR) {
@@ -789,20 +848,11 @@ void loop() {
             measureAndStoreData();
         }
     }
-
-    // 4. Procesamiento de la Cola del Buffer
-    processBufferQueue();
-    buffer_file_count = countBufferFiles();
-
+    
     // 5. Lógica de Pantalla OLED
+    buffer_file_count = countBufferFiles(); // Actualiza el contador
     if (OLED_CONECTADA) {
         unsigned long current_rotation_interval = (screen_mode == 0) ? SCREEN_CONSUMPTION_INTERVAL_MS : SCREEN_OTHER_INTERVAL_MS;
-        
-        if (digitalRead(BUTTON_PIN) == LOW && (currentMillis - last_button_press > 500)) {
-            last_button_press = currentMillis;
-            screen_mode = (screen_mode + 1) % 3;
-            last_screen_change_time = currentMillis;
-        }
         
         if (currentMillis - last_screen_change_time > current_rotation_interval) {
             screen_mode = (screen_mode + 1) % 3;
