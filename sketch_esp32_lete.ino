@@ -43,7 +43,7 @@
 #include <esp_task_wdt.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 8.1; 
+const float FIRMWARE_VERSION = 8.2; 
 #define SERVICE_TYPE "1F"
 const bool OLED_CONECTADA = true;
 const bool DEBUG_MODE = true;
@@ -60,14 +60,25 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 15 * 60 * 1000; // --> AÑADIDO v7.0: Reintento de NTP cada 15 min
 const unsigned long SERVER_TASKS_INTERVAL_MS = 900 * 1000UL; // --> AÑADIDO v7.0: Chequeos al servidor cada 4h
 unsigned long bootTime = 0;
+const unsigned long BUFFER_HEALTH_CHECK_INTERVAL_MS = 60 * 1000UL; // Chequeo de salud del buffer cada minuto
 
 // Configuración del Watchdog y Pulsación Larga
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000 // 10 segundos
 
-// Configuración del buffer en cola
-#define MAX_BUFFER_FILE_SIZE 4096 // 8 KB por archivo
-#define MAX_BUFFER_FILES 50       // Máximo de 50 archivos (50 * 8KB = 400 KB)
+// --> CONFIGURACIÓN OPTIMIZADA DEL BUFFER v8.2
+#define MAX_BUFFER_FILE_SIZE 1024      // 1KB por archivo
+#define MAX_BUFFER_FILES 100           // Aumentado a 100 archivos (800KB total)
+#define BUFFER_ROTATION_SIZE 80        // Opcional: para futuras lógicas de rotación
+#define MAX_MEASUREMENTS_PER_FILE 200  // Límite de mediciones por archivo
+#define BUFFER_BATCH_SIZE 5            // Enviar hasta 5 mediciones por lote
+#define MAX_QUEUE_SIZE 20              // Aumentado el tamaño de cola en memoria
+
+// --> NUEVAS CONFIGURACIONES PARA ROBUSTEZ v8.2
+#define MAX_RETRY_ATTEMPTS 3           // Máximo reintentos por medición
+#define CONNECTION_TIMEOUT_MS 10000    // Timeout para conexiones HTTP
+#define WIFI_RECONNECT_ATTEMPTS 5      // Intentos de reconexión WiFi
+#define DATA_COMPRESSION_LEVEL 1       // Nivel de compresión (1=básico)
 
 // --- 3. CONFIGURACIÓN DE PINES ---
 #define SCREEN_WIDTH 128
@@ -90,16 +101,34 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
 EnergyMonitor emon1, emon2;
 
-// --> AÑADIDO v7.0: Estructura y Cola para comunicación entre núcleos
+// --> ESTRUCTURA MEJORADA PARA MEDICIONES v8.2
 struct MeasurementData {
+    uint32_t sequence_number;  // Número de secuencia para detectar pérdidas
+    uint32_t timestamp;        // Timestamp Unix
     float vrms;
     float irms1;
     float irms2;
     float power;
     float leakage;
     float temp_cpu;
+    uint8_t quality_flag;      // 0=OK, 1=Estimado, 2=Degradado
 };
+
+// --> ESTRUCTURA PARA MÉTRICAS DE SALUD DEL BUFFER v8.2
+struct BufferHealthMetrics {
+    uint32_t total_measurements_taken;
+    uint32_t measurements_sent_live;
+    uint32_t measurements_buffered;
+    uint32_t measurements_lost;
+    uint32_t buffer_overflows;
+    uint32_t network_failures;
+    float buffer_usage_percent;
+    uint32_t oldest_buffered_timestamp;
+};
+
 QueueHandle_t dataQueue;
+
+BufferHealthMetrics buffer_health = {0};
 
 // Variables de Calibración
 float voltage_cal = 265.0;
@@ -121,6 +150,14 @@ int dias_de_gracia_restantes = 0;
 String proximo_pago_str = "--/--/----"; // --> AÑADIDO v7.0
 int buffer_file_count = 0;
 
+// --> NUEVAS VARIABLES PARA CONTROL AVANZADO v8.2
+uint32_t global_sequence_number = 0;
+uint32_t last_sent_sequence = 0;
+bool wifi_connection_stable = false;
+uint8_t wifi_reconnect_attempts = 0;
+unsigned long last_buffer_health_check = 0;
+int current_buffer_file_index = 0;
+
 // Variables de Control
 unsigned long last_measurement_time = 0;
 unsigned long last_server_tasks_check = 0; // --> ACTUALIZADO v7.0: Un solo timer para tareas de servidor
@@ -136,9 +173,10 @@ const int LECTURAS_A_DESCARTAR = 10;
 // --> AÑADIDO v8.0: Mutex para proteger recursos compartidos
 SemaphoreHandle_t spiffsMutex;
 SemaphoreHandle_t sharedVarsMutex;
+SemaphoreHandle_t bufferMetricsMutex; // Proteger métricas del buffer
 
-// --- 5. DECLARACIONES DE FUNCIONES (PROTOTIPOS) ---
-// --> ACTUALIZADO v7.0: Lista completa y organizada de prototipos
+
+// --- 5. DECLARACIONES DE FUNCIONES v8.2 ---
 
 // Tarea del Núcleo 0
 void networkTask(void * pvParameters);
@@ -146,55 +184,71 @@ void networkTask(void * pvParameters);
 // Lógica Principal y de Medición
 void saveCalibration();
 void loadCalibration();
-int countBufferFiles();
-void writeToBuffer(const char* data_payload);
-void processBufferQueue();
-void sendDataToInflux(MeasurementData data);
 void measureAndStoreData();
 
-// Tareas de Servidor (llamadas por networkTask)
+// Funciones de Buffer Optimizadas
+int countBufferFiles();
+void writeToBuffer(const MeasurementData& data);
+void processBufferQueue();
+bool sendDataToInflux(const MeasurementData& data);
+bool sendBatchToInflux(const MeasurementData* dataArray, int count);
+void rotateBufferFiles();
+String compressDataPayload(const MeasurementData& data);
+MeasurementData decompressDataPayload(const String& compressed);
+
+// Funciones de Salud y Recuperación
+void updateBufferHealthMetrics();
+void checkBufferHealth();
+bool isWifiConnectionStable();
+void handleNetworkRecovery();
+
+// Tareas de Servidor
 void checkServerTasks();
-void checkSubscriptionStatus();
 void checkForHttpUpdate();
 
-// Funciones de Servidor Web (Web Handlers)
+// Funciones de Servidor Web
 void handleRoot();
 void handleUpdate();
 void handleResetWifi();
 void handleCalibration();
 void handleRestart();
 void handleFactoryReset();
+void handleBufferStats(); // Nueva página
 
 // Funciones de Pantalla OLED
 void setupOLED();
 void drawConsumptionScreen();
 void drawDiagnosticsScreen();
 void drawServiceScreen();
-void drawBootScreen();
 void drawConfigScreen(const char* apName);
 void drawUpdateScreen(String text);
 void drawGenericMessage(String line1, String line2);
 void drawPaymentDueScreen();
+void drawBufferHealthScreen(); // Nueva pantalla
 const char* getWifiIcon(int rssi);
 
 // --- FUNCIONES DE LÓGICA PRINCIPAL ---
 
-// --- Tarea de Red con Lógica de Prioridad a la Cola en Vivo ---
+// --- Tarea de Red Optimizada con Manejo Inteligente de Prioridades ---
 void networkTask(void * pvParameters) {
-    if (DEBUG_MODE) Serial.println("Tarea de Red iniciada en Núcleo 0.");
+    if (DEBUG_MODE) Serial.println("Tarea de Red v8.2 iniciada en Núcleo 0.");
     esp_task_wdt_add(NULL);
 
     unsigned long last_ntp_sync_attempt = 0;
+    MeasurementData batch_buffer[BUFFER_BATCH_SIZE];
+    int batch_count = 0;
 
-    for (;;) { // Bucle infinito para la tarea de red
+    for (;;) {
         esp_task_wdt_reset();
+        
+        wifi_connection_stable = isWifiConnectionStable();
 
-        if (WiFi.status() == WL_CONNECTED) {
+        if (wifi_connection_stable) {
             
-            // --- Lógica de Sincronización NTP (no cambia) ---
+            // Sincronización NTP
             if (!time_synced && millis() - last_ntp_sync_attempt > NTP_RETRY_INTERVAL_MS) {
                 last_ntp_sync_attempt = millis();
-                if (DEBUG_MODE) Serial.println("[N0] Reintentando sincronizacion de hora NTP...");
+                if (DEBUG_MODE) Serial.println("[N0] Reintentando sincronización NTP...");
                 configTime(0, 0, NTP_SERVER);
                 
                 struct tm timeinfo;
@@ -203,38 +257,57 @@ void networkTask(void * pvParameters) {
                         time_synced = true;
                         xSemaphoreGive(sharedVarsMutex);
                     }
-                    if (DEBUG_MODE) Serial.println("[N0] Hora NTP sincronizada exitosamente.");
+                    if (DEBUG_MODE) Serial.println("[N0] Hora NTP sincronizada.");
                 } else {
-                    if (DEBUG_MODE) Serial.println("[N0] Fallo al reintentar la sincronizacion NTP.");
+                    if (DEBUG_MODE) Serial.println("[N0] Fallo en sincronización NTP.");
                 }
             }
 
-            // --- LÓGICA DE PROCESAMIENTO CON PRIORIDAD ABSOLUTA ---
+            // --- PROCESAMIENTO EN LOTES PARA MAYOR EFICIENCIA ---
             MeasurementData receivedData;
+            bool data_available = false;
             
-            // Primero, intentamos leer un dato de la cola en vivo.
-            if (xQueueReceive(dataQueue, &receivedData, 0) == pdTRUE) {
-                // Si había un dato, lo enviamos. Damos prioridad a vaciar la cola.
-                sendDataToInflux(receivedData);
-            } else {
-                // Si la cola en vivo está VACÍA, entonces y solo entonces,
-                // revisamos si hay trabajo pendiente en el buffer.
-                if (countBufferFiles() > 0) {
-                    if (DEBUG_MODE) Serial.println("[N0] Cola en vivo vacía. Procesando un archivo del buffer...");
-                    processBufferQueue();
+            // Recolectar datos de la cola en lotes
+            while (batch_count < BUFFER_BATCH_SIZE && 
+                   xQueueReceive(dataQueue, &receivedData, 0) == pdTRUE) {
+                batch_buffer[batch_count] = receivedData;
+                batch_count++;
+                data_available = true;
+            }
+            
+            // Enviar lote si hay datos
+            if (data_available && batch_count > 0) {
+                if (batch_count == 1) { // Un solo dato, envío individual
+                    sendDataToInflux(batch_buffer[0]);
+                } else { // Múltiples datos, envío en lote
+                    sendBatchToInflux(batch_buffer, batch_count);
                 }
+                batch_count = 0; // Resetear contador de lote
+            }
+            
+            // Si la cola en vivo está vacía, procesar buffer almacenado
+            if (!data_available && countBufferFiles() > 0) {
+                if (DEBUG_MODE) Serial.println("[N0] Procesando datos del buffer...");
+                processBufferQueue();
             }
 
-            // --- Lógica de Tareas de Servidor (no cambia) ---
+            // Tareas de servidor
             if (millis() - last_server_tasks_check > SERVER_TASKS_INTERVAL_MS) {
                 last_server_tasks_check = millis();
                 checkServerTasks();
             }
+            
+        } else {
+            handleNetworkRecovery();
         }
         
-        // Reducimos el delay para que la tarea sea más responsiva y pueda vaciar
-        // la cola más rápido si es necesario.
-        vTaskDelay(pdMS_TO_TICKS(500)); // Delay reducido a 0.5 segundos
+        // Chequeo de salud del buffer
+        if (millis() - last_buffer_health_check > BUFFER_HEALTH_CHECK_INTERVAL_MS) {
+            last_buffer_health_check = millis();
+            checkBufferHealth();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -317,75 +390,60 @@ void loadCalibration() {
     }
 }
 
-// --> Cuenta cuántos archivos de buffer existen de forma segura
-int countBufferFiles() {
-    int count = 0;
-    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-            String filename = "/buffer_" + String(i) + ".txt";
-            if (SPIFFS.exists(filename)) {
-                count++;
-            }
-        }
-        // Liberamos el control de SPIFFS ANTES de salir de la función
-        xSemaphoreGive(spiffsMutex);
-    } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en countBufferFiles.");
-    }
-    return count;
-}
-
-// --> Lógica segura para escribir datos en la cola del buffer
-void writeToBuffer(const char* data_payload) {
+// --- Función Mejorada para Escribir al Buffer con Compresión ---
+void writeToBuffer(const MeasurementData& data) {
     if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         String filename;
-        bool file_found = false;
-        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
-            filename = "/buffer_" + String(i) + ".txt";
-            if (!SPIFFS.exists(filename)) {
-                file_found = true;
-                break;
+        File bufferFile;
+        
+        filename = "/buffer_" + String(current_buffer_file_index) + ".txt";
+        
+        bool needs_rotation = false;
+        if (SPIFFS.exists(filename)) {
+            bufferFile = SPIFFS.open(filename, FILE_READ);
+            if (bufferFile && bufferFile.size() >= MAX_BUFFER_FILE_SIZE) {
+                needs_rotation = true;
             }
-            File file = SPIFFS.open(filename, FILE_READ);
-            if (file && file.size() < MAX_BUFFER_FILE_SIZE) {
-                file.close();
-                file_found = true;
-                break;
-            }
-            if(file) file.close();
+            if (bufferFile) bufferFile.close();
         }
 
-        if (!file_found) {
-            if (DEBUG_MODE) Serial.println("[N0] Buffer lleno. Dato descartado.");
-        } else {
-            File bufferFile = SPIFFS.open(filename, FILE_APPEND);
-            if (bufferFile) {
-                bufferFile.print(data_payload);
-                bufferFile.close();
-                if (DEBUG_MODE) Serial.printf("[N0] Dato guardado en buffer: %s\n", filename.c_str());
+        if (needs_rotation || countBufferFiles() >= MAX_BUFFER_FILES) {
+            rotateBufferFiles();
+            current_buffer_file_index = (current_buffer_file_index + 1) % MAX_BUFFER_FILES;
+            filename = "/buffer_" + String(current_buffer_file_index) + ".txt";
+            
+            if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                buffer_health.buffer_overflows++;
+                xSemaphoreGive(bufferMetricsMutex);
+            }
+        }
+
+        String compressed_data = compressDataPayload(data);
+        bufferFile = SPIFFS.open(filename, FILE_APPEND);
+        if (bufferFile) {
+            bufferFile.println(compressed_data);
+            bufferFile.close();
+            
+            if (DEBUG_MODE) Serial.printf("[N0] Medición %u guardada en %s\n", data.sequence_number, filename.c_str());
+            
+            if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                buffer_health.measurements_buffered++;
+                xSemaphoreGive(bufferMetricsMutex);
             }
         }
         
         xSemaphoreGive(spiffsMutex);
     } else {
-        if (DEBUG_MODE) Serial.println("Timeout al esperar el mutex de SPIFFS en writeToBuffer.");
+        if (DEBUG_MODE) Serial.println("Timeout en writeToBuffer.");
+        if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            buffer_health.measurements_lost++;
+            xSemaphoreGive(bufferMetricsMutex);
+        }
     }
 }
 
-// --> Envía un struct de datos a InfluxDB (con lógica de período de gracia)
-void sendDataToInflux(MeasurementData data) {
-    char data_payload[300]; 
-    int chars_written = snprintf(data_payload, sizeof(data_payload), 
-             "%s,device=LETE-%04X vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f\n",
-             INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(),
-             data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu);
-
-    if (chars_written < 0 || chars_written >= sizeof(data_payload)) {
-        if (DEBUG_MODE) Serial.println("[N0] Error: Payload de datos truncado.");
-        return;
-    }
-    
-    // --- LECTURA SEGURA DE LAS VARIABLES DE ESTADO ---
+// --- Función Mejorada para Envío Individual con Reintentos ---
+bool sendDataToInflux(const MeasurementData& data) {
     bool sub_activa_local = false;
     int dias_gracia_local = 0;
     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -394,35 +452,58 @@ void sendDataToInflux(MeasurementData data) {
         xSemaphoreGive(sharedVarsMutex);
     }
     
-    // --- LÓGICA DE DECISIÓN CORRECTA ---
-    // Enviar si el WiFi está conectado Y (la suscripción está activa O quedan días de gracia)
     if (WiFi.status() != WL_CONNECTED || (!sub_activa_local && dias_gracia_local <= 0)) {
-        if (DEBUG_MODE) Serial.println("[N0] Envío omitido (sin WiFi o suscripción/gracia). Guardando en buffer.");
-        writeToBuffer(data_payload);
-        return;
+        writeToBuffer(data);
+        return false;
+    }
+    // --- TRADUCCIÓN A INFLUXDB LINE PROTOCOL ---
+    char influx_payload[300];
+    snprintf(influx_payload, sizeof(influx_payload),
+        "%s,device=LETE-%04X,seq=%u vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%ui %llu",
+        INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(), data.sequence_number,
+        data.vrms, data.irms1, data.irms2, data.power, data.leakage, data.temp_cpu,
+        data.quality_flag, (unsigned long long)data.timestamp * 1000000000ULL);
+
+    for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+        HTTPClient http;
+        http.setTimeout(CONNECTION_TIMEOUT_MS);
+        http.begin(INFLUXDB_URL);
+        http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
+        http.addHeader("Content-Type", "text/plain");
+        
+        int httpCode = http.POST(influx_payload);
+        bool success = (httpCode >= 200 && httpCode < 300);
+        http.end();
+
+        if (success) {
+            if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                buffer_health.measurements_sent_live++;
+                xSemaphoreGive(bufferMetricsMutex);
+            }
+            if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                server_status = true;
+                xSemaphoreGive(sharedVarsMutex);
+            }
+            if (DEBUG_MODE) Serial.printf("[N0] Medición %u enviada exitosamente.\n", data.sequence_number);
+            return true;
+        } else {
+            if (DEBUG_MODE) Serial.printf("[N0] Intento %d fallo (HTTP:%d) para medición %u\n", attempt + 1, httpCode, data.sequence_number);
+            if (attempt < MAX_RETRY_ATTEMPTS - 1) {
+                vTaskDelay(pdMS_TO_TICKS(1000 * (1 << attempt)));
+            }
+        }
     }
     
-    HTTPClient http;
-    http.setTimeout(5000);
-    http.begin(INFLUXDB_URL);
-    http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
-    http.addHeader("Content-Type", "text/plain");
-    
-    int httpCode = http.POST(data_payload);
-    bool status = (httpCode >= 200 && httpCode < 300);
-    http.end();
-
+    writeToBuffer(data);
+    if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        buffer_health.network_failures++;
+        xSemaphoreGive(bufferMetricsMutex);
+    }
     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        server_status = status;
+        server_status = false;
         xSemaphoreGive(sharedVarsMutex);
     }
-
-    if (status) {
-        if (DEBUG_MODE) Serial.println("[N0] Dato en vivo enviado a InfluxDB correctamente.");
-    } else {
-        if (DEBUG_MODE) Serial.printf("[N0] Error al enviar dato en vivo. HTTP: %d. Guardando en buffer.\n", httpCode);
-        writeToBuffer(data_payload);
-    }
+    return false;
 }
 
 // --> Lógica segura para procesar la cola del buffer (con log de confirmación)
@@ -614,9 +695,8 @@ void checkForHttpUpdate() {
     http.end();
 }
 
-// Mide los sensores y pone los datos en la cola para el Núcleo 0
+// --- Función Mejorada de Medición con Secuencia y Calidad ---
 void measureAndStoreData() {
-    // Esta función está perfecta, no necesita cambios.
     emon1.calcVI(20, 2000);
     emon1.calcIrms(1480);
     emon2.calcIrms(1480);
@@ -627,9 +707,13 @@ void measureAndStoreData() {
     latest_irms2 = emon2.Irms;
     latest_temp_cpu = temperatureRead();
 
+    uint8_t quality = 0;
     if (isnan(latest_vrms) || isinf(latest_vrms) || isnan(latest_irms1) || isinf(latest_irms1)) {
-        if (DEBUG_MODE) Serial.println("[N1] Lectura inválida (NaN/Inf) descartada.");
-        return;
+        if (DEBUG_MODE) Serial.println("[N1] Lectura inválida, usando valores estimados.");
+        latest_vrms = 220.0;
+        latest_irms1 = 0.0;
+        latest_irms2 = 0.0;
+        quality = 1;
     }
 
     if (latest_vrms < 30.0) latest_vrms = 0.0;
@@ -639,17 +723,27 @@ void measureAndStoreData() {
     latest_leakage = abs(latest_irms1 - latest_irms2);
 
     MeasurementData dataToSend;
+    dataToSend.sequence_number = ++global_sequence_number;
+    dataToSend.timestamp = time_synced ? time(NULL) : (millis() / 1000);
     dataToSend.vrms = latest_vrms;
     dataToSend.irms1 = latest_irms1;
     dataToSend.irms2 = latest_irms2;
     dataToSend.power = latest_power;
     dataToSend.leakage = latest_leakage;
     dataToSend.temp_cpu = latest_temp_cpu;
+    dataToSend.quality_flag = quality;
 
-    if (xQueueSend(dataQueue, &dataToSend, pdMS_TO_TICKS(100)) != pdTRUE) {
-        if (DEBUG_MODE) Serial.println("[N1] La cola de datos está llena, medida descartada.");
+    if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        buffer_health.total_measurements_taken++;
+        xSemaphoreGive(bufferMetricsMutex);
+    }
+
+    if (xQueueSend(dataQueue, &dataToSend, pdMS_TO_TICKS(50)) != pdTRUE) {
+        if (DEBUG_MODE) Serial.println("[N1] Cola llena, guardando directamente en buffer.");
+        writeToBuffer(dataToSend);
     }
 }
+
 
 // --- FUNCIONES DE INTERFAZ WEB (SERVIDOR) ---
 
@@ -834,11 +928,305 @@ void handleFactoryReset() {
     ESP.restart();
 }
 
+// --- NUEVAS FUNCIONES DE UTILIDAD v8.2 ---
+
+// --- Nueva Función para Envío en Lotes (Más Eficiente) ---
+bool sendBatchToInflux(const MeasurementData* dataArray, int count) {
+    if (count <= 0) return false;
+
+    // --- TRADUCCIÓN DEL LOTE A INFLUXDB LINE PROTOCOL ---
+    String batch_payload = "";
+    for (int i = 0; i < count; i++) {
+        char influx_line[300];
+        snprintf(influx_line, sizeof(influx_line),
+            "%s,device=LETE-%04X,seq=%u vrms=%.2f,irms1=%.3f,irms2=%.3f,power=%.2f,leakage=%.3f,cpu_temp=%.1f,quality=%ui %llu",
+            INFLUXDB_MEASUREMENT, (uint16_t)ESP.getEfuseMac(), dataArray[i].sequence_number,
+            dataArray[i].vrms, dataArray[i].irms1, dataArray[i].irms2, dataArray[i].power, dataArray[i].leakage, dataArray[i].temp_cpu,
+            dataArray[i].quality_flag, (unsigned long long)dataArray[i].timestamp * 1000000000ULL);
+        
+        batch_payload += influx_line;
+        if (i < count - 1) batch_payload += "\n";
+    }
+    
+    for (int i = 0; i < count; i++) {
+        batch_payload += compressDataPayload(dataArray[i]);
+        if (i < count - 1) batch_payload += "\n";
+    }
+    
+    HTTPClient http;
+    http.setTimeout(CONNECTION_TIMEOUT_MS * 2);
+    http.begin(INFLUXDB_URL);
+    http.addHeader("Authorization", "Token " INFLUXDB_TOKEN);
+    http.addHeader("Content-Type", "text/plain");
+    
+    int httpCode = http.POST(batch_payload);
+    bool success = (httpCode >= 200 && httpCode < 300);
+    http.end();
+    
+    if (success) {
+        if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            buffer_health.measurements_sent_live += count;
+            xSemaphoreGive(bufferMetricsMutex);
+        }
+        if (DEBUG_MODE) Serial.printf("[N0] Lote de %d mediciones enviado exitosamente.\n", count);
+    } else {
+        for (int i = 0; i < count; i++) {
+            writeToBuffer(dataArray[i]);
+        }
+        if (DEBUG_MODE) Serial.printf("[N0] Fallo lote (HTTP:%d), %d mediciones al buffer.\n", httpCode, count);
+    }
+    return success;
+}
+
+// --- Función de Compresión de Datos (Formato Compacto) ---
+String compressDataPayload(const MeasurementData& data) {
+    char compressed_buffer[200];
+    int chars_written = snprintf(compressed_buffer, sizeof(compressed_buffer),
+        "%u|%u|%.2f|%.3f|%.3f|%.2f|%.3f|%.1f|%u",
+        data.sequence_number, data.timestamp, data.vrms, data.irms1, data.irms2,
+        data.power, data.leakage, data.temp_cpu, data.quality_flag);
+    
+    if (chars_written < 0 || chars_written >= sizeof(compressed_buffer)) {
+        if (DEBUG_MODE) Serial.println("Error en compresión de datos.");
+        return "";
+    }
+    return String(compressed_buffer);
+}
+
+// --- Función de Descompresión (Para Lectura del Buffer) ---
+MeasurementData decompressDataPayload(const String& compressed) {
+    MeasurementData data = {0};
+    int indices[9] = {0};
+    int found = 0;
+    int last_index = -1;
+
+    for (int i = 0; i < compressed.length() && found < 8; i++) {
+        if (compressed[i] == '|') {
+            indices[found++] = i;
+        }
+    }
+
+    if (found >= 7) {
+        data.sequence_number = compressed.substring(0, indices[0]).toInt();
+        data.timestamp = compressed.substring(indices[0] + 1, indices[1]).toInt();
+        data.vrms = compressed.substring(indices[1] + 1, indices[2]).toFloat();
+        data.irms1 = compressed.substring(indices[2] + 1, indices[3]).toFloat();
+        data.irms2 = compressed.substring(indices[3] + 1, indices[4]).toFloat();
+        data.power = compressed.substring(indices[4] + 1, indices[5]).toFloat();
+        data.leakage = compressed.substring(indices[5] + 1, indices[6]).toFloat();
+        data.temp_cpu = compressed.substring(indices[6] + 1, indices[7]).toFloat();
+        if (found >= 8) {
+             data.quality_flag = compressed.substring(indices[7] + 1).toInt();
+        }
+    }
+    return data;
+}
+
+// --- Función de Rotación de Archivos del Buffer ---
+void rotateBufferFiles() {
+    if (DEBUG_MODE) Serial.println("[N0] Iniciando rotación de archivos de buffer...");
+    uint32_t oldest_timestamp = UINT32_MAX;
+    String oldest_file = "";
+
+    for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+        String filename = "/buffer_" + String(i) + ".txt";
+        if (SPIFFS.exists(filename)) {
+            File file = SPIFFS.open(filename, FILE_READ);
+            if (file && file.size() > 0) {
+                String first_line = file.readStringUntil('\n');
+                file.close();
+                MeasurementData data = decompressDataPayload(first_line);
+                if (data.timestamp < oldest_timestamp) {
+                    oldest_timestamp = data.timestamp;
+                    oldest_file = filename;
+                }
+            } else if (file) {
+                file.close();
+            }
+        }
+    }
+    
+    if (!oldest_file.isEmpty()) {
+        SPIFFS.remove(oldest_file);
+        if (DEBUG_MODE) Serial.printf("[N0] Archivo más antiguo eliminado: %s\n", oldest_file.c_str());
+    }
+}
+
+// --- Nueva Función para Verificar Estabilidad de WiFi ---
+bool isWifiConnectionStable() {
+    if (WiFi.status() != WL_CONNECTED) {
+        wifi_reconnect_attempts++;
+        return false;
+    }
+    if (WiFi.RSSI() < -85) return false;
+    wifi_reconnect_attempts = 0;
+    return true;
+}
+
+// --- Función para Manejo de Recuperación de Red ---
+void handleNetworkRecovery() {
+    if (wifi_reconnect_attempts >= WIFI_RECONNECT_ATTEMPTS) {
+        if (DEBUG_MODE) Serial.println("[N0] Demasiados fallos de WiFi. Reiniciando ESP32...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP.restart();
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        if (DEBUG_MODE) Serial.println("[N0] Intentando reconexión WiFi...");
+        WiFi.reconnect();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// --- Función para Chequeo de Salud del Buffer ---
+void checkBufferHealth() {
+    if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int current_files = countBufferFiles();
+        buffer_health.buffer_usage_percent = (float)current_files / MAX_BUFFER_FILES * 100.0;
+        
+        if (DEBUG_MODE) {
+            Serial.printf("\n[N0] --- SALUD DEL BUFFER ---\n");
+            Serial.printf(" > Uso: %.1f%% (%d/%d archivos)\n", buffer_health.buffer_usage_percent, current_files, MAX_BUFFER_FILES);
+            Serial.printf(" > Mediciones: %u tomadas, %u enviadas, %u en buffer, %u perdidas\n", buffer_health.total_measurements_taken, buffer_health.measurements_sent_live, buffer_health.measurements_buffered, buffer_health.measurements_lost);
+            Serial.printf(" > Fallos de red: %u | Overflows: %u\n", buffer_health.network_failures, buffer_health.buffer_overflows);
+            Serial.printf("---------------------------\n");
+        }
+        xSemaphoreGive(bufferMetricsMutex);
+    }
+}
+
+// --- Función Mejorada para Contar Archivos de Buffer (con Cache) ---
+int countBufferFiles() {
+    static unsigned long last_count_time = 0;
+    static int cached_count = 0;
+    
+    if (millis() - last_count_time < 5000) {
+        return cached_count;
+    }
+    
+    int count = 0;
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        for (int i = 0; i < MAX_BUFFER_FILES; i++) {
+            if (SPIFFS.exists("/buffer_" + String(i) + ".txt")) {
+                count++;
+            }
+        }
+        xSemaphoreGive(spiffsMutex);
+        cached_count = count;
+        last_count_time = millis();
+    }
+    return count;
+}
+
+// --- Nueva Página Web para Estadísticas del Buffer v8.2 ---
+void handleBufferStats() {
+    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
+        return server.requestAuthentication();
+    }
+
+    // Obtener métricas actuales de forma segura
+    BufferHealthMetrics current_metrics = {0};
+    if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        current_metrics = buffer_health;
+        xSemaphoreGive(bufferMetricsMutex);
+    }
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    char chunk_buffer[512];
+
+    // Encabezado
+    server.sendContent("<html><head><title>Estadísticas del Buffer - LETE</title>");
+    server.sendContent("<meta http-equiv='refresh' content='10'>");
+    server.sendContent("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+    server.sendContent("<style>body{font-family:sans-serif;} .metric{background:#f0f0f0;padding:10px;margin:5px;border-radius:5px;} .alert{color:red;} .ok{color:green;}</style></head><body>");
+
+    server.sendContent("<h1>Estadísticas del Buffer LETE v8.2</h1>");
+    server.sendContent("<p><a href='/'>&larr; Volver al Panel Principal</a></p>");
+
+    // Métricas principales
+    server.sendContent("<h2>Métricas de Rendimiento</h2>");
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Mediciones Totales:</b> %u</div>", 
+        current_metrics.total_measurements_taken);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Enviadas en Vivo:</b> %u</div>", 
+        current_metrics.measurements_sent_live);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>En Buffer:</b> %u</div>", 
+        current_metrics.measurements_buffered);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Perdidas:</b> %u</div>", 
+        current_metrics.measurements_lost);
+    server.sendContent(chunk_buffer);
+
+    // Estado del buffer
+    server.sendContent("<h2>Estado del Buffer</h2>");
+    
+    String usage_class = (current_metrics.buffer_usage_percent > 80) ? "alert" : "ok";
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric %s'><b>Uso del Buffer:</b> %.1f%%</div>", 
+        usage_class.c_str(), current_metrics.buffer_usage_percent);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Archivos de Buffer:</b> %d / %d</div>", 
+        countBufferFiles(), MAX_BUFFER_FILES);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Overflows del Buffer:</b> %u</div>", 
+        current_metrics.buffer_overflows);
+    server.sendContent(chunk_buffer);
+    
+    snprintf(chunk_buffer, sizeof(chunk_buffer), 
+        "<div class='metric'><b>Fallos de Red:</b> %u</div>", 
+        current_metrics.network_failures);
+    server.sendContent(chunk_buffer);
+
+    // Información de datos más antiguos
+    if (current_metrics.oldest_buffered_timestamp > 0 && time_synced) {
+        uint32_t age_seconds = time(NULL) - current_metrics.oldest_buffered_timestamp;
+        snprintf(chunk_buffer, sizeof(chunk_buffer), 
+            "<div class='metric'><b>Dato más Antiguo:</b> %u segundos</div>", 
+            age_seconds);
+        server.sendContent(chunk_buffer);
+    }
+
+    // Calcular tasas de éxito
+    if (current_metrics.total_measurements_taken > 0) {
+        float success_rate = (float)current_metrics.measurements_sent_live / current_metrics.total_measurements_taken * 100.0f;
+        float loss_rate = (float)current_metrics.measurements_lost / current_metrics.total_measurements_taken * 100.0f;
+        
+        server.sendContent("<h2>Tasas de Rendimiento</h2>");
+        
+        String success_class = (success_rate > 90) ? "ok" : "alert";
+        snprintf(chunk_buffer, sizeof(chunk_buffer), 
+            "<div class='metric %s'><b>Tasa de Éxito:</b> %.1f%%</div>", 
+            success_class.c_str(), success_rate);
+        server.sendContent(chunk_buffer);
+        
+        snprintf(chunk_buffer, sizeof(chunk_buffer), 
+            "<div class='metric'><b>Tasa de Pérdida:</b> %.1f%%</div>", 
+            loss_rate);
+        server.sendContent(chunk_buffer);
+    }
+
+    server.sendContent("</body></html>");
+    server.sendContent("");
+}
+
 // --- FUNCIÓN DE SETUP (VERSIÓN FINAL Y PULIDA) ---
 void setup() {
     Serial.begin(115200);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
-    // --> AÑADIDO v8.1 (CRÍTICO)
     Wire.begin(I2C_SDA, I2C_SCL);
 
     bootTime = millis();
@@ -867,10 +1255,11 @@ void setup() {
     // --> AÑADIDO v8.0: Crear Mutex
     spiffsMutex = xSemaphoreCreateMutex();
     sharedVarsMutex = xSemaphoreCreateMutex();
+    bufferMetricsMutex = xSemaphoreCreateMutex(); // Nuevo mutex
 
-    if (spiffsMutex == NULL || sharedVarsMutex == NULL) {
-        Serial.println("Error crítico: No se pudieron crear los mutex.");
-        // Aquí podríamos entrar en un bucle infinito o reiniciar.
+    if (spiffsMutex == NULL || sharedVarsMutex == NULL || bufferMetricsMutex == NULL) {
+    Serial.println("Error crítico: Fallo creando mutex.");
+    ESP.restart(); // Reiniciar si no se pueden crear
     }
 
     // 1. Configuración del Watchdog Timer
@@ -950,6 +1339,7 @@ void setup() {
     server.on("/calibracion", handleCalibration);
     server.on("/restart", handleRestart);
     server.on("/factory-reset", handleFactoryReset);
+    server.on("/buffer-stats", handleBufferStats); // Nueva página
     server.begin();
 
     // 8. Chequeo inicial de tareas del servidor (suscripción, etc.)
@@ -964,12 +1354,12 @@ void setup() {
     esp_task_wdt_reset();
 
     // 10. (ÚLTIMO PASO) Crear cola y lanzar la tarea del Núcleo 0
-    dataQueue = xQueueCreate(10, sizeof(MeasurementData));
+    dataQueue = xQueueCreate(MAX_QUEUE_SIZE, sizeof(MeasurementData));
     if (dataQueue != NULL) {
         xTaskCreatePinnedToCore(
              networkTask,        /* Function to implement the task */
-             "Network Task",     /* Name of the task */
-             16384,              /* Stack size in words --> AUMENTADO a 16KB */
+             "Network Task v8.2",     /* Name of the task */
+             20480,              /* Stack size in words --> AUMENTADO a 16KB */
              NULL,               /* Task input parameter */
              1,                  /* Priority of the task */
              NULL,               /* Task handle. */
