@@ -169,4 +169,45 @@ void drawServiceScreen() {
     display.setCursor(0, 50);
     display.printf("Firmware: v%.1f", FIRMWARE_VERSION);
     display.display();
+
+    switch (screen_mode) {
+    case 0: drawConsumptionScreen(); break;
+    case 1: drawDiagnosticsScreen(); break;
+    case 2: drawServiceScreen(); break;
+    case 3: drawBufferHealthScreen(); break; // <-- NUEVA PANTALLA
+  }
 }
+
+// --- NUEVA PANTALLA v8.2: Salud del Buffer ---
+void drawBufferHealthScreen() {
+    if (!OLED_CONECTADA) return;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("--- SALUD DEL BUFFER ---");
+
+    BufferHealthMetrics current_metrics = {0};
+    if (xSemaphoreTake(bufferMetricsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        current_metrics = buffer_health;
+        xSemaphoreGive(bufferMetricsMutex);
+    }
+
+    display.setCursor(0, 12);
+    display.printf("Uso: %.1f%%", current_metrics.buffer_usage_percent);
+    
+    display.setCursor(70, 12);
+    display.printf("Arch: %d/%d", countBufferFiles(), MAX_BUFFER_FILES);
+
+    display.setCursor(0, 24);
+    display.printf("Enviadas: %u", current_metrics.measurements_sent_live);
+
+    display.setCursor(0, 36);
+    display.printf("En Buffer: %u", current_metrics.measurements_buffered);
+
+    display.setCursor(0, 48);
+    String status_class = (current_metrics.measurements_lost > 50) ? "[ALERTA]" : "[OK]";
+    display.printf("Perdidas: %u %s", current_metrics.measurements_lost, status_class.c_str());
+
+    display.display();
+}
+
