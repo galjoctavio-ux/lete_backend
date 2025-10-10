@@ -1,11 +1,11 @@
 # -------------------------------------------------------------------
-# Script de Alertas Diarias para LETE v3.0 (Reformulado)
-# Incorpora mejoras de robustez, precisión y nuevas funcionalidades
+# Script de Alertas Diarias para LETE v3.1 (Refactorizado)
+# - Se elimina InfluxDB para usar un servidor local de datos.
+# - Se reestructura la lógica de procesamiento de clientes.
 # -------------------------------------------------------------------
 
 # --- 1. Importaciones ---
 import psycopg2
-from influxdb_client_3 import InfluxDBClient3
 import requests
 import pandas as pd
 import certifi
@@ -13,8 +13,6 @@ import os
 import json
 from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
-
-# --- MEJORA: Librerías para Zonas Horarias y Reintentos ---
 import pytz
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -25,11 +23,6 @@ load_dotenv()
 os.environ['GRPC_DEFAULT_SSL_ROOTS_FILE_PATH'] = certifi.where()
 
 # --- 4. Configuración General (desde .env) ---
-# --- MEJORA: Se leen todas las configuraciones sensibles y lógicas desde .env ---
-INFLUX_URL = os.environ.get("INFLUX_URL")
-INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN")
-INFLUX_ORG = os.environ.get("INFLUX_ORG")
-INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET")
 
 DB_HOST = os.environ.get("DB_HOST")
 DB_USER = os.environ.get("DB_USER")
@@ -42,12 +35,12 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_URL = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
 
 # --- IDs de Plantillas de Mensajes (Templates) ---
-CONTENT_SID_REPORTE_DIARIO = os.environ.get("CONTENT_SID_REPORTE_DIARIO") # Renombrado para claridad
-CONTENT_SID_AVISO_NUEVO = os.environ.get("CONTENT_SID_AVISO_NUEVO") # Para clientes nuevos
-
-# --- NUEVA FUNCIONALIDAD: IDs para nuevas alertas ---
+CONTENT_SID_REPORTE_DIARIO = os.environ.get("CONTENT_SID_REPORTE_DIARIO")
+CONTENT_SID_AVISO_NUEVO = os.environ.get("CONTENT_SID_AVISO_NUEVO")
 CONTENT_SID_AVISO_CORTE_3DIAS = os.environ.get("CONTENT_SID_AVISO_CORTE_3DIAS")
 CONTENT_SID_AVISO_DIA_DE_CORTE = os.environ.get("CONTENT_SID_AVISO_DIA_DE_CORTE")
+# --- MODIFICADO: Se centraliza la carga de esta variable ---
+CONTENT_SID_REPORTE_INICIAL = os.environ.get("CONTENT_SID_REPORTE_INICIAL") 
 
 # --- Lógica de Negocio y Reglas ---
 IVA = 1.16
@@ -69,6 +62,9 @@ TARIFAS_CFE = {
     ],
     'PDBT': [
         {'hasta_kwh': float('inf'), 'precio': 5.60}
+    ],
+    'DAC': [
+        {'hasta_kwh': float('inf'), 'precio': 7.80}
     ]
 }
 
@@ -161,48 +157,57 @@ def resetear_banderas_notificacion(device_id):
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
 
-# --- 6. Funciones de InfluxDB y APIs Externas ---
+# --- 6. Funciones de Consulta de Datos y APIs Externas ---
 
-# --- MEJORA: Se añade un decorador de reintentos para robustez ---
-@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
-def obtener_consumo_kwh_en_rango(client_influx, device_id, fecha_inicio_aware, fecha_fin_aware):
+def obtener_consumo_desde_servidor_local(device_id, fecha_inicio_aware, fecha_fin_aware):
     """
-    Obtiene el total de kWh consumidos en un rango de fechas, manejando zonas horarias.
+    Lee el archivo CSV local, filtra los datos para un dispositivo y rango de fechas, 
+    y calcula el consumo total y diario en kWh.
     """
-    mac_completa = str(device_id).replace(":", "")
-    device_id_influx = f"LETE-{mac_completa[2:4]}{mac_completa[0:2]}".upper()
-    
-    # --- MEJORA: Conversión a UTC y formato RFC3339 para InfluxDB ---
-    fecha_inicio_utc = fecha_inicio_aware.astimezone(pytz.utc).isoformat().replace('+00:00', 'Z')
-    fecha_fin_utc = fecha_fin_aware.astimezone(pytz.utc).isoformat().replace('+00:00', 'Z')
+    archivo_csv = 'mediciones.csv'
+    print(f"Leyendo {archivo_csv} para el dispositivo {device_id}...")
 
-    query = f"""
-        SELECT time, power
-        FROM "energia_estado"
-        WHERE "device" = '{device_id_influx}' AND time >= '{fecha_inicio_utc}' AND time < '{fecha_fin_utc}'
-    """
     try:
-        tabla = client_influx.query(query=query, language="sql")
-        df = tabla.to_pandas().dropna(subset=['power', 'time'])
+        # 1. Leer el archivo CSV con Pandas
+        df = pd.read_csv(archivo_csv)
         if df.empty:
-            return 0.0, None # Devuelve consumo 0.0 y un DataFrame vacío
+            return 0.0, pd.Series()
 
-        df['time'] = pd.to_datetime(df['time'])
-        df = df.set_index('time').sort_index()
+        # 2. Convertir la columna de timestamp a objetos de fecha (timezone-aware)
+        df['timestamp_servidor'] = pd.to_datetime(df['timestamp_servidor'], utc=True)
+
+        # 3. Filtrar los datos por el device_id y el rango de fechas
+        df_filtrado = df[
+            (df['device_id'] == device_id) &
+            (df['timestamp_servidor'] >= fecha_inicio_aware) &
+            (df['timestamp_servidor'] < fecha_fin_aware)
+        ]
+
+        if df_filtrado.empty:
+            return 0.0, pd.Series()
+
+        # 4. Calcular la energía (kWh) a partir de la potencia (W)
+        df_calculo = df_filtrado.set_index('timestamp_servidor').sort_index()
         
-        # Interpolar para rellenar huecos y calcular energía de forma precisa
-        df_resampled = df['power'].resample('5min').mean()
-        df_interpolated = df_resampled.interpolate(method='linear')
+        # Se remuestrea la potencia a intervalos de 1 minuto para un cálculo preciso
+        potencia_media_W = df_calculo['power'].resample('1min').mean()
+        potencia_interpolada = potencia_media_W.interpolate(method='linear')
         
-        kwh_intervalo = (df_interpolated / 1000) * (5 / 60.0)
-        
-        # Devuelve el total y el DataFrame detallado por día para análisis posterior
+        # Energía (kWh) = (Potencia (W) / 1000) * (Intervalo (min) / 60)
+        kwh_intervalo = (potencia_interpolada / 1000) * (1 / 60.0)
+
+        # 5. Calcular el total y el desglose diario
+        total_kwh = kwh_intervalo.sum()
         consumo_diario = kwh_intervalo.resample('D').sum()
-        return kwh_intervalo.sum(), consumo_diario
 
+        return total_kwh, consumo_diario
+
+    except FileNotFoundError:
+        print(f"⚠️  Error: No se encontró el archivo {archivo_csv}.")
+        return None, None
     except Exception as e:
-        print(f"❌ ERROR al consultar kWh en rango para {device_id}: {e}")
-        return None, None # Devuelve None en caso de fallo en la consulta
+        print(f"❌ ERROR al procesar el archivo CSV para {device_id}: {e}")
+        return None, None
 
 # --- MEJORA: Se añade un decorador de reintentos para robustez ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
@@ -226,7 +231,7 @@ def enviar_alerta_whatsapp(telefono_destino, content_sid, content_variables):
         print(f"✔️ Alerta enviada exitosamente.")
     else:
         print(f"⚠️  Error al enviar alerta. Código: {response.status_code}, Respuesta: {response.text}")
-        response.raise_for_status() # Esto hará que el decorador @retry se active en caso de error 4xx/5xx
+        response.raise_for_status() # Esto hará que el decorador @retry se active
 
 # --- 7. Funciones de Lógica de Negocio ---
 def calcular_costo_estimado(kwh_consumidos, tipo_tarifa):
@@ -281,142 +286,194 @@ def calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral):
     proxima_fecha = date(proximo_ano, proximo_mes, dia_de_corte)
     return ultima_fecha, proxima_fecha
 
-def procesar_un_cliente(cliente_data, client_influx, hoy_aware):
-    """
-    Encapsula toda la lógica para un único cliente.
-    """
-    (device_id, telefono, kwh_promedio, nombre, dia_de_corte, tipo_tarifa, 
-     fecha_inicio_servicio, ciclo_bimestral, notif_3dias_enviada, notif_corte_enviada) = cliente_data
-    
-    print(f"\n--- Procesando cliente: {nombre} ({device_id}) ---")
+# --- 8. Lógica de Procesamiento de Clientes (REFACTORIZADO) ---
+# --- 8. Lógica de Procesamiento de Clientes (REFACTORIZADO) ---
 
-    hoy_date = hoy_aware.date()
-    ultima_fecha_de_corte, proxima_fecha_de_corte = calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral)
-    
-    if not ultima_fecha_de_corte:
-        print(f"⚠️ No se pudo determinar la fecha de corte para {nombre}. Omitiendo cliente.")
-        return
-
-    # --- PASO 1: LÓGICA DE NOTIFICACIONES ESPECIALES ---
+def _gestionar_alertas_de_corte(cliente, hoy_date, proxima_fecha_de_corte):
+    """Revisa y envía alertas de corte. Devuelve True si se envió una."""
+    (device_id, telefono, _, nombre, _, _, _, _, notif_3dias_enviada, notif_corte_enviada) = cliente
     dias_restantes = (proxima_fecha_de_corte - hoy_date).days
-    
+
     if dias_restantes == 3 and not notif_3dias_enviada:
         print("INFO: Enviando alerta de 3 días para el corte.")
         variables = {"1": nombre, "2": proxima_fecha_de_corte.strftime('%d de %B')}
         enviar_alerta_whatsapp(telefono, CONTENT_SID_AVISO_CORTE_3DIAS, variables)
         marcar_notificacion_enviada(device_id, 'notificacion_corte_3dias')
-        return # Terminamos hoy, ya que este aviso es prioritario
+        return True # Se envió una alerta, no continuar hoy.
 
     if dias_restantes == 0 and not notif_corte_enviada:
         print("INFO: Enviando alerta de día de corte.")
         variables = {"1": nombre}
         enviar_alerta_whatsapp(telefono, CONTENT_SID_AVISO_DIA_DE_CORTE, variables)
         marcar_notificacion_enviada(device_id, 'notificacion_dia_corte')
-        return # Terminamos, no se envía el reporte diario normal este día.
-        
-    # --- PASO 2: LÓGICA DEL REPORTE DIARIO ---
-    ayer_date = hoy_date - timedelta(days=1)
-    inicio_ayer_aware = ZONA_HORARIA_LOCAL.localize(datetime.combine(ayer_date, datetime.min.time()))
-    fin_ayer_aware = ZONA_HORARIA_LOCAL.localize(datetime.combine(hoy_date, datetime.min.time()))
-    kwh_ayer, _ = obtener_consumo_kwh_en_rango(client_influx, device_id, inicio_ayer_aware, fin_ayer_aware)
+        return True # Se envió una alerta, no continuar hoy.
+
+    return False
+
+def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
+    """Genera y envía el reporte diario de consumo."""
+    (device_id, telefono, kwh_promedio, nombre, _, tipo_tarifa, fecha_inicio_servicio, _, _, _) = cliente
+    ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
+    
+    # Obtener consumo de ayer
+    ayer_date = hoy_aware.date() - timedelta(days=1)
+    inicio_ayer = ZONA_HORARIA_LOCAL.localize(datetime.combine(ayer_date, datetime.min.time()))
+    fin_ayer = ZONA_HORARIA_LOCAL.localize(datetime.combine(hoy_aware.date(), datetime.min.time()))
+    kwh_ayer, _ = obtener_consumo_desde_servidor_local(device_id, inicio_ayer, fin_ayer)
     if kwh_ayer is None: return
 
-    fecha_inicio_periodo_date = ultima_fecha_de_corte
+    # Obtener consumo del periodo actual
+    # Si el cliente es nuevo, el periodo empieza en su fecha de inicio, si no, en la última fecha de corte
+    fecha_inicio_periodo = ultima_fecha_de_corte
     if fecha_inicio_servicio and fecha_inicio_servicio > ultima_fecha_de_corte:
-        fecha_inicio_periodo_date = fecha_inicio_servicio
-    inicio_periodo_aware = ZONA_HORARIA_LOCAL.localize(datetime.combine(fecha_inicio_periodo_date, datetime.min.time()))
-    kwh_periodo_actual, consumos_diarios_series = obtener_consumo_kwh_en_rango(client_influx, device_id, inicio_periodo_aware, fin_ayer_aware)
+        fecha_inicio_periodo = fecha_inicio_servicio
+
+    inicio_periodo = ZONA_HORARIA_LOCAL.localize(datetime.combine(fecha_inicio_periodo, datetime.min.time()))
+    kwh_periodo_actual, consumos_diarios_series = obtener_consumo_desde_servidor_local(device_id, inicio_periodo, fin_ayer)
     if kwh_periodo_actual is None: return
 
+    # Lógica para crear la línea de comparación con el promedio
     promedio_float = float(kwh_promedio) if kwh_promedio is not None else 0.0
     linea_comparativa = ""
     if promedio_float > 0:
         porcentaje_dif = ((kwh_ayer - promedio_float) / promedio_float) * 100
-        if kwh_ayer > promedio_float: linea_comparativa = f"Es un {abs(porcentaje_dif):.0f}% más que tu promedio diario. 📈"
-        else: linea_comparativa = f"¡Excelente! Ahorraste un {abs(porcentaje_dif):.0f}% respecto a tu promedio diario. 📉"
+        if kwh_ayer > promedio_float:
+            linea_comparativa = f"Es un {abs(porcentaje_dif):.0f}% más que tu promedio diario. 📈"
+        else:
+            linea_comparativa = f"¡Excelente! Ahorraste un {abs(porcentaje_dif):.0f}% respecto a tu promedio diario. 📉"
 
-    # --- Lógica para elegir la plantilla correcta ---
+    # Lógica para elegir la plantilla correcta
     numero_dias_transcurridos = len(consumos_diarios_series) if consumos_diarios_series is not None else 0
     
-    content_sid_a_usar = None
-    variables_plantilla = {}
-
     if numero_dias_transcurridos >= MIN_DIAS_PARA_PROYECCION:
-        # CASO 1: Hay suficientes días, enviamos el reporte COMPLETO
+        # Reporte COMPLETO con proyección
         promedio_diario_real = kwh_periodo_actual / numero_dias_transcurridos
         dias_del_ciclo = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
         proyeccion_kwh = promedio_diario_real * dias_del_ciclo
         costo_estimado = calcular_costo_estimado(proyeccion_kwh, tipo_tarifa)
-        
-        content_sid_a_usar = CONTENT_SID_REPORTE_DIARIO
-        variables_plantilla = {
-            "1": nombre, "2": f"{kwh_ayer:.2f}", "3": linea_comparativa,
-            "4": f"{kwh_periodo_actual:.2f}", "5": f"{costo_estimado:.2f}"
-        }
+        variables = {"1": nombre, "2": f"{kwh_ayer:.2f}", "3": linea_comparativa, "4": f"{kwh_periodo_actual:.2f}", "5": f"{costo_estimado:.2f}"}
+        enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_DIARIO, variables)
     else:
-        # CASO 2: Aún no hay suficientes días, enviamos el reporte INICIAL (sin proyección)
-        content_sid_a_usar = os.environ.get("CONTENT_SID_REPORTE_INICIAL") # Leemos el nuevo SID
-        variables_plantilla = {
-            "1": nombre, "2": f"{kwh_ayer:.2f}", "3": linea_comparativa,
-            "4": f"{kwh_periodo_actual:.2f}"
-        }
+        # Reporte INICIAL sin proyección
+        variables = {"1": nombre, "2": f"{kwh_ayer:.2f}", "3": linea_comparativa, "4": f"{kwh_periodo_actual:.2f}"}
+        enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_INICIAL, variables)
 
-    # Revisa si es un cliente nuevo para sobreescribir la plantilla si es necesario
-    if fecha_inicio_servicio and (hoy_date - fecha_inicio_servicio).days < 60:
-        content_sid_a_usar = CONTENT_SID_AVISO_NUEVO
-        
-    enviar_alerta_whatsapp(telefono, content_sid_a_usar, variables_plantilla)
+def _realizar_cierre_de_ciclo(cliente, fechas_corte):
+    """Realiza tareas de fin de ciclo: recalcular promedio y resetear banderas."""
+    (device_id, _, _, nombre, _, _, _, _, _, _) = cliente
+    ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
 
-    # --- PASO 3: LÓGICA DE FIN DE CICLO (AL FINAL DE TODO) ---
-    if hoy_date == proxima_fecha_de_corte:
-        print(f"¡Fin de periodo detectado para {nombre}! Realizando tareas de cierre...")
-        
-        inicio_bimestre_pasado = ZONA_HORARIA_LOCAL.localize(datetime.combine(ultima_fecha_de_corte, datetime.min.time()))
-        fin_bimestre_pasado = ZONA_HORARIA_LOCAL.localize(datetime.combine(proxima_fecha_de_corte, datetime.min.time()))
-        
-        consumo_total_bimestre, _ = obtener_consumo_kwh_en_rango(client_influx, device_id, inicio_bimestre_pasado, fin_bimestre_pasado)
-        
-        if consumo_total_bimestre is not None and consumo_total_bimestre > 0:
-            dias_del_bimestre = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
-            nuevo_promedio = consumo_total_bimestre / dias_del_bimestre if dias_del_bimestre > 0 else 0
+    print(f"¡Fin de periodo para {nombre}! Realizando cierre...")
+    
+    inicio_bimestre = ZONA_HORARIA_LOCAL.localize(datetime.combine(ultima_fecha_de_cote, datetime.min.time()))
+    fin_bimestre = ZONA_HORARIA_LOCAL.localize(datetime.combine(proxima_fecha_de_corte, datetime.min.time()))
+    
+    consumo_total_bimestre, _ = obtener_consumo_desde_servidor_local(device_id, inicio_bimestre, fin_bimestre)
+    
+    if consumo_total_bimestre is not None and consumo_total_bimestre > 0:
+        dias_del_bimestre = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
+        if dias_del_bimestre > 0:
+            nuevo_promedio = consumo_total_bimestre / dias_del_bimestre
             actualizar_promedio_cliente(device_id, nuevo_promedio)
-        
-        # Ahora sí, reseteamos las banderas para que el siguiente ciclo comience limpio.
-        resetear_banderas_notificacion(device_id)
+    
+    resetear_banderas_notificacion(device_id)
+
+def procesar_un_cliente(cliente_data, hoy_aware):
+    """
+    Orquesta el procesamiento completo para un único cliente.
+    """
+    nombre = cliente_data[3]
+    print(f"\n--- Procesando cliente: {nombre} ({cliente_data[0]}) ---")
+
+    dia_de_corte = cliente_data[4]
+    ciclo_bimestral = cliente_data[7]
+    
+    ultima_corte, proxima_corte = calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral)
+    if not ultima_corte:
+        print(f"⚠️ No se pudo determinar la fecha de corte para {nombre}. Omitiendo.")
+        return
+
+    # PASO 1: Gestionar alertas prioritarias de corte. Si se envía una, se detiene el proceso de hoy.
+    if _gestionar_alertas_de_corte(cliente_data, hoy_aware.date(), proxima_corte):
+        return
+
+    # PASO 2: Si no hubo alertas de corte, generar el reporte diario.
+    _generar_reporte_diario(cliente_data, hoy_aware, (ultima_corte, proxima_corte))
+
+    # PASO 3: Si hoy es el día de corte, realizar las tareas de cierre de ciclo.
+    if hoy_aware.date() == proxima_corte:
+        _realizar_cierre_de_ciclo(cliente_data, (ultima_corte, proxima_corte))
+
+def _realizar_cierre_de_ciclo(cliente, fechas_corte):
+    """Realiza tareas de fin de ciclo: recalcular promedio y resetear banderas."""
+    (device_id, _, _, nombre, _, _, _, _, _, _) = cliente
+    ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
+
+    print(f"¡Fin de periodo para {nombre}! Realizando cierre...")
+    
+    inicio_bimestre = ZONA_HORARIA_LOCAL.localize(datetime.combine(ultima_fecha_de_corte, datetime.min.time()))
+    fin_bimestre = ZONA_HORARIA_LOCAL.localize(datetime.combine(proxima_fecha_de_corte, datetime.min.time()))
+    
+    consumo_total_bimestre, _ = obtener_consumo_desde_servidor_local(device_id, inicio_bimestre, fin_bimestre)
+    
+    if consumo_total_bimestre is not None and consumo_total_bimestre > 0:
+        dias_del_bimestre = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
+        if dias_del_bimestre > 0:
+            nuevo_promedio = consumo_total_bimestre / dias_del_bimestre
+            actualizar_promedio_cliente(device_id, nuevo_promedio)
+    
+    resetear_banderas_notificacion(device_id)
+
+def procesar_un_cliente(cliente_data, hoy_aware):
+    """
+    Orquesta el procesamiento completo para un único cliente.
+    """
+    nombre = cliente_data[3]
+    device_id = cliente_data[0]
+    dia_de_corte = cliente_data[4]
+    ciclo_bimestral = cliente_data[7]
+    
+    print(f"\n--- Procesando cliente: {nombre} ({device_id}) ---")
+    
+    ultima_corte, proxima_corte = calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral)
+    if not ultima_corte:
+        print(f"⚠️ No se pudo determinar la fecha de corte para {nombre}. Omitiendo.")
+        return
+
+    # PASO 1: Gestionar alertas prioritarias de corte. Si se envía una, se detiene el proceso de hoy.
+    if _gestionar_alertas_de_corte(cliente_data, hoy_aware.date(), proxima_corte):
+        return
+
+    # PASO 2: Si no hubo alertas de corte, generar el reporte diario.
+    _generar_reporte_diario(cliente_data, hoy_aware, (ultima_corte, proxima_corte))
+
+    # PASO 3: Si hoy es el día de corte, realizar las tareas de cierre de ciclo.
+    if hoy_aware.date() == proxima_corte:
+        _realizar_cierre_de_ciclo(cliente_data, (ultima_corte, proxima_corte))
 
         
 # --- 9. Ejecución Principal ---
 def main():
-    print("=" * 45)
-    print(f"--- Iniciando Script de Reporte Diario v3.0 ---")
+    print("=" * 50)
+    print(f"--- Iniciando Script de Reporte Diario v3.2 ---")
     
-    try:
-        client_influx = InfluxDBClient3(host=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, database=INFLUX_BUCKET)
-        print("✅ Conexión con InfluxDB exitosa.")
-    except Exception as e:
-        print(f"❌ ERROR de conexión con InfluxDB. Abortando. Detalles: {e}")
-        return
-
     clientes = obtener_clientes()
     if not clientes:
         print("No hay clientes para procesar. Terminando script.")
         return
 
-    # --- MEJORA: Obtenemos la hora actual una sola vez con zona horaria ---
     ahora_aware = datetime.now(ZONA_HORARIA_LOCAL)
     print(f"Ejecutando a las {ahora_aware.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     for cliente in clientes:
         try:
-            procesar_un_cliente(cliente, client_influx, ahora_aware)
+            procesar_un_cliente(cliente, ahora_aware)
         except Exception as e:
             nombre_cliente = cliente[3] if len(cliente) > 3 else "ID Desconocido"
-            print(f"❌ ERROR INESPERADO al procesar al cliente '{nombre_cliente}'. Saltando al siguiente.")
-            print(f"   Detalles del error: {e}")
+            print(f"❌ ERROR INESPERADO al procesar '{nombre_cliente}'. Saltando. Error: {e}")
 
-    print("\n--- Script de Reporte Diario v3.0 completado. ---")
-    print("=" * 45)
-
+    print("\n--- Script de Reporte Diario v3.2 completado. ---")
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()
