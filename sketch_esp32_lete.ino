@@ -1,12 +1,12 @@
 /*
 ==========================================================================
-== FIRMWARE LETE - MONITOR DE ENERGÍA v10.0 (Revisión Final)
+== FIRMWARE LETE - MONITOR DE ENERGÍA v11.0 (Revisión con EmonLib)
 ==
-== CORRECCIONES v10.0:
-== - Arquitectura de "Batching" para eficiencia de SD y red.
-== - Pantalla de bienvenida inteligente para configuración inicial.
-== - Cálculo RMS manual, estable y preciso.
-== - Depuración mejorada en Monitor Serie.
+== CORRECCIONES v11.0:
+== - Eliminado el soporte para ADS1115, usando ADC interno del ESP32.
+== - Integración de la librería EmonLib para cálculos de potencia precisos.
+== - Pines de lectura configurados a V: 34, I_Fase: 32, I_Neutro: 35.
+== - Se añade el Factor de Potencia (F.P.) a la telemetría.
 =========================================================================
 */
 
@@ -26,15 +26,15 @@
 #include "time.h"
 #include "secrets.h"
 #include <esp_task_wdt.h>
+#include "EmonLib.h" // <-- LIBRERÍA AÑADIDA
 
 // --- LIBRERÍAS PARA HARDWARE ---
 #include <SPI.h>
 #include <SD.h>
-#include <Adafruit_ADS1X15.h>
 #include <Adafruit_NeoPixel.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 10.0;
+const float FIRMWARE_VERSION = 11.0;
 const bool OLED_CONECTADA = true;
 const bool DEBUG_MODE = true;
 
@@ -49,6 +49,11 @@ const bool DEBUG_MODE = true;
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
+// --- PINES PARA MEDICIÓN CON ADC INTERNO ---
+#define VOLTAGE_PIN 34
+#define CURRENT_PHASE_PIN 32
+#define CURRENT_NEUTRAL_PIN 35
+
 // --- INTERVALOS DE TIEMPO Y CONTROL ---
 const unsigned long MEASUREMENT_INTERVAL_MS = 2000;
 const unsigned long SCREEN_CONSUMPTION_INTERVAL_MS = 30000;
@@ -57,7 +62,7 @@ const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 120 * 1000;
 const unsigned long SERVER_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
-const unsigned long MESSENGER_CYCLE_DELAY_MS = 200;
+const unsigned long MESSENGER_CYCLE_DELAY_MS = 1000;
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000
 unsigned long bootTime = 0;
@@ -68,33 +73,28 @@ const char* NTP_SERVER_2 = "mx.pool.ntp.org";
 const char* NTP_SERVER_3 = "time.google.com";
 #define CONNECTION_TIMEOUT_MS 10000
 
-#define ADC_VOLTAGE_CHANNEL 2
-#define ADC_CURRENT_PHASE_CHANNEL 0
-#define ADC_CURRENT_NEUTRAL_CHANNEL 1
-// El canal A3 ya no se usa como referencia explícita, pero lo dejamos definido por si acaso.
-#define ADC_BIAS_CHANNEL 3 
-
 // --- 3. OBJETOS Y VARIABLES GLOBALES ---
 
 // Objetos de Hardware
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-Adafruit_ADS1115 ads;
 Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
+EnergyMonitor emon_phase;
+EnergyMonitor emon_neutral;
 
 // Estructura de Datos para las Mediciones (Completa)
 struct MeasurementData {
     uint32_t sequence_number;
     uint32_t timestamp;
     float vrms, irms_phase, irms_neutral, power, leakage, temp_cpu;
-    float va; // Campo para la Potencia Aparente (VA)
+    float va, power_factor; // Campos para Potencia Aparente (VA) y Factor de Potencia
 };
 
-// Variables de Calibración
+// Variables de Calibración para EmonLib
 float voltage_cal = 153.5;
 float current_cal_phase = 106.0;
 float current_cal_neutral = 106.0;
-float power_cal = 0.82; // Factor de corrección final para Potencia Real
+float phase_cal = 1.7; // Factor de corrección de fase para EmonLib
 
 // Variables de Estado (Protegidas por Mutex y Completas)
 SemaphoreHandle_t sharedVarsMutex;
@@ -151,8 +151,6 @@ void writerTask(void * pvParameters) {
     const int lecturas_a_descartar = 5;
     int lecturas_descartadas = 0;
 
-    ads.setDataRate(RATE_ADS1115_860SPS); // Máxima velocidad para minimizar delay entre lecturas
-
     for (;;) { // <-- INICIO DEL BUCLE INFINITO PRINCIPAL
         esp_task_wdt_reset();
         unsigned long currentMillis = millis();
@@ -162,58 +160,10 @@ void writerTask(void * pvParameters) {
 
             if(DEBUG_MODE) Serial.println("\n[N1] ==> Iniciando ciclo de medición...");
 
-            const int numberOfSamples = 250;
-            const int biasSamples = 50;
-
-            // 1. CÁLCULO DE BIAS DINÁMICO (RÁPIDO)
-            if(DEBUG_MODE) Serial.println("[N1] Calculando bias dinámico...");
-            long sum_v_bias = 0, sum_i_phase_bias = 0, sum_i_neutral_bias = 0;
-            for (int i = 0; i < biasSamples; i++) {
-                sum_v_bias += ads.readADC_SingleEnded(ADC_VOLTAGE_CHANNEL);
-                sum_i_phase_bias += ads.readADC_SingleEnded(ADC_CURRENT_PHASE_CHANNEL);
-                sum_i_neutral_bias += ads.readADC_SingleEnded(ADC_CURRENT_NEUTRAL_CHANNEL);
-                vTaskDelay(1); // <-- AÑADIDO: Ceder tiempo para máxima estabilidad
-            }
-            float bias_v = (float)sum_v_bias / biasSamples;
-            float bias_i_phase = (float)sum_i_phase_bias / biasSamples;
-            float bias_i_neutral = (float)sum_i_neutral_bias / biasSamples;
-            if(DEBUG_MODE) Serial.printf("[N1-Debug] Bias calculados -> V: %.1f, I_Fase: %.1f, I_Neutro: %.1f\n", bias_v, bias_i_phase, bias_i_neutral);
-
-            // 2. MUESTREO RÁPIDO Y SINCRONIZADO
-            if(DEBUG_MODE) Serial.println("[N1] Iniciando bucle de muestreo principal...");
-            double sum_v_sq = 0, sum_i_phase_sq = 0, sum_i_neutral_sq = 0, sum_power = 0;
-
-            for (int i = 0; i < numberOfSamples; i++) {
-                int16_t raw_v = ads.readADC_SingleEnded(ADC_VOLTAGE_CHANNEL);
-                int16_t raw_i_phase = ads.readADC_SingleEnded(ADC_CURRENT_PHASE_CHANNEL);
-                int16_t raw_i_neutral = ads.readADC_SingleEnded(ADC_CURRENT_NEUTRAL_CHANNEL);
-
-                double v_counts = (double)raw_v - bias_v;
-                double i_phase_counts = (double)raw_i_phase - bias_i_phase;
-                double i_neutral_counts = (double)raw_i_neutral - bias_i_neutral;
-
-                sum_v_sq += v_counts * v_counts;
-                sum_i_phase_sq += i_phase_counts * i_phase_counts;
-                sum_i_neutral_sq += i_neutral_counts * i_neutral_counts;
-                sum_power += v_counts * i_phase_counts;
-                
-                vTaskDelay(1); 
-            }
-            if(DEBUG_MODE) Serial.println("[N1] Bucle de muestreo finalizado.");
-
-            // 3. CÁLCULO FINAL (CALIBRACIÓN AL FINAL)
-            const float ADC_TO_VOLTS = 0.0001875f;
-            
-            double v_rms_counts = sqrt(sum_v_sq / numberOfSamples);
-            double i_phase_rms_counts = sqrt(sum_i_phase_sq / numberOfSamples);
-            double i_neutral_rms_counts = sqrt(sum_i_neutral_sq / numberOfSamples);
-            double real_power_counts = sum_power / numberOfSamples;
-            if(DEBUG_MODE) Serial.printf("[N1-Debug] Valores crudos -> Vrms_c: %.1f, Irms_c: %.1f, Power_c: %.1f\n", v_rms_counts, i_phase_rms_counts, real_power_counts);
-
-            float vrms = v_rms_counts * ADC_TO_VOLTS * voltage_cal;
-            float irms_phase = i_phase_rms_counts * ADC_TO_VOLTS * current_cal_phase;
-            float irms_neutral = i_neutral_rms_counts * ADC_TO_VOLTS * current_cal_neutral;
-            float real_power = real_power_counts * ADC_TO_VOLTS * ADC_TO_VOLTS * voltage_cal * current_cal_phase * power_cal;
+            // Realizamos los cálculos para el canal de Fase (que incluye voltaje)
+            emon_phase.calcVI(20, 2000); 
+            // Realizamos los cálculos solo para la corriente del Neutro
+            emon_neutral.calcVI(20, 2000);
 
             if (lecturas_descartadas < lecturas_a_descartar) {
                 lecturas_descartadas++;
@@ -227,20 +177,21 @@ void writerTask(void * pvParameters) {
                     // Esto evita procesar datos con timestamp 0.
                     continue; 
                 }
-                // --- FIN DEL CAMBIO ---
+            
 
                 if(DEBUG_MODE && lecturas_descartadas == 5) Serial.println("[N1] Lecturas iniciales descartadas. Empezando a procesar datos.");
 
                 MeasurementData data;
                 data.sequence_number = ++global_sequence_number;
                 data.timestamp = time_synced ? time(NULL) : 0;
-                data.vrms = vrms;
-                data.irms_phase = irms_phase;
-                data.irms_neutral = irms_neutral;
-                data.power = real_power;
-                data.leakage = fabs(irms_phase - irms_neutral);
+                data.vrms = emon_phase.Vrms;
+                data.irms_phase = emon_phase.Irms;
+                data.irms_neutral = emon_neutral.Irms;
+                data.power = emon_phase.realPower;
+                data.va = emon_phase.apparentPower;
+                data.power_factor = emon_phase.powerFactor;
+                data.leakage = fabs(data.irms_phase - data.irms_neutral);
                 data.temp_cpu = temperatureRead();
-                data.va = data.vrms * data.irms_phase;
 
                 if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     latest_vrms = data.vrms;
@@ -253,9 +204,9 @@ void writerTask(void * pvParameters) {
                 }
 
                 if(DEBUG_MODE) {
-                    Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, Fuga:%.3f, Temp:%.1fC\n",
-                                    data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.leakage, data.temp_cpu);
-                }
+                Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, FP:%.2f, Fuga:%.3f, Temp:%.1fC\n",
+                                data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu);
+            }
                 
                 if (time_synced) {
                     if(DEBUG_MODE) Serial.println("[N1-Debug] Condición 'time_synced' es verdadera. Procediendo a guardar en SD.");
@@ -268,8 +219,9 @@ void writerTask(void * pvParameters) {
                         dataFile.print(data.irms_neutral); dataFile.print(",");
                         dataFile.print(data.power); dataFile.print(",");
                         dataFile.print(data.va); dataFile.print(",");
+                        dataFile.print(data.power_factor); dataFile.print(","); // <-- AÑADIDO
                         dataFile.print(data.leakage); dataFile.print(",");
-                        dataFile.println(data.temp_cpu); // El último valor usa println para el salto de línea
+                        dataFile.println(data.temp_cpu);
                         dataFile.close();
 
                         lines_in_buffer++;
@@ -468,17 +420,18 @@ void messengerTask(void * pvParameters) {
 
                     if (line.length() > 0) {
                         MeasurementData data;
-                        int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f", 
+
+                        // <-- CAMBIO: Actualizado para parsear 10 campos, incluyendo F.P.
+                        int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f,%f", 
                                 &data.sequence_number, &data.timestamp, &data.vrms, &data.irms_phase, 
-                                &data.irms_neutral, &data.power, &data.va, &data.leakage, &data.temp_cpu);
+                                &data.irms_neutral, &data.power, &data.va, &data.power_factor, &data.leakage, &data.temp_cpu);
                         
-                        if (parsed_items == 9) {
+                        if (parsed_items == 10) {
                             char linePayload[256];
-                            
-                            // Formato del payload como CSV simple para ser compatible con tu servidor Python.
+                            // <-- CAMBIO: Actualizado para enviar F.P. al servidor
                             snprintf(linePayload, sizeof(linePayload),
-                                     "%.2f,%.3f,%.3f,%.2f,%.2f,%.3f,%.1f,%u,%lu\n",
-                                     data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.leakage, data.temp_cpu,
+                                     "%.2f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.1f,%u,%lu\n",
+                                     data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu,
                                      data.sequence_number, data.timestamp);
                             payload += linePayload;
                         } else {
@@ -543,7 +496,7 @@ void setup() {
     Serial.begin(115200);
     delay(1000); 
     Serial.println("\n\n==================================================");
-    Serial.println("== INICIANDO FIRMWARE LETE v10.0 (Batching) ==");
+    Serial.println("== INICIANDO FIRMWARE LETE v11.0 (EmonLib) ==");
     Serial.println("==================================================");
     bootTime = millis();
 
@@ -571,17 +524,16 @@ void setup() {
         Serial.println(" OK.");
     }
 
-    // --- 3. INICIALIZAR PANTALLA Y ADC ---
-    Serial.print("Inicializando periféricos I2C (OLED y ADC)...");
+    // --- 3. INICIALIZAR PANTALLA ---
+    Serial.print("Inicializando periféricos I2C (OLED)...");
     setupOLED();
-    if (!ads.begin()) {
-        Serial.println("\nERROR CRÍTICO: No se encontró el ADS1115. Revisa el bus I2C. El sistema se detendrá.");
-        drawGenericMessage("ERROR", "No hay ADC");
-        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); pixels.show();
-        while (1) delay(1000);
-    }
-    ads.setGain(GAIN_TWOTHIRDS);
-    ads.setDataRate(RATE_ADS1115_860SPS);
+    Serial.println(" OK.");
+
+    // --- 4. CONFIGURAR EMONLIB ---
+    Serial.print("Configurando EmonLib con pines y calibración...");
+    emon_phase.voltage(VOLTAGE_PIN, voltage_cal, phase_cal);
+    emon_phase.current(CURRENT_PHASE_PIN, current_cal_phase);
+    emon_neutral.current(CURRENT_NEUTRAL_PIN, current_cal_neutral);
     Serial.println(" OK.");
 
     // --- 4. GESTIÓN DE WIFI CON WIFIMANAGER ---
@@ -621,7 +573,7 @@ void setup() {
     Serial.print("Cargando calibración desde la SD...");
     loadCalibration(); 
     Serial.println(" OK.");
-    if(DEBUG_MODE) Serial.printf("   Valores cargados de SD -> V_CAL: %.2f, P_CAL: %.2f\n", voltage_cal, power_cal);
+    if(DEBUG_MODE) Serial.printf("   Valores cargados de SD -> V_CAL: %.2f, P_CAL: %.2f\n", voltage_cal, phase_cal);
 
     // 2. Contacta a Supabase para buscar nuevas calibraciones o comandos.
     bool newConfigDownloaded = handleRemoteTasks();
@@ -767,14 +719,14 @@ void saveCalibration() {
     doc["voltage_cal"] = voltage_cal;
     doc["current_cal_phase"] = current_cal_phase;
     doc["current_cal_neutral"] = current_cal_neutral;
-    doc["power_cal"] = power_cal; // <-- AÑADIDO: Guardar el factor de potencia
+    doc["phase_cal"] = phase_cal; // <-- AÑADIDO: Guardar el factor de potencia
     
     if (DEBUG_MODE) {
         Serial.println("[N0-Debug] Valores de calibración a guardar:");
         Serial.printf("  - voltage_cal: %.2f\n", (float)doc["voltage_cal"]);
         Serial.printf("  - current_cal_phase: %.2f\n", (float)doc["current_cal_phase"]);
         Serial.printf("  - current_cal_neutral: %.2f\n", (float)doc["current_cal_neutral"]);
-        Serial.printf("  - power_cal: %.2f\n", (float)doc["power_cal"]);
+        Serial.printf("  - phase_cal: %.2f\n", (float)doc["phase_cal"]);
     }
     
     // Escribimos el documento JSON al archivo.
@@ -810,7 +762,7 @@ void loadCalibration() {
                 if (doc.containsKey("voltage_cal")) voltage_cal = doc["voltage_cal"];
                 if (doc.containsKey("current_cal_phase")) current_cal_phase = doc["current_cal_phase"];
                 if (doc.containsKey("current_cal_neutral")) current_cal_neutral = doc["current_cal_neutral"];
-                if (doc.containsKey("power_cal")) power_cal = doc["power_cal"]; // <-- AÑADIDO: Cargar el factor de potencia
+                if (doc.containsKey("phase_cal")) phase_cal = doc["phase_cal"]; // <-- AÑADIDO: Cargar el factor de potencia
 
                 if (DEBUG_MODE) {
                     Serial.println("--------------------------------------------------");
@@ -818,7 +770,7 @@ void loadCalibration() {
                     Serial.printf("  - voltage_cal: %.2f\n", voltage_cal);
                     Serial.printf("  - current_cal_phase: %.2f\n", current_cal_phase);
                     Serial.printf("  - current_cal_neutral: %.2f\n", current_cal_neutral);
-                    Serial.printf("  - power_cal: %.2f\n", power_cal);
+                    Serial.printf("  - phase_cal: %.2f\n", phase_cal);
                     Serial.println("--------------------------------------------------");
                 }
             } else {
@@ -988,28 +940,28 @@ void handleCalibration() {
             float new_voltage_cal = server.arg("voltage").toFloat();
             float new_current_cal_phase = server.arg("current_phase").toFloat();
             float new_current_cal_neutral = server.arg("current_neutral").toFloat();
-            float new_power_cal = server.arg("power").toFloat(); // <-- AÑADIDO: Leer el nuevo valor
+            float new_phase_cal = server.arg("power").toFloat(); // <-- AÑADIDO: Leer el nuevo valor
 
             if (DEBUG_MODE) {
                 Serial.println("[N0-Debug] Valores recibidos del formulario:");
                 Serial.printf("  - voltage: %.2f\n", new_voltage_cal);
                 Serial.printf("  - current_phase: %.2f\n", new_current_cal_phase);
                 Serial.printf("  - current_neutral: %.2f\n", new_current_cal_neutral);
-                Serial.printf("  - power: %.2f\n", new_power_cal);
+                Serial.printf("  - power: %.2f\n", new_phase_cal);
             }
             
             // --- CAMBIO: Rangos de validación ampliados y corregidos ---
             if (new_voltage_cal > 50.0 && new_voltage_cal < 300.0 &&
                 new_current_cal_phase > 10.0 && new_current_cal_phase < 200.0 &&
                 new_current_cal_neutral > 10.0 && new_current_cal_neutral < 200.0 &&
-                new_power_cal > 0.1 && new_power_cal < 10.0) {
+                new_phase_cal > 0.1 && new_phase_cal < 10.0) {
                 
                 if (DEBUG_MODE) Serial.println("[N0-Debug] Validación de rangos: OK.");
 
                 voltage_cal = new_voltage_cal;
                 current_cal_phase = new_current_cal_phase;
                 current_cal_neutral = new_current_cal_neutral;
-                power_cal = new_power_cal; // <-- AÑADIDO: Actualizar la variable global
+                new_phase_cal = new_phase_cal; // <-- AÑADIDO: Actualizar la variable global
                 
                 saveCalibration(); // Guardar los nuevos valores en la SD
                 server.send(200, "text/plain", "OK. Calibración guardada y aplicada.");
@@ -1034,8 +986,8 @@ void handleCalibration() {
         html += "Factor Voltaje (V_CAL):<br><input type='text' name='voltage' value='" + String(voltage_cal, 2) + "'><br>";
         html += "Factor Corriente Fase (I_CAL_P):<br><input type='text' name='current_phase' value='" + String(current_cal_phase, 2) + "'><br>";
         html += "Factor Corriente Neutro (I_CAL_N):<br><input type='text' name='current_neutral' value='" + String(current_cal_neutral, 2) + "'><br>";
-        // --- CAMBIO: Añadido campo para power_cal ---
-        html += "Factor Correcci&oacute;n Potencia (P_CAL):<br><input type='text' name='power' value='" + String(power_cal, 2) + "'><br>";
+        // --- CAMBIO: Añadido campo para phase_cal ---
+        html += "Factor Correcci&oacute;n Potencia (P_CAL):<br><input type='text' name='power' value='" + String(phase_cal, 2) + "'><br>";
         html += "<br><input type='submit' value='Guardar Calibraci&oacute;n'>";
         html += "</form></body></html>";
         server.send(200, "text/html", html);
@@ -1275,8 +1227,8 @@ bool handleRemoteTasks() {
                 current_cal_phase = values["current1"];
                 current_cal_neutral = values["current2"];
                 
-                if (values.containsKey("power_cal")) {
-                     power_cal = values["power_cal"];
+                if (values.containsKey("phase_cal")) {
+                     phase_cal = values["phase_cal"];
                 }
 
                 newConfigFetched = true;
