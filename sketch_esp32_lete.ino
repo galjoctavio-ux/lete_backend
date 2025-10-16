@@ -449,7 +449,16 @@ void messengerTask(void * pvParameters) {
                     }
                     
                     HTTPClient http;
-                    http.begin(SERVER_URL); // Asegúrate de tener #define SERVER_URL "http://..."
+                    // --- CORRECCIÓN CLAVE: Construimos la URL con el device_id ---
+                    String macAddress = WiFi.macAddress();
+                    macAddress.replace(":", ""); // Quitamos los dos puntos
+                    String url_con_id = String(SERVER_URL) + "?device=" + macAddress;
+
+                    if(DEBUG_MODE) Serial.printf("[N0-Debug] URL de destino: %s\n", url_con_id.c_str());
+
+                    http.begin(url_con_id); // <-- Usamos la nueva URL
+                    // --- FIN DE LA CORRECCIÓN ---
+
                     http.addHeader("Content-Type", "text/plain");
                     
                     int httpCode = http.POST(payload);
