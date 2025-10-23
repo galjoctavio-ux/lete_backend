@@ -1,18 +1,14 @@
 /*
 ==========================================================================
-== FIRMWARE LETE - MONITOR DE ENERGÍA v11.0 (Revisión con EmonLib)
+== FIRMWARE LETE - MONITOR DE ENERGÍA v12.1 (Estable)
 ==
-== CORRECCIONES v11.0:
-== - Eliminado el soporte para ADS1115, usando ADC interno del ESP32.
-== - Integración de la librería EmonLib para cálculos de potencia precisos.
-== - Pines de lectura configurados a V: 34, I_Fase: 32, I_Neutro: 35.
-== - Se añade el Factor de Potencia (F.P.) a la telemetría.
+== CORRECCIONES v12.1:
+== - Debugmode off
 =========================================================================
 */
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
@@ -27,6 +23,7 @@
 #include "secrets.h"
 #include <esp_task_wdt.h>
 #include "EmonLib.h" // <-- LIBRERÍA AÑADIDA
+#include <WiFiClientSecure.h> // <-- ASEGÚRATE DE TENER ESTO
 
 // --- LIBRERÍAS PARA HARDWARE ---
 #include <SPI.h>
@@ -34,9 +31,9 @@
 #include <Adafruit_NeoPixel.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 11.0;
+const float FIRMWARE_VERSION = 12.1;
 const bool OLED_CONECTADA = true;
-const bool DEBUG_MODE = true;
+const bool DEBUG_MODE = false;
 
 // --- CONFIGURACIÓN DE PINES ---
 #define BUTTON_PIN 13
@@ -62,7 +59,7 @@ const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 120 * 1000;
 const unsigned long SERVER_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
-const unsigned long MESSENGER_CYCLE_DELAY_MS = 1000;
+const unsigned long MESSENGER_CYCLE_DELAY_MS = 5000;
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000
 unsigned long bootTime = 0;
@@ -78,7 +75,6 @@ const char* NTP_SERVER_3 = "time.google.com";
 // Objetos de Hardware
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-WebServer server(80);
 EnergyMonitor emon_phase;
 EnergyMonitor emon_neutral;
 
@@ -122,6 +118,7 @@ unsigned long last_wifi_check = 0;
 unsigned long button_press_start_time = 0;
 bool button_is_pressed = false;
 uint32_t global_sequence_number = 0;
+String currentServerUrl; //Se agrega
 
 // --- 4. DECLARACIÓN DE FUNCIONES ---
 void writerTask(void * pvParameters);
@@ -129,13 +126,7 @@ void messengerTask(void * pvParameters);
 void checkSubscriptionStatus();
 void loadCalibration();
 void saveCalibration();
-void handleRoot();
-void handleCalibration();
-void handleUpdate();
-void handleResetWifi();
-void handleRestart();
 void handleFactoryReset();
-void handleBufferStats();
 
 // --- INCLUSIÓN DE ARCHIVOS SEPARADOS ---
 #include "oled_screens.h"
@@ -203,10 +194,9 @@ void writerTask(void * pvParameters) {
                     xSemaphoreGive(sharedVarsMutex);
                 }
 
-                if(DEBUG_MODE) {
-                Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, FP:%.2f, Fuga:%.3f, Temp:%.1fC\n",
-                                data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu);
-            }
+                // --- IMPRESIÓN DE CALIBRACIÓN ---
+          Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, FP:%.2f, Fuga:%.3f, Temp:%.1fC\n",
+                          data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu);
                 
                 if (time_synced) {
                     if(DEBUG_MODE) Serial.println("[N1-Debug] Condición 'time_synced' es verdadera. Procediendo a guardar en SD.");
@@ -382,6 +372,8 @@ void messengerTask(void * pvParameters) {
                 if (DEBUG_MODE) Serial.println("[N0] Nueva configuración remota detectada, guardando en SD...");
                 saveCalibration();
             }
+
+            checkForHttpUpdate();
             
             last_server_check = millis();
         }
@@ -435,30 +427,40 @@ void messengerTask(void * pvParameters) {
                                      data.sequence_number, data.timestamp);
                             payload += linePayload;
                         } else {
-                            if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: Línea mal formada en %s, se leyeron %d de 9 campos. Línea ignorada.\n", filename.c_str(), parsed_items);
+                            if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: Línea mal formada en %s, se leyeron %d de 10 campos. Línea ignorada.\n", filename.c_str(), parsed_items);
                         }
                     }
                 }
 
                 if (payload.length() > 0) {
-                    if(DEBUG_MODE) {
-                        Serial.println("[N0] Intentando enviar a servidor local. Payload a enviar:");
-                        Serial.println("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv");
-                        Serial.print(payload);
-                        Serial.println("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+                if(DEBUG_MODE) {
+                    Serial.println("[N0] Payload de datos generado. Verificando suscripción...");
+                    // Serial.println("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv");
+                    // Serial.print(payload);
+                    // Serial.println("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+                }
+                
+                // --- INICIO DE CORRECCIÓN DE LÓGICA DE SUSCRIPCIÓN ---
+                bool puede_enviar_datos = false;
+                if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    if (subscription_active || dias_de_gracia_restantes > 0) {
+                        puede_enviar_datos = true;
                     }
-                    
+                    xSemaphoreGive(sharedVarsMutex);
+                }
+
+                if (puede_enviar_datos) {
+                    // Si SÍ puede enviar (activa o en gracia), ejecuta el bloque de envío
+                    if(DEBUG_MODE) Serial.printf("[N0] Suscripción OK. Enviando batch %s...\n", filename.c_str());
+
                     HTTPClient http;
-                    // --- CORRECCIÓN CLAVE: Construimos la URL con el device_id ---
                     String macAddress = WiFi.macAddress();
-                    macAddress.replace(":", ""); // Quitamos los dos puntos
-                    String url_con_id = String(SERVER_URL) + "?device=" + macAddress;
+                    macAddress.replace(":", "");
+                    String url_con_id = String(currentServerUrl) + "?device=" + macAddress;
 
                     if(DEBUG_MODE) Serial.printf("[N0-Debug] URL de destino: %s\n", url_con_id.c_str());
 
-                    http.begin(url_con_id); // <-- Usamos la nueva URL
-                    // --- FIN DE LA CORRECCIÓN ---
-
+                    http.begin(url_con_id);
                     http.addHeader("Content-Type", "text/plain");
                     
                     int httpCode = http.POST(payload);
@@ -473,10 +475,16 @@ void messengerTask(void * pvParameters) {
                             Serial.printf("[N0] ERROR: Fallo al enviar batch %s (HTTP: %d). Se reintentará.\n", filename.c_str(), httpCode);
                             Serial.printf("[N0-Debug] Respuesta del servidor: %s\n", serverResponse.c_str());
                         }
-                        // Lógica de reintento: rompemos el bucle para que la tarea se reinicie y vuelva a encontrar este archivo.
-                        break; 
+                        break; // Rompe el bucle 'while' para reintentar este archivo después
                     }
                 } else {
+                    // Si NO puede enviar (suscripción vencida y sin gracia), lo informa.
+                    // El archivo NO se borra y se conserva en la SD.
+                    if(DEBUG_MODE) Serial.printf("[N0] Suscripción inactiva. Omitiendo envío del batch %s. Se conservará en la SD.\n", filename.c_str());
+                }
+                // --- FIN DE LA CORRECCIÓN ---
+
+            } else {
                    if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: No se generó payload para el archivo %s. Borrando archivo vacío o corrupto.\n", filename.c_str());
                    SD.remove("/" + filename);
                 }
@@ -489,8 +497,6 @@ void messengerTask(void * pvParameters) {
         root.close();
         if(DEBUG_MODE) Serial.println("[N0-Debug] Búsqueda de archivos finalizada para este ciclo.");
 
-        if(DEBUG_MODE) Serial.println("[N0-Debug] Manejando cliente web y OTA...");
-        server.handleClient();
         ArduinoOTA.handle();
 
         if(DEBUG_MODE) Serial.printf("[N0-Debug] <<< Fin del bucle. Esperando %lu ms.\n", MESSENGER_CYCLE_DELAY_MS);
@@ -536,6 +542,17 @@ void setup() {
     // --- 3. INICIALIZAR PANTALLA ---
     Serial.print("Inicializando periféricos I2C (OLED)...");
     setupOLED();
+    Serial.println(" OK.");
+
+    // --- 6. INICIALIZAR MUTEX Y WATCHDOG ---
+    Serial.print("Configurando sistema multitarea (Mutex y Watchdog)...");
+    sharedVarsMutex = xSemaphoreCreateMutex();
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+        .trigger_panic = true,
+       };
+    esp_task_wdt_reconfigure(&wdt_config);
     Serial.println(" OK.");
 
     // --- 4. CONFIGURAR EMONLIB ---
@@ -595,36 +612,30 @@ void setup() {
     } else {
         Serial.println("No hay nuevas configuraciones remotas. Usando configuración actual.");
     }
+
+    // --- 4. APLICAR CONFIGURACIÓN A EMONLIB ---
+    // ¡CORRECCIÓN! Se aplica la calibración (de SD o Supabase) a EmonLib.
+    applyCalibration();
+
     Serial.println("--------------------------------");
     // <<<<<<< FIN DE LA LÓGICA DE CALIBRACIÓN >>>>>>>
 
     // --- 5. SERVIDOR WEB Y OTA ---
-    Serial.print("Configurando servidor web y OTA...");
-    server.on("/", handleRoot);
-    server.on("/calibracion", handleCalibration);
+    Serial.print("Configurando OTA...");
+    //server.on("/", handleRoot);
+    //server.on("/calibracion", handleCalibration);
     // ... (resto de tus server.on) ...
-    server.begin();
+    //server.begin();
     
     ArduinoOTA.setHostname("lete-monitor");
     ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.begin();
     Serial.println(" OK.");
-
-    // --- 6. INICIALIZAR MUTEX Y WATCHDOG ---
-    Serial.print("Configurando sistema multitarea (Mutex y Watchdog)...");
-    sharedVarsMutex = xSemaphoreCreateMutex();
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-        .trigger_panic = true,
-       };
-    esp_task_wdt_reconfigure(&wdt_config);
-    Serial.println(" OK.");
     
     // --- 7. INICIAR TAREAS DE LOS NÚCLEOS ---
     Serial.print("Iniciando tareas en los núcleos 0 y 1...");
     xTaskCreatePinnedToCore(writerTask, "WriterTask", 10000, NULL, 2, &writerTaskHandle, 1);
-    xTaskCreatePinnedToCore(messengerTask, "MessengerTask", 10000, NULL, 1, &messengerTaskHandle, 0);
+    xTaskCreatePinnedToCore(messengerTask, "MessengerTask", 32768, NULL, 1, &messengerTaskHandle, 0);
     Serial.println(" OK.");
 
     Serial.println("\n==================================================");
@@ -644,67 +655,182 @@ void loop() {
 // =========================================================================
 // --- FUNCIÓN DE ACTUALIZACIÓN OTA (VERSIÓN FINAL CON DEPURACIÓN) ---
 // =========================================================================
-
 void checkForHttpUpdate() {
     if (WiFi.status() != WL_CONNECTED) {
         if (DEBUG_MODE) Serial.println("[N0] Omitiendo búsqueda de actualizaciones: WiFi desconectado.");
         return;
     }
+    
     if (DEBUG_MODE) Serial.println("\n[N0] ==> Buscando actualizaciones de firmware...");
     
+    // --- PASO 1: VERIFICAR VERSIÓN DISPONIBLE (HTTP) ---
+    WiFiClient clientVersion;
     HTTPClient http;
-    // Aumentamos ligeramente el timeout para más robustez en redes lentas
-    http.setTimeout(5000); 
     
-    if(DEBUG_MODE) Serial.printf("[N0-Debug] Consultando URL de versión: %s\n", FIRMWARE_VERSION_URL);
-    http.begin(FIRMWARE_VERSION_URL);
+    if(DEBUG_MODE) Serial.printf("[N0-Debug] Consultando versión: %s\n", FIRMWARE_VERSION_URL);
     
-    int httpCode = http.GET();
-    if (httpCode == HTTP_CODE_OK) {
-        String version_str = http.getString();
-        if(DEBUG_MODE) Serial.printf("[N0-Debug] Versión recibida del servidor (raw): '%s'\n", version_str.c_str());
-        
-        version_str.trim();
-        float new_version = version_str.toFloat();
-        
-        if (DEBUG_MODE) Serial.printf("[N0] Versión actual: %.1f, Versión en servidor: %.1f\n", FIRMWARE_VERSION, new_version);
-        
-        if (new_version > FIRMWARE_VERSION) {
-            if (DEBUG_MODE) Serial.println("[N0] ¡Nueva versión disponible! Iniciando proceso de actualización...");
-            if (OLED_CONECTADA) drawGenericMessage("Actualizando", "Descargando...");
-
-            if(DEBUG_MODE) Serial.printf("[N0-Debug] Descargando binario desde: %s\n", FIRMWARE_BIN_URL);
-            
-            // Usamos un cliente HTTP separado para la actualización del binario
-            HTTPClient httpUpdateClient;
-            httpUpdateClient.setConnectTimeout(30000); 
-            httpUpdateClient.begin(FIRMWARE_BIN_URL);
-            
-            t_httpUpdate_return ret = httpUpdate.update(httpUpdateClient);
-            
-            // Manejo de errores de la actualización
-            if (ret == HTTP_UPDATE_FAILED) {
-                if (DEBUG_MODE) {
-                    Serial.println("[N0] ERROR CRÍTICO: La actualización del firmware falló.");
-                    Serial.printf("[N0-Debug] Código de error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-                }
-                if (OLED_CONECTADA) drawGenericMessage("Actualizacion", "Error!");
-                delay(2000);
-            }
-            // Si la actualización es exitosa, el ESP32 se reiniciará automáticamente.
-            // No es necesario añadir más código aquí.
-
-        } else {
-            if (DEBUG_MODE) Serial.println("[N0] El firmware ya está en su última versión.");
-        }
-    } else {
-        if (DEBUG_MODE) {
-            Serial.printf("[N0] ERROR: No se pudo verificar la versión (Código HTTP: %d).\n", httpCode);
-            String payload = http.getString();
-            Serial.printf("[N0-Debug] Respuesta del servidor: %s\n", payload.c_str());
-        }
+    if (!http.begin(clientVersion, FIRMWARE_VERSION_URL)) {
+        if(DEBUG_MODE) Serial.println("[N0] ERROR: No se pudo iniciar cliente HTTP para versión.");
+        return;
     }
+
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        if (DEBUG_MODE) {
+            Serial.printf("[N0] ERROR: No se pudo verificar versión (HTTP: %d).\n", httpCode);
+        }
+        http.end();
+        return;
+    }
+    
+    String version_str = http.getString();
     http.end();
+    
+    version_str.trim();
+    float new_version = version_str.toFloat();
+    
+    if (DEBUG_MODE) Serial.printf("[N0] Versión actual: %.1f, Versión servidor: %.1f\n", FIRMWARE_VERSION, new_version);
+    
+    if (new_version <= FIRMWARE_VERSION) {
+        if (DEBUG_MODE) Serial.println("[N0] Firmware ya está actualizado.");
+        return;
+    }
+    
+    // --- PASO 2: PREPARAR SISTEMA PARA ACTUALIZACIÓN ---
+    if (DEBUG_MODE) Serial.println("[N0] ¡Nueva versión disponible! Preparando sistema...");
+    if (OLED_CONECTADA) drawGenericMessage("Actualizando", "Preparando...");
+    
+    // Reportar RAM libre ANTES de liberar
+    if (DEBUG_MODE) Serial.printf("[N0-Debug] RAM libre antes de preparar: %d bytes\n", ESP.getFreeHeap());
+    
+    // --- CRÍTICO: PAUSAR TAREA DEL CORE 1 ---
+    if(DEBUG_MODE) Serial.println("[N0] ==> Pausando Tarea Escritura (Core 1)...");
+    vTaskSuspend(writerTaskHandle);
+    delay(500); // Dar tiempo suficiente
+    
+    
+    // --- CRÍTICO: DESHABILITAR OTA ---
+    ArduinoOTA.end();
+    
+    // --- CRÍTICO: CERRAR ARCHIVOS ABIERTOS EN SD ---
+    if(DEBUG_MODE) Serial.println("[N0] ==> Desmontando SD...");
+    SD.end();
+    delay(100);
+    
+    // Reportar RAM libre DESPUÉS de liberar
+    if (DEBUG_MODE) Serial.printf("[N0-Debug] RAM libre después de preparar: %d bytes\n", ESP.getFreeHeap());
+    
+    // --- PASO 3: VERIFICAR QUE TENEMOS SUFICIENTE RAM ---
+    uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t MIN_HEAP_REQUIRED = 100000; // 100KB mínimo
+    
+    if (freeHeap < MIN_HEAP_REQUIRED) {
+        if (DEBUG_MODE) {
+            Serial.printf("[N0] ERROR: RAM insuficiente (%d bytes). Se requieren al menos %d bytes.\n", 
+                freeHeap, MIN_HEAP_REQUIRED);
+            Serial.println("[N0] Abortando actualización. Reiniciando dispositivo...");
+        }
+        delay(3000);
+        ESP.restart();
+        return;
+    }
+    
+    if (DEBUG_MODE) Serial.printf("[N0] RAM disponible: %d bytes. Continuando...\n", freeHeap);
+    
+    // --- PASO 4: VERIFICAR CONECTIVIDAD ---
+    if(DEBUG_MODE) Serial.println("[N0-Debug] Verificando conectividad...");
+    WiFiClient testClient;
+    
+    String binUrl = String(FIRMWARE_BIN_URL);
+    int hostStart = binUrl.indexOf("://") + 3;
+    int hostEnd = binUrl.indexOf("/", hostStart);
+    String host = binUrl.substring(hostStart, hostEnd);
+    
+    if(DEBUG_MODE) Serial.printf("[N0-Debug] Conectando a: %s:80\n", host.c_str());
+    
+    if (!testClient.connect(host.c_str(), 80)) {
+        if(DEBUG_MODE) Serial.println("[N0] ERROR: No se puede conectar al servidor.");
+        ESP.restart(); // Reiniciar en lugar de solo resumir
+        return;
+    }
+    testClient.stop();
+    if(DEBUG_MODE) Serial.println("[N0-Debug] Conectividad OK.");
+    
+    // --- PASO 5: CONFIGURAR ACTUALIZACIÓN ---
+    if (OLED_CONECTADA) drawGenericMessage("Actualizando", "Descargando...");
+    
+    WiFiClient clientOTA;
+    
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    httpUpdate.rebootOnUpdate(true); // ¡CAMBIO! Reinicio automático si éxito
+    
+    // Callback simplificado (menos uso de RAM)
+    httpUpdate.onProgress([](int progress, int total) {
+        static unsigned long lastPrint = 0;
+        static int lastPercent = -1;
+        
+        if (millis() - lastPrint > 3000) { // Cada 3 segundos
+            int percent = (progress * 100) / total;
+            
+            // Solo imprimir si el porcentaje cambió
+            if (percent != lastPercent) {
+                if(DEBUG_MODE) Serial.printf("[N0-OTA] %d%%\n", percent);
+                
+                if (OLED_CONECTADA && percent % 20 == 0) { // Actualizar pantalla cada 20%
+                    char msg[20];
+                    snprintf(msg, sizeof(msg), "%d%%", percent);
+                    drawGenericMessage("Descargando", msg);
+                }
+                
+                lastPercent = percent;
+            }
+            
+            esp_task_wdt_reset();
+            lastPrint = millis();
+        }
+    });
+    
+    httpUpdate.onStart([]() {
+        if(DEBUG_MODE) Serial.println("[N0-OTA] Iniciando descarga...");
+    });
+    
+    httpUpdate.onEnd([]() {
+        if(DEBUG_MODE) Serial.println("[N0-OTA] ¡Completado! Reiniciando...");
+        if (OLED_CONECTADA) drawGenericMessage("Actualizacion", "Completada!");
+    });
+    
+    httpUpdate.onError([](int error) {
+        if(DEBUG_MODE) {
+            Serial.printf("[N0-OTA] Error: %d\n", error);
+            Serial.printf("[N0-OTA] Detalle: %s\n", HTTPUpdate().getLastErrorString().c_str());
+        }
+    });
+    
+    // --- PASO 6: EJECUTAR ACTUALIZACIÓN ---
+    if(DEBUG_MODE) Serial.printf("[N0-Debug] Descargando: %s\n", FIRMWARE_BIN_URL);
+    if(DEBUG_MODE) Serial.printf("[N0-Debug] RAM libre justo antes de update(): %d bytes\n", ESP.getFreeHeap());
+    
+    esp_task_wdt_reset();
+    
+    t_httpUpdate_return ret = httpUpdate.update(clientOTA, FIRMWARE_BIN_URL);
+    
+    // --- PASO 7: EVALUAR RESULTADO (solo si falla, porque success reinicia auto) ---
+    if (ret == HTTP_UPDATE_FAILED) {
+        if (DEBUG_MODE) {
+            Serial.println("[N0] ERROR: Actualización falló.");
+            Serial.printf("[N0-Debug] Error (%d): %s\n", 
+                httpUpdate.getLastError(), 
+                httpUpdate.getLastErrorString().c_str());
+        }
+        if (OLED_CONECTADA) drawGenericMessage("Actualizacion", "Error!");
+        delay(5000);
+        ESP.restart(); // Reiniciar de todos modos
+    }
+    
+    // Si llegamos aquí, algo raro pasó
+    if (DEBUG_MODE) Serial.println("[N0] Estado inesperado. Reiniciando...");
+    delay(2000);
+    ESP.restart();
 }
 
 // =========================================================================
@@ -805,231 +931,30 @@ void loadCalibration() {
 }
 
 // =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleRoot (VERSIÓN FINAL COMPLETA) ----
+// --- FUNCIÓN PARA APLICAR LA CALIBRACIÓN A EMONLIB ---
 // =========================================================================
 
-void handleRoot() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
+void applyCalibration() {
+    if (DEBUG_MODE) {
+        Serial.println("\n[SISTEMA] Aplicando nueva configuración de calibración a EmonLib...");
+        Serial.printf("  - V_CAL: %.2f\n", voltage_cal);
+        Serial.printf("  - I_CAL_Fase: %.2f\n", current_cal_phase);
+        Serial.printf("  - I_CAL_Neutro: %.2f\n", current_cal_neutral);
+        Serial.printf("  - P_CAL (Phase): %.2f\n", phase_cal);
     }
     
-    if (DEBUG_MODE) Serial.println("\n[N0] Petición recibida en '/'. Generando página de estado.");
-
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "text/html", "");
-    char chunk_buffer[512];
-
-    // --- CAMBIO: Leer TODAS las variables de estado de forma segura ---
-    float vrms, irms_p, irms_n, power, leakage;
-    bool sub_active, s_status;
-    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        vrms = latest_vrms;
-        irms_p = latest_irms_phase;
-        irms_n = latest_irms_neutral;
-        power = latest_power;
-        leakage = latest_leakage;
-        sub_active = subscription_active;
-        s_status = server_status;
-        xSemaphoreGive(sharedVarsMutex);
-    } else {
-        // En caso de no poder acceder a los datos, mostramos 0 para no bloquear la página
-        vrms = irms_p = irms_n = power = leakage = 0.0;
-        sub_active = s_status = false;
-        if (DEBUG_MODE) Serial.println("[N0] ADVERTENCIA: No se pudo obtener el mutex para leer las variables en handleRoot.");
-    }
-    
-    // --- CAMBIO: Calcular VA y Factor de Potencia al momento ---
-    float va = vrms * irms_p;
-    float power_factor = (va > 0) ? (power / va) : 0;
-
-    server.sendContent("<html><head><title>Monitor LETE</title><meta http-equiv='refresh' content='5'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif; margin: 20px;} h2{color:#005b96;} table{border-collapse: collapse; width: 100%; max-width: 400px;} td{padding: 8px; border: 1px solid #ddd;}</style></head><body>");
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<h1>Monitor LETE v%.1f</h1>", FIRMWARE_VERSION);
-    server.sendContent(chunk_buffer);
-    
-    // --- CAMBIO: Mostrar todos los datos en una tabla ---
-    server.sendContent("<h2>Estado Principal</h2><table>");
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Voltaje</td><td><b>%.1f V</b></td></tr>", vrms);
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Corriente Fase</td><td><b>%.3f A</b></td></tr>", irms_p);
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Corriente Neutro</td><td><b>%.3f A</b></td></tr>", irms_n);
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Potencia Real</td><td><b>%.0f W</b></td></tr>", power);
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Potencia Aparente</td><td><b>%.0f VA</b></td></tr>", va);
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Factor de Potencia</td><td><b>%.2f</b></td></tr>", power_factor);
-    server.sendContent(chunk_buffer);
-     snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Corriente de Fuga</td><td><b>%.3f A</b></td></tr>", leakage);
-    server.sendContent(chunk_buffer);
-    server.sendContent("</table>");
-
-    server.sendContent("<h2>Conectividad</h2><table>");
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Red</td><td>%s (%d dBm)</td></tr>", WiFi.SSID().c_str(), WiFi.RSSI());
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>IP</td><td>%s</td></tr>", WiFi.localIP().toString().c_str());
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Nube</td><td>%s</td></tr>", (s_status ? "OK" : "Error"));
-    server.sendContent(chunk_buffer);
-    snprintf(chunk_buffer, sizeof(chunk_buffer), "<tr><td>Suscripci&oacute;n</td><td>%s</td></tr>", (sub_active ? "Activa" : "Inactiva"));
-    server.sendContent(chunk_buffer);
-    server.sendContent("</table>");
-
-    server.sendContent("<h2>Acciones</h2>");
-    server.sendContent("<p><a href='/calibracion'>Ajustar Calibracion</a></p>");
-    server.sendContent("<p><a href='/update'>Buscar Actualizaciones</a></p>");
-    server.sendContent("<p><a href='/buffer-stats'>Estadisticas SD</a></p>");
-    server.sendContent("<p><a href='/reset-wifi'>Borrar Credenciales Wi-Fi</a></p>");
-    server.sendContent("<p><a href='/restart' onclick='return confirm(\"Reiniciar?\");'>Reiniciar Dispositivo</a></p>");
-    server.sendContent("<p style='color:red;'><a href='/factory-reset' onclick='return confirm(\"BORRAR TODO?\");'>Reseteo de Fábrica</a></p>");
-    server.sendContent("</body></html>");
-    server.sendContent(""); // Finaliza la transferencia chunked
+    // Reconfigura los objetos de EmonLib con los valores globales actualizados
+    emon_phase.voltage(VOLTAGE_PIN, voltage_cal, phase_cal);
+    emon_phase.current(CURRENT_PHASE_PIN, current_cal_phase);
+    emon_neutral.current(CURRENT_NEUTRAL_PIN, current_cal_neutral);
 }
 
 // =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleUpdate (VERSIÓN FINAL) -----------
-// =========================================================================
-
-void handleUpdate() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
-    
-    if (DEBUG_MODE) Serial.println("\n[N0] Petición web '/update' recibida. Solicitando búsqueda de firmware...");
-    
-    // Levantamos la bandera para que la messengerTask inicie la búsqueda
-    // Usamos un mutex para asegurar que la escritura sea segura entre tareas
-    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        ota_update_request = true;
-        xSemaphoreGive(sharedVarsMutex);
-    }
-
-    server.send(200, "text/plain", "OK. Petición de búsqueda de actualizaciones enviada a la tarea de red.");
-}
-
-// =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleResetWifi (VERSIÓN FINAL) --------
-// =========================================================================
-
-void handleResetWifi() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
-
-    if (DEBUG_MODE) Serial.println("\n[N0] Petición web '/reset-wifi' recibida. Borrando credenciales y reiniciando...");
-
-    server.send(200, "text/plain", "OK. Credenciales borradas. El dispositivo se reiniciará en 1 segundo...");
-    
-    delay(1000); // Pequeña pausa para asegurar el envío de la respuesta HTTP
-    
-    WiFiManager wm;
-    wm.resetSettings();
-    
-    if (DEBUG_MODE) Serial.println("[N0] Credenciales borradas. Reiniciando ahora.");
-
-    ESP.restart();
-}
-
-// =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleCalibration (VERSIÓN FINAL) ------
-// =========================================================================
-
-void handleCalibration() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
-
-    // --- Lógica para procesar el envío del formulario (POST) ---
-    if (server.method() == HTTP_POST) {
-        if (DEBUG_MODE) Serial.println("\n[N0] Petición POST recibida en '/calibracion'. Procesando nuevos valores...");
-
-        // Comprobamos que todos los parámetros necesarios han sido enviados
-        if (server.hasArg("voltage") && server.hasArg("current_phase") && server.hasArg("current_neutral") && server.hasArg("power")) {
-            
-            float new_voltage_cal = server.arg("voltage").toFloat();
-            float new_current_cal_phase = server.arg("current_phase").toFloat();
-            float new_current_cal_neutral = server.arg("current_neutral").toFloat();
-            float new_phase_cal = server.arg("power").toFloat(); // <-- AÑADIDO: Leer el nuevo valor
-
-            if (DEBUG_MODE) {
-                Serial.println("[N0-Debug] Valores recibidos del formulario:");
-                Serial.printf("  - voltage: %.2f\n", new_voltage_cal);
-                Serial.printf("  - current_phase: %.2f\n", new_current_cal_phase);
-                Serial.printf("  - current_neutral: %.2f\n", new_current_cal_neutral);
-                Serial.printf("  - power: %.2f\n", new_phase_cal);
-            }
-            
-            // --- CAMBIO: Rangos de validación ampliados y corregidos ---
-            if (new_voltage_cal > 50.0 && new_voltage_cal < 300.0 &&
-                new_current_cal_phase > 10.0 && new_current_cal_phase < 200.0 &&
-                new_current_cal_neutral > 10.0 && new_current_cal_neutral < 200.0 &&
-                new_phase_cal > 0.1 && new_phase_cal < 10.0) {
-                
-                if (DEBUG_MODE) Serial.println("[N0-Debug] Validación de rangos: OK.");
-
-                voltage_cal = new_voltage_cal;
-                current_cal_phase = new_current_cal_phase;
-                current_cal_neutral = new_current_cal_neutral;
-                new_phase_cal = new_phase_cal; // <-- AÑADIDO: Actualizar la variable global
-                
-                saveCalibration(); // Guardar los nuevos valores en la SD
-                server.send(200, "text/plain", "OK. Calibración guardada y aplicada.");
-
-            } else {
-                if (DEBUG_MODE) Serial.println("[N0] ERROR: Uno o más valores están fuera del rango de seguridad.");
-                server.send(400, "text/plain", "Error: Valores fuera de rango de seguridad.");
-            }
-        } else {
-            if (DEBUG_MODE) Serial.println("[N0] ERROR: Faltan parámetros en la petición POST.");
-            server.send(400, "text/plain", "Error: Faltan parámetros.");
-        }
-    } 
-    // --- Lógica para mostrar el formulario (GET) ---
-    else {
-        if (DEBUG_MODE) Serial.println("\n[N0] Petición GET recibida en '/calibracion'. Mostrando formulario.");
-        
-        String html = "<html><head><title>Calibracion LETE</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif; margin: 20px;} input{margin-bottom: 10px; width: 200px; padding: 5px;}</style></head><body>";
-        html += "<h1>Calibraci&oacute;n del Dispositivo</h1>";
-        html += "<p>Ajusta los factores de calibraci&oacute;n y presiona Guardar.</p>";
-        html += "<form action='/calibracion' method='POST'>";
-        html += "Factor Voltaje (V_CAL):<br><input type='text' name='voltage' value='" + String(voltage_cal, 2) + "'><br>";
-        html += "Factor Corriente Fase (I_CAL_P):<br><input type='text' name='current_phase' value='" + String(current_cal_phase, 2) + "'><br>";
-        html += "Factor Corriente Neutro (I_CAL_N):<br><input type='text' name='current_neutral' value='" + String(current_cal_neutral, 2) + "'><br>";
-        // --- CAMBIO: Añadido campo para phase_cal ---
-        html += "Factor Correcci&oacute;n Potencia (P_CAL):<br><input type='text' name='power' value='" + String(phase_cal, 2) + "'><br>";
-        html += "<br><input type='submit' value='Guardar Calibraci&oacute;n'>";
-        html += "</form></body></html>";
-        server.send(200, "text/html", html);
-    }
-}
-
-// =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleRestart (VERSIÓN FINAL) ----------
-// =========================================================================
-
-void handleRestart() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
-
-    if (DEBUG_MODE) Serial.println("\n[N0] Petición web '/restart' recibida. Reiniciando el dispositivo...");
-
-    server.send(200, "text/html", "<h1>Reiniciando...</h1><p>El dispositivo se reiniciará en 2 segundos.</p>");
-    
-    // Pausa para asegurar que la respuesta HTTP se envíe completamente al navegador
-    delay(2000);
-    
-    ESP.restart();
-}
-
-// =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleFactoryReset (VERSIÓN FINAL) -----
+// --- FUNCIÓN DEL SERVIDOR WEB - handleFactoryReset (MODIFICADA SIN WEBSERVER) -----
 // =========================================================================
 
 void handleFactoryReset() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
+ j
 
     if (DEBUG_MODE) Serial.println("\n[N0] !ADVERTENCIA! Petición web '/factory-reset' recibida. Se borrarán todos los datos.");
 
@@ -1059,106 +984,29 @@ void handleFactoryReset() {
         File file = root.openNextFile();
         while(file){
             String filename = file.name();
-            // Borramos solo los archivos que nos interesan para no borrar archivos de sistema
-            if (filename.endsWith(".dat")) {
-                if (DEBUG_MODE) Serial.printf("[N0-Debug]   - Borrando: %s\n", filename.c_str());
-                SD.remove("/" + filename);
-            }
-            file.close(); // Cerramos el handle del archivo actual
-            file = root.openNextFile(); // Pasamos al siguiente
+// Borramos solo los archivos que nos interesan para no borrar archivos de sistema
+    if (filename.endsWith(".dat")) {
+        if (DEBUG_MODE) Serial.printf("[N0-Debug]   - Borrando: %s\n", filename.c_str());
+            SD.remove("/" + filename);
         }
+        file.close(); // Cerramos el handle del archivo actual
+            file = root.openNextFile(); // Pasamos al siguiente
+    }
         root.close(); // Cerramos el directorio raíz
         if (DEBUG_MODE) Serial.println("[N0] Todos los archivos de datos han sido borrados.");
     }
-    
+
     // 3. Borrar credenciales de WiFi
     if (DEBUG_MODE) Serial.print("[N0] Borrando credenciales de WiFi...");
     WiFiManager wm;
     wm.resetSettings();
     if (DEBUG_MODE) Serial.println(" OK.");
 
-    // 4. Enviar respuesta y reiniciar
-    server.send(200, "text/html", "<h1>Reseteo de Fábrica Completo. Reiniciando...</h1>");
+    // 4. Enviar respuesta y reinicia
+    // server.send(200, "text/html", "<h1>Reseteo de Fábrica Completo. Reiniciando...</h1>"); // <--- LÍNEA ELIMINADA
     delay(2000);
-    
+
     ESP.restart();
-}
-
-// =========================================================================
-// --- FUNCIÓN DEL SERVIDOR WEB - handleBufferStats (VERSIÓN FINAL) ------
-// =========================================================================
-
-void handleBufferStats() {
-    if (!server.authenticate(HTTP_USER, HTTP_PASS)) {
-        return server.requestAuthentication();
-    }
-
-    if (DEBUG_MODE) Serial.println("\n[N0] Petición web '/buffer-stats' recibida. Generando estadísticas...");
-
-    // --- CÁLCULO DE ESTADÍSTICAS ---
-    uint64_t totalBytes = SD.cardSize();
-    uint64_t usedBytes = SD.usedBytes();
-    float usedMB = (float)usedBytes / (1024 * 1024);
-    float totalMB = (float)totalBytes / (1024 * 1024);
-    float usedGB = usedMB / 1024;
-    float totalGB = totalMB / 1024;
-
-    // --- CÁLCULO DE ARCHIVOS PENDIENTES ---
-    int pending_files = 0;
-    File root = SD.open("/");
-    if (root) {
-        File file = root.openNextFile();
-        while(file){
-            String filename = file.name();
-            if (filename.endsWith(".dat") && filename != "/buffer.dat") {
-                pending_files++;
-            }
-            file.close();
-            file = root.openNextFile();
-        }
-        root.close();
-    }
-
-    // Leemos el contador de líneas del buffer actual de forma segura
-    int lines_in_buffer_local = 0;
-    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        lines_in_buffer_local = lines_in_buffer;
-        xSemaphoreGive(sharedVarsMutex);
-    }
-    
-    if (DEBUG_MODE) {
-        Serial.println("[N0-Debug] Estadísticas generadas:");
-        Serial.printf("  - SD: %.2f / %.2f MB Usados\n", usedMB, totalMB);
-        Serial.printf("  - Archivos de batch pendientes: %d\n", pending_files);
-        Serial.printf("  - Líneas en buffer actual: %d\n", lines_in_buffer_local);
-    }
-
-    // --- GENERACIÓN DE HTML ---
-    String html = "<html><head><title>Estadisticas de Buffer</title><meta http-equiv='refresh' content='10'></head><body>";
-    html += "<h1>Estadisticas de Buffer y SD</h1>";
-    
-    html += "<h2>Estado del B&uacute;fer de Datos</h2><table>";
-    html += "<tr><td>Archivos de batch pendientes de env&iacute;o</td><td><b>" + String(pending_files) + "</b></td></tr>";
-    html += "<tr><td>Mediciones en el batch actual</td><td><b>" + String(lines_in_buffer_local) + " / " + String(BATCH_SIZE) + "</b></td></tr>";
-    html += "</table>";
-    
-    html += "<h2>Almacenamiento en Tarjeta SD</h2><table>";
-    html += "<tr><td>Tipo de Tarjeta</td><td>";
-    switch(SD.cardType()){
-        case CARD_MMC: html += "MMC"; break;
-        case CARD_SD: html += "SDSC"; break;
-        case CARD_SDHC: html += "SDHC"; break;
-        default: html += "Desconocido";
-    }
-    html += "</td></tr>";
-    html += "<tr><td>Espacio Total</td><td>" + String(totalGB, 2) + " GB (" + String(totalMB, 0) + " MB)</td></tr>";
-    html += "<tr><td>Espacio Usado</td><td>" + String(usedGB, 2) + " GB (" + String(usedMB, 2) + " MB)</td></tr>";
-    html += "</table>";
-
-    html += "<p><a href='/'>Volver al inicio</a></p>";
-    html += "</body></html>";
-    
-    server.send(200, "text/html", html);
 }
 
 // Esta función devuelve 'true' si se descargó una nueva calibración, y 'false' si no.
@@ -1195,35 +1043,52 @@ bool handleRemoteTasks() {
             if (DEBUG_MODE) Serial.printf("[N0] ERROR: Fallo al parsear JSON de tareas: %s\n", error.c_str());
         } else {
             
-            // --- 1. PROCESAR ESTADO DE SUSCRIPCIÓN (Lógica completa) ---
-            if (doc.containsKey("subscription_payload")) {
-                if(DEBUG_MODE) Serial.println("[N0] Procesando datos de suscripción...");
-                String sub_payload = doc["subscription_payload"];
+            // --- 1. PROCESAR ESTADO DE SUSCRIPCIÓN (Lógica JSON v2.0) ---
+            if (doc.containsKey("subscription") && !doc["subscription"].isNull()) {
+                if(DEBUG_MODE) Serial.println("[N0] Procesando objeto de suscripción...");
+                
+                JsonObject sub = doc["subscription"];
+                
+                // Usamos .as<String>() para manejar de forma segura si el valor es nulo
+                String status_str = sub["status"].as<String>();
+                String next_pay_str = sub["next_payment_date"].as<String>();
+                
+                // Usamos el operador '|' como valor por defecto si la clave no existe
+                int grace_days_val = sub["grace_days"] | 0;
+                long next_pay_ts_val = sub["next_payment_ts"] | 0;
 
-                int first_pipe = sub_payload.indexOf('|');
-                int second_pipe = sub_payload.indexOf('|', first_pipe + 1);
-
-                if (first_pipe > 0 && second_pipe > first_pipe) {
-                    if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        subscription_active = (sub_payload.substring(0, first_pipe) == "active");
-                        dias_de_gracia_restantes = sub_payload.substring(first_pipe + 1, second_pipe).toInt();
-                        pago_vencido = !subscription_active;
-
-                        int third_pipe = sub_payload.indexOf('|', second_pipe + 1); 
-                        if (third_pipe > second_pipe) {
-                            sub_next_payment_str = sub_payload.substring(second_pipe + 1, third_pipe);
-                            sub_active_until_ts = sub_payload.substring(third_pipe + 1).toInt();
-                        } else {
-                            sub_next_payment_str = sub_payload.substring(second_pipe + 1);
-                            sub_active_until_ts = 0;
-                        }
-                        
-                        xSemaphoreGive(sharedVarsMutex);
-                        if(DEBUG_MODE) Serial.println("[N0] ÉXITO: Datos de suscripción actualizados en memoria.");
+                // Actualizamos las variables globales de forma segura
+                if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    subscription_active = (status_str == "active");
+                    dias_de_gracia_restantes = grace_days_val;
+                    pago_vencido = !subscription_active;
+                    sub_next_payment_str = next_pay_str;
+                    sub_active_until_ts = next_pay_ts_val;
+                    
+                    xSemaphoreGive(sharedVarsMutex);
+                    
+                    if(DEBUG_MODE) {
+                       Serial.println("[N0] ÉXITO: Datos de suscripción actualizados en memoria.");
+                       Serial.printf("     - Status: %s, Gracia: %d, Vencido: %s\n",
+                           subscription_active ? "Activa" : "Inactiva",
+                           dias_de_gracia_restantes,
+                           pago_vencido ? "SI" : "NO");
+                       Serial.printf("     - Prox. Pago: %s (TS: %lu)\n", sub_next_payment_str.c_str(), sub_active_until_ts);
                     }
-                } else {
-                    if(DEBUG_MODE) Serial.println("[N0] ADVERTENCIA: El formato del 'subscription_payload' es incorrecto. Se ignoró.");
                 }
+            } else {
+                if(DEBUG_MODE) Serial.println("[N0] ADVERTENCIA: No se encontró el objeto 'subscription' en la respuesta de Supabase.");
+            }
+
+            // <<<<<<< INICIO DE LA CORRECCIÓN >>>>>>>
+            // (Esta sección ya la tenías, solo asegúrate que siga después de la de suscripción)
+
+            // <<<<<<< INICIO DE LA CORRECCIÓN >>>>>>>
+            // --- 2. PROCESAR LA URL DEL SERVIDOR DE DATOS ---
+            // Se mueve aquí, al nivel principal del JSON, no anidado.
+            if (doc.containsKey("server_url") && !doc["server_url"].isNull()) {
+            currentServerUrl = doc["server_url"].as<String>();
+            if (DEBUG_MODE) Serial.printf("[N0] URL del servidor de datos actualizada a: %s\n", currentServerUrl.c_str());
             }
 
             // --- 2. PROCESAR ACTUALIZACIÓN DE CALIBRACIÓN ---
@@ -1240,6 +1105,9 @@ bool handleRemoteTasks() {
                      phase_cal = values["phase_cal"];
                 }
 
+                // --- CORRECCIÓN AÑADIDA ---
+                applyCalibration(); // Aplicar inmediatamente la nueva calibración
+
                 newConfigFetched = true;
                 if (DEBUG_MODE) Serial.println("[N0] ¡ÉXITO! Variables de calibración actualizadas.");
             }
@@ -1255,7 +1123,7 @@ bool handleRemoteTasks() {
                     ESP.restart();
                 } else if (cmd == "factory_reset") {
                     if (DEBUG_MODE) Serial.println("[N0] Comando remoto 'factory_reset' recibido. Ejecutando...");
-                    // handleFactoryReset(); // Llama aquí a tu función de reseteo de fábrica
+                    handleFactoryReset(); // Llama aquí a tu función de reseteo de fábrica
                 }
             }
         }
