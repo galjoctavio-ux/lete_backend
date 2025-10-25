@@ -1,9 +1,9 @@
 /*
 ==========================================================================
-== FIRMWARE LETE - MONITOR DE ENERGÍA v12.1 (Estable)
+== FIRMWARE LETE - MONITOR DE ENERGÍA v12.4 (Estable)
 ==
 == CORRECCIONES v12.1:
-== - Debugmode off
+== -
 =========================================================================
 */
 
@@ -24,6 +24,7 @@
 #include <esp_task_wdt.h>
 #include "EmonLib.h" // <-- LIBRERÍA AÑADIDA
 #include <WiFiClientSecure.h> // <-- ASEGÚRATE DE TENER ESTO
+#include <PubSubClient.h>
 
 // --- LIBRERÍAS PARA HARDWARE ---
 #include <SPI.h>
@@ -31,7 +32,7 @@
 #include <Adafruit_NeoPixel.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 12.1;
+const float FIRMWARE_VERSION = 12.4;
 const bool OLED_CONECTADA = true;
 const bool DEBUG_MODE = false;
 
@@ -55,14 +56,14 @@ const bool DEBUG_MODE = false;
 const unsigned long MEASUREMENT_INTERVAL_MS = 2000;
 const unsigned long SCREEN_CONSUMPTION_INTERVAL_MS = 30000;
 const unsigned long SCREEN_OTHER_INTERVAL_MS = 15000;
-const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
+//const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 120 * 1000;
 const unsigned long SERVER_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
 const unsigned long MESSENGER_CYCLE_DELAY_MS = 5000;
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000
-unsigned long bootTime = 0;
+//unsigned long bootTime = 0;
 
 // --- CONFIGURACIÓN DE RED Y SENSORES ---
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -119,6 +120,18 @@ unsigned long button_press_start_time = 0;
 bool button_is_pressed = false;
 uint32_t global_sequence_number = 0;
 String currentServerUrl; //Se agrega
+const int MQTT_PORT = 1883;
+const char* TOPIC_BOOT = "lete/dispositivos/boot_time";
+const char* TOPIC_MEDICIONES = "lete/mediciones/"; // El device_id se añadirá al final
+
+// Objetos de WiFi y MQTT
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Variables de estado para MQTT
+String deviceIdForMqtt = "";
+bool boot_time_reported = false;
+volatile bool calibration_complete = false;
 
 // --- 4. DECLARACIÓN DE FUNCIONES ---
 void writerTask(void * pvParameters);
@@ -132,27 +145,39 @@ void handleFactoryReset();
 #include "oled_screens.h"
 
 // =========================================================================
-// === TAREA 1: ESCRITOR (NÚCLEO 1) - VERSIÓN FINAL CON DEPURACIÓN       ===
+// === TAREA 1: ESCRITOR (NÚCLEO 1) - VERSIÓN MODIFICADA (FASE 1)        ===
 // =========================================================================
 void writerTask(void * pvParameters) {
     if(DEBUG_MODE) Serial.println("[N1] Tarea de Escritura iniciada en Núcleo 1.");
     esp_task_wdt_add(NULL);
     
+    // --- PASO 3: AÑADIR RETRASO DE ESTABILIZACIÓN ---
+    if(DEBUG_MODE) Serial.println("[N1] Esperando 60 segundos para estabilización de sensores...");
+    vTaskDelay(pdMS_TO_TICKS(60000));
+    if(DEBUG_MODE) Serial.println("[N1] Estabilización completa. Iniciando bucle principal.");
+
+    // ¡¡SOLUCIÓN AQUÍ!!
+    // Ahora, esperar a que el Núcleo 0 (setup) termine la calibración.
+    if(DEBUG_MODE) Serial.println("[N1] Esperando a que el Núcleo 0 termine la calibración...");
+    while (!calibration_complete) {
+        vTaskDelay(pdMS_TO_TICKS(200)); // Esperar 200ms y volver a checar
+    }
+    if(DEBUG_MODE) Serial.println("[N1] ¡Calibración confirmada! Iniciando bucle principal.");
+
     unsigned long last_measurement_time = 0;
     const int lecturas_a_descartar = 5;
     int lecturas_descartadas = 0;
-
+    
     for (;;) { // <-- INICIO DEL BUCLE INFINITO PRINCIPAL
         esp_task_wdt_reset();
         unsigned long currentMillis = millis();
 
         if (currentMillis - last_measurement_time >= MEASUREMENT_INTERVAL_MS) {
             last_measurement_time = currentMillis;
-
             if(DEBUG_MODE) Serial.println("\n[N1] ==> Iniciando ciclo de medición...");
 
             // Realizamos los cálculos para el canal de Fase (que incluye voltaje)
-            emon_phase.calcVI(20, 2000); 
+            emon_phase.calcVI(20, 2000);
             // Realizamos los cálculos solo para la corriente del Neutro
             emon_neutral.calcVI(20, 2000);
 
@@ -160,21 +185,16 @@ void writerTask(void * pvParameters) {
                 lecturas_descartadas++;
                 if(DEBUG_MODE) Serial.printf("[N1] Descartando lectura inicial %d de %d.\n", lecturas_descartadas, lecturas_a_descartar);
             } else {
-                // --- CAMBIO: AÑADIDA ESPERA ACTIVA PARA LA HORA NTP ---
-                // Si aún no tenemos la hora, no procesamos ni guardamos.
-                if (!time_synced) {
-                    if(DEBUG_MODE) Serial.println("[N1] Esperando la primera sincronización de hora NTP para empezar a guardar datos...");
-                    // Volvemos al inicio del bucle de la tarea para reintentar en el siguiente ciclo.
-                    // Esto evita procesar datos con timestamp 0.
-                    continue; 
-                }
+                
+                // --- PASO 4: ELIMINADO EL BLOQUEO 'if (!time_synced)' ---
+                // El código ahora continúa midiendo y guardando incondicionalmente.
             
-
                 if(DEBUG_MODE && lecturas_descartadas == 5) Serial.println("[N1] Lecturas iniciales descartadas. Empezando a procesar datos.");
-
+                
                 MeasurementData data;
                 data.sequence_number = ++global_sequence_number;
-                data.timestamp = time_synced ? time(NULL) : 0;
+                // --- PASO 5: USAR millis() COMO TIMESTAMP ---
+                data.timestamp = millis(); 
                 data.vrms = emon_phase.Vrms;
                 data.irms_phase = emon_phase.Irms;
                 data.irms_neutral = emon_neutral.Irms;
@@ -195,47 +215,52 @@ void writerTask(void * pvParameters) {
                 }
 
                 // --- IMPRESIÓN DE CALIBRACIÓN ---
-          Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, FP:%.2f, Fuga:%.3f, Temp:%.1fC\n",
-                          data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu);
+                Serial.printf("[N1] RMS -> V:%.1f, A_Fase:%.3f, A_Neutro:%.3f, W:%.0f, VA:%.0f, FP:%.2f, Fuga:%.3f, Temp:%.1fC\n",
+                              data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu);
                 
-                if (time_synced) {
-                    if(DEBUG_MODE) Serial.println("[N1-Debug] Condición 'time_synced' es verdadera. Procediendo a guardar en SD.");
-                    File dataFile = SD.open("/buffer.dat", FILE_APPEND);
-                    if (dataFile) {
-                        dataFile.print(data.sequence_number); dataFile.print(",");
-                        dataFile.print(data.timestamp); dataFile.print(",");
-                        dataFile.print(data.vrms); dataFile.print(",");
-                        dataFile.print(data.irms_phase); dataFile.print(",");
-                        dataFile.print(data.irms_neutral); dataFile.print(",");
-                        dataFile.print(data.power); dataFile.print(",");
-                        dataFile.print(data.va); dataFile.print(",");
-                        dataFile.print(data.power_factor); dataFile.print(","); // <-- AÑADIDO
-                        dataFile.print(data.leakage); dataFile.print(",");
-                        dataFile.println(data.temp_cpu);
-                        dataFile.close();
+                // --- PASO 4: ELIMINADA LA CONDICIÓN 'if (time_synced)' ---
+                // La lógica de guardado en SD ahora se ejecuta siempre.
+                
+                if(DEBUG_MODE) Serial.println("[N1-Debug] Procediendo a guardar en SD.");
+                File dataFile = SD.open("/buffer.dat", FILE_APPEND);
+                if (dataFile) {
+                    // --- PASO 6: AJUSTAR FORMATO DE GUARDADO (Automático por Paso 5) ---
+                    // Se mantiene el formato de 10 campos, pero data.timestamp ahora contiene millis().
+                    // Esto coincide con el sscanf existente en messengerTask
+                    dataFile.print(data.sequence_number);
+                    dataFile.print(",");
+                    dataFile.print(data.timestamp); dataFile.print(",");
+                    dataFile.print(data.vrms); dataFile.print(",");
+                    dataFile.print(data.irms_phase); dataFile.print(",");
+                    dataFile.print(data.irms_neutral); dataFile.print(",");
+                    dataFile.print(data.power); dataFile.print(",");
+                    dataFile.print(data.va); dataFile.print(",");
+                    dataFile.print(data.power_factor); dataFile.print(",");
+                    dataFile.print(data.leakage);
+                    dataFile.print(",");
+                    dataFile.println(data.temp_cpu);
+                    dataFile.close();
 
-                        lines_in_buffer++;
-                        if(DEBUG_MODE) Serial.printf("[N1] Agregando linea %d/%d al buffer.\n", lines_in_buffer, BATCH_SIZE);
-
-                        if (lines_in_buffer >= BATCH_SIZE) {
-                            String new_filename = "/" + String(data.timestamp) + ".dat";
-                            if (SD.rename("/buffer.dat", new_filename)) {
-                                if(DEBUG_MODE) Serial.printf("[N1] Batch completo. Archivo '/buffer.dat' renombrado a '%s'\n", new_filename.c_str());
-                            } else {
-                                if(DEBUG_MODE) Serial.println("[N1] ERROR: Fallo al renombrar el buffer.");
-                            }
-                            lines_in_buffer = 0;
+                    lines_in_buffer++;
+                    if(DEBUG_MODE) Serial.printf("[N1] Agregando linea %d/%d al buffer.\n", lines_in_buffer, BATCH_SIZE);
+                    
+                    if (lines_in_buffer >= BATCH_SIZE) {
+                        // El nombre del archivo ahora usará el timestamp de millis() de la última medición
+                        String new_filename = "/" + String(data.timestamp) + ".dat";
+                        if (SD.rename("/buffer.dat", new_filename)) {
+                            if(DEBUG_MODE) Serial.printf("[N1] Batch completo. Archivo '/buffer.dat' renombrado a '%s'\n", new_filename.c_str());
+                        } else {
+                            if(DEBUG_MODE) Serial.println("[N1] ERROR: Fallo al renombrar el buffer.");
                         }
-                    } else {
-                        if(DEBUG_MODE) Serial.println("[N1] ERROR: Fallo al abrir /buffer.dat para añadir.");
+                        lines_in_buffer = 0;
                     }
                 } else {
-                    if(DEBUG_MODE) Serial.printf("[N1-Debug] Condición 'time_synced' es falsa. No se guardará en SD.\n"); 
+                    if(DEBUG_MODE) Serial.println("[N1] ERROR: Fallo al abrir /buffer.dat para añadir.");
                 }
             }
         } // Fin de if (measurement interval)
         
-        // --- GESTIÓN DE BOTÓN Y PANTALLA ---
+        // --- GESTIÓN DE BOTÓN Y PANTALLA (SIN CAMBIOS) ---
         if (digitalRead(BUTTON_PIN) == LOW) {
             if (!button_is_pressed) {
                 button_press_start_time = currentMillis;
@@ -259,7 +284,8 @@ void writerTask(void * pvParameters) {
         }
 
         if (OLED_CONECTADA) {
-            unsigned long rotation_interval = (screen_mode == 0) ? SCREEN_CONSUMPTION_INTERVAL_MS : SCREEN_OTHER_INTERVAL_MS;
+            unsigned long rotation_interval = (screen_mode == 0) ?
+                SCREEN_CONSUMPTION_INTERVAL_MS : SCREEN_OTHER_INTERVAL_MS;
             if (currentMillis - last_screen_change_time > rotation_interval) {
                 screen_mode = (screen_mode + 1) % 3;
                 last_screen_change_time = currentMillis;
@@ -282,7 +308,7 @@ void writerTask(void * pvParameters) {
             }
         }
         
-        // --- TAREAS DE MANTENIMIENTO DEL SISTEMA ---
+        // --- TAREAS DE MANTENIMIENTO DEL SISTEMA (SIN CAMBIOS) ---
         if (currentMillis - last_wifi_check > WIFI_CHECK_INTERVAL_MS) {
             last_wifi_check = currentMillis;
             if (WiFi.status() != WL_CONNECTED) {
@@ -291,18 +317,15 @@ void writerTask(void * pvParameters) {
             }
         }
 
-        if (currentMillis - bootTime > DAILY_RESTART_INTERVAL_MS) {
-            if(DEBUG_MODE) Serial.println("[N1] Reinicio diario programado...");
-            delay(1000);
-            ESP.restart();
-        }
+        // --- PASO 1: ELIMINADO REINICIO DIARIO ---
+        // El bloque 'if (currentMillis - bootTime > DAILY_RESTART_INTERVAL_MS)' se ha eliminado.
 
         vTaskDelay(pdMS_TO_TICKS(50));
     } // <-- FIN DEL BUCLE INFINITO PRINCIPAL
 }
 
 // =========================================================================
-// === TAREA 2: MENSAJERO (NÚCLEO 0) - CON COMANDOS Y CALIBRACIÓN REMOTA ===
+// === TAREA 2: MENSAJERO (NÚCLEO 0) - CON MQTT (FASE 3) ===================
 // =========================================================================
 void messengerTask(void * pvParameters) {
     if(DEBUG_MODE) Serial.println("[N0] Tarea de Mensajero iniciada en Núcleo 0.");
@@ -315,7 +338,7 @@ void messengerTask(void * pvParameters) {
         if(DEBUG_MODE) Serial.println("\n[N0-Debug] >>> Inicio del bucle de la tarea Messenger.");
         esp_task_wdt_reset();
 
-        // --- MANEJO DE ACTUALIZACIÓN OTA MANUAL ---
+        // --- MANEJO DE ACTUALIZACIÓN OTA MANUAL (Se mantiene) ---
         bool update_requested_local = false;
         if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (ota_update_request) {
@@ -330,7 +353,7 @@ void messengerTask(void * pvParameters) {
         }
         if(DEBUG_MODE) Serial.println("[N0-Debug] Chequeo de OTA manual finalizado.");
 
-        // --- GESTIÓN DE WIFI Y HORA (NTP) ---
+        // --- GESTIÓN DE WIFI (Se mantiene) ---
         if (WiFi.status() != WL_CONNECTED) {
             if(DEBUG_MODE) Serial.println("[N0] WiFi desconectado, en espera durante 10s...");
             pixels.setPixelColor(0, pixels.Color(255, 165, 0));
@@ -342,6 +365,42 @@ void messengerTask(void * pvParameters) {
         pixels.setPixelColor(0, pixels.Color(0, 0, (millis() % 2000) < 1000 ? 50 : 0));
         pixels.show();
 
+         // --- TAREAS PERIÓDICAS (OTA y Comandos Supabase - Se mantienen) ---
+        if (millis() - last_server_check > SERVER_CHECK_INTERVAL_MS || last_server_check == 0) {
+            if(DEBUG_MODE) Serial.println("[N0-Debug] Condición para chequear servidor cumplida. Llamando a handleRemoteTasks().");
+            bool newConfig = handleRemoteTasks();
+            if (newConfig) {
+                if (DEBUG_MODE) Serial.println("[N0] Nueva configuración remota detectada, guardando en SD...");
+                saveCalibration();
+            }
+
+            checkForHttpUpdate();
+            
+            last_server_check = millis();
+        }
+
+
+        // --- FASE 3: LÓGICA DE CONEXIÓN MQTT ---
+        if (!client.connected()) {
+            if (DEBUG_MODE) Serial.println("[N0] Intentando conexión MQTT...");
+            
+            // Generar el ID de dispositivo una vez
+            if (deviceIdForMqtt == "") {
+                deviceIdForMqtt = WiFi.macAddress();
+                deviceIdForMqtt.replace(":", "");
+            }
+
+            if (client.connect(deviceIdForMqtt.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+                if (DEBUG_MODE) Serial.println("[N0] MQTT Conectado.");
+            } else {
+                if (DEBUG_MODE) Serial.printf("[N0] ERROR: Fallo al conectar a MQTT, rc=%d. Reintentando en 5s...\n", client.state());
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue; // Reinicia el bucle para reintentar la conexión
+            }
+        }
+        client.loop(); // Maneja los callbacks y pings de MQTT
+
+        // --- GESTIÓN DE HORA (NTP) Y REPORTE DE ARRANQUE (TAREA A) ---
         if (!time_synced && millis() - last_ntp_attempt > NTP_RETRY_INTERVAL_MS) {
             last_ntp_attempt = millis();
             if(DEBUG_MODE) Serial.println("[N0] ==> Intentando sincronizar NTP...");
@@ -354,32 +413,37 @@ void messengerTask(void * pvParameters) {
                     if(DEBUG_MODE) Serial.println("[N0-Debug] Flag 'time_synced' puesto en true.");
                 }
                 if(DEBUG_MODE) Serial.println("[N0] Hora NTP sincronizada con éxito.");
+
+                // --- FASE 3: IMPLEMENTAR REPORTE DE ARRANQUE (TAREA A) ---
+                if (!boot_time_reported && client.connected()) {
+                    long boot_time_unix = time(NULL) - (millis() / 1000);
+                    char jsonPayload[128];
+                    
+                    snprintf(jsonPayload, sizeof(jsonPayload), 
+                             "{\"device_id\":\"%s\",\"boot_time_unix\":%lu}", 
+                             deviceIdForMqtt.c_str(), boot_time_unix);
+                    
+                    // Publicar con retención (true) para que el backend la reciba
+                    if (client.publish(TOPIC_BOOT, jsonPayload, true)) { 
+                        if(DEBUG_MODE) Serial.printf("[N0] ÉXITO: Reporte de arranque enviado: %s\n", jsonPayload);
+                        boot_time_reported = true;
+                    } else {
+                        if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al enviar reporte de arranque.");
+                    }
+                }
+                // --- FIN FASE 3 ---
+
             } else {
                 if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al obtener hora NTP (timeout).");
             }
         }
         if(DEBUG_MODE) Serial.println("[N0-Debug] Chequeo de NTP finalizado.");
 
-        // --- TAREAS PERIÓDICAS ---
-        // Se reemplaza la antigua llamada a checkSubscriptionStatus() por handleRemoteTasks(),
-        // ya que la Edge Function ahora maneja todo (suscripción, calibración y comandos).
-        if (millis() - last_server_check > SERVER_CHECK_INTERVAL_MS || last_server_check == 0) {
-            if(DEBUG_MODE) Serial.println("[N0-Debug] Condición para chequear servidor cumplida. Llamando a handleRemoteTasks().");
-            
-            bool newConfig = handleRemoteTasks();
-            if (newConfig) {
-                // Si se descargó una nueva calibración, la guardamos en la SD para el próximo reinicio.
-                if (DEBUG_MODE) Serial.println("[N0] Nueva configuración remota detectada, guardando en SD...");
-                saveCalibration();
-            }
-
-            checkForHttpUpdate();
-            
-            last_server_check = millis();
-        }
+       
         if(DEBUG_MODE) Serial.println("[N0-Debug] Chequeo de tareas periódicas finalizado.");
 
-        // --- PROCESAMIENTO DE ARCHIVOS DE LA SD ---
+        // --- FASE 3: PROCESAMIENTO DE ARCHIVOS DE LA SD CON MQTT (TAREA B) ---
+        if (boot_time_reported) {
         if(DEBUG_MODE) Serial.println("[N0-Debug] Abriendo directorio raíz de la SD para buscar archivos...");
         File root = SD.open("/");
         if (!root) {
@@ -392,55 +456,10 @@ void messengerTask(void * pvParameters) {
         File file_to_process;
         while(file_to_process = root.openNextFile()){
             String filename = file_to_process.name();
-            
             if (filename.endsWith(".dat") && filename != "/buffer.dat") {
                 if(DEBUG_MODE) Serial.printf("\n[N0] ==> Archivo de batch encontrado: %s (Tamaño: %d bytes)\n", filename.c_str(), file_to_process.size());
 
-                String fileContent = "";
-                while(file_to_process.available()) {
-                    fileContent += (char)file_to_process.read();
-                }
-
-                String payload = "";
-                int start = 0;
-                int end = fileContent.indexOf('\n');
-                while (end != -1) {
-                    String line = fileContent.substring(start, end);
-                    line.trim();
-                    start = end + 1;
-                    end = fileContent.indexOf('\n', start);
-
-                    if (line.length() > 0) {
-                        MeasurementData data;
-
-                        // <-- CAMBIO: Actualizado para parsear 10 campos, incluyendo F.P.
-                        int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f,%f", 
-                                &data.sequence_number, &data.timestamp, &data.vrms, &data.irms_phase, 
-                                &data.irms_neutral, &data.power, &data.va, &data.power_factor, &data.leakage, &data.temp_cpu);
-                        
-                        if (parsed_items == 10) {
-                            char linePayload[256];
-                            // <-- CAMBIO: Actualizado para enviar F.P. al servidor
-                            snprintf(linePayload, sizeof(linePayload),
-                                     "%.2f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.1f,%u,%lu\n",
-                                     data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu,
-                                     data.sequence_number, data.timestamp);
-                            payload += linePayload;
-                        } else {
-                            if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: Línea mal formada en %s, se leyeron %d de 10 campos. Línea ignorada.\n", filename.c_str(), parsed_items);
-                        }
-                    }
-                }
-
-                if (payload.length() > 0) {
-                if(DEBUG_MODE) {
-                    Serial.println("[N0] Payload de datos generado. Verificando suscripción...");
-                    // Serial.println("vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv");
-                    // Serial.print(payload);
-                    // Serial.println("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^");
-                }
-                
-                // --- INICIO DE CORRECCIÓN DE LÓGICA DE SUSCRIPCIÓN ---
+                // --- Lógica de suscripción (se mantiene) ---
                 bool puede_enviar_datos = false;
                 if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (subscription_active || dias_de_gracia_restantes > 0) {
@@ -449,56 +468,85 @@ void messengerTask(void * pvParameters) {
                     xSemaphoreGive(sharedVarsMutex);
                 }
 
-                if (puede_enviar_datos) {
-                    // Si SÍ puede enviar (activa o en gracia), ejecuta el bloque de envío
-                    if(DEBUG_MODE) Serial.printf("[N0] Suscripción OK. Enviando batch %s...\n", filename.c_str());
+                if (!puede_enviar_datos) {
+                    if(DEBUG_MODE) Serial.printf("[N0] Suscripción inactiva. Omitiendo envío del batch %s.\n", filename.c_str());
+                    file_to_process.close();
+                    continue; // Pasa al siguiente archivo
+                }
 
-                    HTTPClient http;
-                    String macAddress = WiFi.macAddress();
-                    macAddress.replace(":", "");
-                    String url_con_id = String(currentServerUrl) + "?device=" + macAddress;
+                // --- Procesar y enviar por MQTT línea por línea ---
+                bool batch_success = true;
+                String topic_mediciones = String(TOPIC_MEDICIONES) + deviceIdForMqtt;
 
-                    if(DEBUG_MODE) Serial.printf("[N0-Debug] URL de destino: %s\n", url_con_id.c_str());
-
-                    http.begin(url_con_id);
-                    http.addHeader("Content-Type", "text/plain");
-                    
-                    int httpCode = http.POST(payload);
-                    String serverResponse = http.getString();
-                    http.end();
-
-                    if (httpCode >= 200 && httpCode < 300) {
-                        if(DEBUG_MODE) Serial.printf("[N0] ÉXITO: Batch %s enviado (HTTP: %d). Borrando archivo.\n", filename.c_str(), httpCode);
-                        SD.remove("/" + filename);
-                    } else {
-                        if(DEBUG_MODE) {
-                            Serial.printf("[N0] ERROR: Fallo al enviar batch %s (HTTP: %d). Se reintentará.\n", filename.c_str(), httpCode);
-                            Serial.printf("[N0-Debug] Respuesta del servidor: %s\n", serverResponse.c_str());
+                while (file_to_process.available()) {
+                    String line = file_to_process.readStringUntil('\n');
+                    line.trim();
+                    if (line.length() > 0) {
+                        MeasurementData data;
+                        // El sscanf sigue parseando 10 campos
+                        // data.timestamp ahora contiene millis()
+                        int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f,%f", 
+                                          &data.sequence_number, &data.timestamp, &data.vrms, &data.irms_phase, 
+                                          &data.irms_neutral, &data.power, &data.va, &data.power_factor, &data.leakage, &data.temp_cpu);
+                        
+                        if (parsed_items == 10) {
+                            char jsonPayload[256];
+                            // Construir el JSON con nombres cortos para ahorrar espacio
+                            snprintf(jsonPayload, sizeof(jsonPayload),
+                                     "{\"ts_millis\":%lu,\"vrms\":%.2f,\"irms_p\":%.3f,\"irms_n\":%.3f,\"pwr\":%.2f,\"va\":%.2f,\"pf\":%.2f,\"leak\":%.3f,\"temp\":%.1f,\"seq\":%u}",
+                                     data.timestamp, data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu, data.sequence_number);
+                            
+                            // Publicar el mensaje
+                            if (!client.publish(topic_mediciones.c_str(), jsonPayload)) {
+                                if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al publicar mensaje MQTT. Abortando este batch.");
+                                batch_success = false;
+                                break; // Rompe el bucle 'while (file_to_process.available())'
+                            } else {
+                                 if(DEBUG_MODE) Serial.printf("[N0] Mensaje enviado: %s\n", jsonPayload);
+                            }
+                        } else {
+                            if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: Línea mal formada en %s, %d/10. Ignorada.\n", filename.c_str(), parsed_items);
                         }
-                        break; // Rompe el bucle 'while' para reintentar este archivo después
                     }
-                } else {
-                    // Si NO puede enviar (suscripción vencida y sin gracia), lo informa.
-                    // El archivo NO se borra y se conserva en la SD.
-                    if(DEBUG_MODE) Serial.printf("[N0] Suscripción inactiva. Omitiendo envío del batch %s. Se conservará en la SD.\n", filename.c_str());
-                }
+
+                    // --- INICIO DE LA CORRECCIÓN DE TIMEOUT ---
+                client.loop(); // Permite que MQTT envíe pings de keep-alive
+                esp_task_wdt_reset(); // Evita el reinicio del Watchdog
                 // --- FIN DE LA CORRECCIÓN ---
+                } // Fin del bucle while (file_to_process.available())
+
+                if (batch_success) {
+                    if(DEBUG_MODE) Serial.printf("[N0] ÉXITO: Batch %s enviado. Borrando archivo.\n", filename.c_str());
+                    // Cerramos el archivo ANTES de borrarlo
+                    file_to_process.close();
+                    SD.remove("/" + filename);
+                } else {
+                    if(DEBUG_MODE) Serial.printf("[N0] ERROR: Batch %s fallido. Se reintentará.\n", filename.c_str());
+                    // Cerramos el archivo y rompemos el bucle principal para reintentar
+                    file_to_process.close();
+                    break; 
+                }
 
             } else {
-                   if(DEBUG_MODE) Serial.printf("[N0] ADVERTENCIA: No se generó payload para el archivo %s. Borrando archivo vacío o corrupto.\n", filename.c_str());
-                   SD.remove("/" + filename);
-                }
-            } else {
-                if(DEBUG_MODE && filename != "/") Serial.printf("[N0-Debug] Archivo/Directorio encontrado ('%s') pero ignorado.\n", filename.c_str());
+                 if(DEBUG_MODE && filename != "/") Serial.printf("[N0-Debug] Archivo/Directorio encontrado ('%s') pero ignorado.\n", filename.c_str());
             }
-            file_to_process.close();
-            esp_task_wdt_reset(); 
+            
+            if (file_to_process) {
+                file_to_process.close();
+            }
+            
+            esp_task_wdt_reset();
         }
         root.close();
         if(DEBUG_MODE) Serial.println("[N0-Debug] Búsqueda de archivos finalizada para este ciclo.");
 
-        ArduinoOTA.handle();
+        } else {
+    // Si aún no se reporta, solo imprime un aviso y espera al siguiente ciclo
+    if(DEBUG_MODE) Serial.println("[N0-Debug] Esperando reporte de arranque antes de procesar archivos SD.");
+    }
+    // ¡¡FIN DE LA SOLUCIÓN 1!!
 
+        ArduinoOTA.handle();
         if(DEBUG_MODE) Serial.printf("[N0-Debug] <<< Fin del bucle. Esperando %lu ms.\n", MESSENGER_CYCLE_DELAY_MS);
         vTaskDelay(pdMS_TO_TICKS(MESSENGER_CYCLE_DELAY_MS));
     }
@@ -509,11 +557,11 @@ void messengerTask(void * pvParameters) {
 // =========================================================================
 void setup() {
     Serial.begin(115200);
-    delay(1000); 
+    delay(1000);
     Serial.println("\n\n==================================================");
     Serial.println("== INICIANDO FIRMWARE LETE v11.0 (EmonLib) ==");
     Serial.println("==================================================");
-    bootTime = millis();
+    //bootTime = millis();
 
     // --- 1. INICIALIZAR HARDWARE BÁSICO ---
     Serial.print("Inicializando hardware básico...");
@@ -524,25 +572,58 @@ void setup() {
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Serial.println(" OK.");
 
-    // --- 2. INICIALIZAR TARJETA SD ---
-    Serial.print("Montando tarjeta SD...");
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("\nERROR CRÍTICO: Fallo al montar la tarjeta SD. El sistema se detendrá.");
-        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); pixels.show();
-        while (1) delay(1000);
-    }
-    Serial.println(" OK.");
-
-    if (SD.exists("/buffer.dat")) {
-        Serial.print("Limpiando archivo de buffer anterior...");
-        SD.remove("/buffer.dat");
-        Serial.println(" OK.");
-    }
-
     // --- 3. INICIALIZAR PANTALLA ---
+    // Se mueve aquí para mostrar el estado de carga desde el inicio
     Serial.print("Inicializando periféricos I2C (OLED)...");
     setupOLED();
     Serial.println(" OK.");
+    
+    // --- FASE 2: Implementar Pantalla de Arranque ---
+    drawBootScreen("Iniciando..."); // <--- NUEVA PANTALLA DE ARRANQUE
+    delay(500);
+
+    // --- 2. INICIALIZAR TARJETA SD ---
+    Serial.print("Montando tarjeta SD...");
+    drawBootScreen("Montando SD..."); // <--- NUEVA PANTALLA DE ARRANQUE
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("\nERROR CRÍTICO: Fallo al montar la tarjeta SD. El sistema se detendrá.");
+        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); pixels.show();
+        drawBootScreen("ERROR: SD"); // <--- NUEVA PANTALLA DE ARRANQUE
+        while (1) delay(1000);
+    }
+    Serial.println(" OK.");
+    
+    // --- FASE 1: PURGAR DATOS ANTIGUOS AL ARRANCAR ---
+    Serial.print("Purgando archivos de datos (.dat) de sesiones anteriores...");
+    drawBootScreen("Purgando datos..."); // <--- NUEVA PANTALLA DE ARRANQUE
+    
+    File root = SD.open("/");
+    if (root) {
+        File file = root.openNextFile();
+        while(file){
+            String filename = file.name();
+            // Borramos solo los archivos que nos interesan
+            if (filename.endsWith(".dat")) {
+                if(DEBUG_MODE) Serial.printf("\n[SETUP-Debug] Borrando archivo anterior: %s\n", filename.c_str());
+                String fullPath = "/" + filename;
+                SD.remove(fullPath);
+            }
+            file.close();
+            file = root.openNextFile();
+        }
+        root.close();
+        
+        // Asegurarse de que el buffer residual también se borre
+        if (SD.exists("/buffer.dat")) {
+            SD.remove("/buffer.dat");
+        }
+        
+    } else {
+        Serial.println("ERROR: No se pudo abrir el directorio raíz para purgar.");
+    }
+    Serial.println(" OK.");
+    
 
     // --- 6. INICIALIZAR MUTEX Y WATCHDOG ---
     Serial.print("Configurando sistema multitarea (Mutex y Watchdog)...");
@@ -562,45 +643,70 @@ void setup() {
     emon_neutral.current(CURRENT_NEUTRAL_PIN, current_cal_neutral);
     Serial.println(" OK.");
 
-    // --- 4. GESTIÓN DE WIFI CON WIFIMANAGER ---
+    
+
+    // --- 4. GESTIÓN DE WIFI CON WIFIMANAGER (LÓGICA CORREGIDA) ---
     Serial.println("Iniciando gestor de WiFi...");
+    drawBootScreen("Conectando WiFi...");
+
+    WiFi.mode(WIFI_STA); // Asegurarse de que estamos en modo estación
+    // Comprobar si hay credenciales guardadas
+    if (WiFi.SSID() == "") {
+    // CASO 1: NO HAY CREDENCIALES (PRIMER ARRANQUE)
+    // Iniciar portal de configuración
+    Serial.println("No hay credenciales WiFi. Se iniciará el portal de configuración.");
+    drawGenericMessage("Configuracion WiFi", "Conectate a la red: LETE-Monitor-Config");
+    pixels.setPixelColor(0, pixels.Color(255, 255, 0)); pixels.show();
     WiFiManager wm;
-    wm.setConnectTimeout(20);
-
-    if (WiFi.status() != WL_CONNECTED && WiFi.SSID() == "") {
-        drawGenericMessage("Configuracion WiFi", "Conectate a la red: LETE-Monitor-Config");
-        pixels.setPixelColor(0, pixels.Color(255, 255, 0)); pixels.show();
-        Serial.println("No hay credenciales WiFi. Se iniciará el portal de configuración.");
-    } else {
-        drawGenericMessage("Luz en tu Espacio", "Conectando...");
-        pixels.setPixelColor(0, pixels.Color(0, 0, 255)); pixels.show();
-        Serial.println("Intentando autoconexión a red guardada...");
+    wm.setConnectTimeout(300); // 5 minutos para configurar
+    if (!wm.autoConnect("LETE-Monitor-Config")) { // Aquí autoConnect es correcto
+    Serial.println("Fallo al conectar desde el portal o se agotó el tiempo. Reiniciando...");
+    delay(3000);
+    ESP.restart();
     }
-
-    if (!wm.autoConnect("LETE-Monitor-Config")) {
-        Serial.println("Fallo al conectar desde el portal o se agotó el tiempo. Reiniciando...");
-        delay(3000);
-        ESP.restart();
-    }
-    
-    Serial.println("\n--------------------------------------------------");
-    Serial.println("WiFi Conectado con Éxito!");
-    Serial.printf("  SSID: %s\n", WiFi.SSID().c_str());
-    Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
-    Serial.println("--------------------------------------------------");
-    
-    pixels.setPixelColor(0, pixels.Color(0, 255, 0)); pixels.show();
-    delay(1000);
+// Si llega aquí, autoConnect funcionó y estamos conectados.
+} else {
+// CASO 2: SÍ HAY CREDENCIALES
+// Dejar que el ESP32 se conecte automáticamente en segundo plano.
+// Las tareas writerTask y messengerTask ya tienen reintentos.
+Serial.println("Credenciales encontradas. Intentando autoconexión a red guardada...");
+pixels.setPixelColor(0, pixels.Color(0, 0, 255)); pixels.show();
+// No llamamos a WiFi.begin() explícitamente, el ESP lo hace solo.
+}
+// ESPERAR UN POCO a que se conecte (si tenía credenciales)
+int retries = 0;
+Serial.print("Esperando conexión (max 10s)...");
+while (WiFi.status() != WL_CONNECTED && retries < 20) { // Esperar max 10 segundos
+delay(500);
+Serial.print(".");
+retries++;
+}
+Serial.println();
+// Si después de la espera (o del portal) estamos conectados, lo mostramos.
+// Si no, no pasa nada, las tareas lo reintentarán.
+if (WiFi.status() == WL_CONNECTED) {
+Serial.println("\n--------------------------------------------------");
+Serial.println("WiFi Conectado con Éxito!");
+Serial.printf("  SSID: %s\n", WiFi.SSID().c_str());
+Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
+Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
+Serial.println("--------------------------------------------------");
+pixels.setPixelColor(0, pixels.Color(0, 255, 0)); pixels.show();
+} else {
+Serial.println("No se pudo conectar al WiFi. El dispositivo reintentará en segundo plano.");
+pixels.setPixelColor(0, pixels.Color(255, 165, 0)); // LED Naranja
+}
+delay(1000); // Pequeña pausa
 
     // <<<<<<< INICIO DE LA LÓGICA DE CALIBRACIÓN >>>>>>>
+    drawBootScreen("Cargando config..."); // <--- NUEVA PANTALLA DE ARRANQUE
     Serial.println("\n--- GESTIÓN DE CONFIGURACIÓN ---");
     // 1. Carga la última configuración válida guardada en la SD.
     Serial.print("Cargando calibración desde la SD...");
     loadCalibration(); 
     Serial.println(" OK.");
     if(DEBUG_MODE) Serial.printf("   Valores cargados de SD -> V_CAL: %.2f, P_CAL: %.2f\n", voltage_cal, phase_cal);
-
+    
     // 2. Contacta a Supabase para buscar nuevas calibraciones o comandos.
     bool newConfigDownloaded = handleRemoteTasks();
     
@@ -617,11 +723,19 @@ void setup() {
     // ¡CORRECCIÓN! Se aplica la calibración (de SD o Supabase) a EmonLib.
     applyCalibration();
 
+    // ¡¡SOLUCIÓN AQUÍ!!
+    // Avisar al Core 1 (writerTask) que la calibración está lista
+    // y que ya puede empezar a medir.
+    calibration_complete = true;
+    if(DEBUG_MODE) Serial.println("[SETUP] Bandera 'calibration_complete' activada.");
+
     Serial.println("--------------------------------");
     // <<<<<<< FIN DE LA LÓGICA DE CALIBRACIÓN >>>>>>>
 
     // --- 5. SERVIDOR WEB Y OTA ---
     Serial.print("Configurando OTA...");
+    drawBootScreen("Iniciando OTA..."); // <--- NUEVA PANTALLA DE ARRANQUE
+    
     //server.on("/", handleRoot);
     //server.on("/calibracion", handleCalibration);
     // ... (resto de tus server.on) ...
@@ -631,12 +745,23 @@ void setup() {
     ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.begin();
     Serial.println(" OK.");
-    
+
+    // --- 6. CONFIGURAR CLIENTE MQTT ---
+    Serial.print("Configurando cliente MQTT...");
+    // Usamos la variable dinámica (de Supabase) en lugar de una IP fija
+    client.setServer(currentServerUrl.c_str(), MQTT_PORT);
+    client.setKeepAlive(60);
+    Serial.println(" OK.");
+
     // --- 7. INICIAR TAREAS DE LOS NÚCLEOS ---
     Serial.print("Iniciando tareas en los núcleos 0 y 1...");
+    drawBootScreen("Iniciando tareas..."); // <--- NUEVA PANTALLA DE ARRANQUE
     xTaskCreatePinnedToCore(writerTask, "WriterTask", 10000, NULL, 2, &writerTaskHandle, 1);
     xTaskCreatePinnedToCore(messengerTask, "MessengerTask", 32768, NULL, 1, &messengerTaskHandle, 0);
     Serial.println(" OK.");
+    
+    drawBootScreen("¡Listo!"); // <--- NUEVA PANTALLA DE ARRANQUE
+    delay(1000); // Pequeña pausa para ver el mensaje final
 
     Serial.println("\n==================================================");
     Serial.println("== Setup completo. El control pasa a las tareas ==");
@@ -766,27 +891,21 @@ void checkForHttpUpdate() {
     
     // Callback simplificado (menos uso de RAM)
     httpUpdate.onProgress([](int progress, int total) {
-        static unsigned long lastPrint = 0;
         static int lastPercent = -1;
+
+        int percent = (progress * 100) / total;
         
-        if (millis() - lastPrint > 3000) { // Cada 3 segundos
-            int percent = (progress * 100) / total;
+        // Solo imprimir y actualizar pantalla si el porcentaje cambió
+        if (percent != lastPercent) {
+            if(DEBUG_MODE) Serial.printf("[N0-OTA] %d%%\n", percent);
             
-            // Solo imprimir si el porcentaje cambió
-            if (percent != lastPercent) {
-                if(DEBUG_MODE) Serial.printf("[N0-OTA] %d%%\n", percent);
-                
-                if (OLED_CONECTADA && percent % 20 == 0) { // Actualizar pantalla cada 20%
-                    char msg[20];
-                    snprintf(msg, sizeof(msg), "%d%%", percent);
-                    drawGenericMessage("Descargando", msg);
-                }
-                
-                lastPercent = percent;
+            // Usamos la nueva función del oled_screens.h
+            if (OLED_CONECTADA) {
+                drawUpdateScreen("Descargando...", percent);
             }
             
+            lastPercent = percent;
             esp_task_wdt_reset();
-            lastPrint = millis();
         }
     });
     
@@ -954,7 +1073,6 @@ void applyCalibration() {
 // =========================================================================
 
 void handleFactoryReset() {
- j
 
     if (DEBUG_MODE) Serial.println("\n[N0] !ADVERTENCIA! Petición web '/factory-reset' recibida. Se borrarán todos los datos.");
 
@@ -1024,8 +1142,11 @@ bool handleRemoteTasks() {
     
     String url = String(SUPABASE_URL) + "/functions/v1/device-tasks?deviceId=" + deviceId;
 
+    WiFiClientSecure clientSecure;
+    clientSecure.setInsecure();
+
     HTTPClient http;
-    http.begin(url);
+    http.begin(clientSecure, url);
     http.addHeader("apikey", String(SUPABASE_ANON_KEY));
     http.addHeader("Authorization", "Bearer " + String(SUPABASE_ANON_KEY));
     http.setTimeout(8000);

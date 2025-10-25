@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Mr. Frío</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div id="loading-view"><h2>Cargando tus datos...</h2></div>
+            
+            <div id="dashboard-view" style="display: none;">
+                <h1>Tu Panel de Control</h1>
+                <div id="perfil-info"></div>
+                
+                <h2>Mis Dispositivos</h2>
+                <div id="dispositivos-lista">
+                    </div>
+
+                <div id="empty-state">
+                    <p>No tienes ningún dispositivo activo en este momento.</p>
+                    <p>¿Acabas de comprar uno nuevo?</p>
+                    <button onclick="window.location.href='/registro.html'">Activar Nuevo Dispositivo</button> </div>
+                
+            </div>
+        </div>
+    </div>
+    
+    <template id="dispositivo-template">
+        <div class="dispositivo-card">
+            <h3 class="nombre-plan"></h3>
+            <p><strong>ID del Dispositivo:</strong> <span class="device-id"></span></p>
+            <p><strong>Estado:</strong> <span class="estado"></span></p>
+            <p><strong>Precio:</strong> $<span class="precio"></span> MXN/mes</p>
+            <button class="btn-cancelar">Cancelar Suscripción</button>
+        </div>
+    </template>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', async () => {
+        const loadingView = document.getElementById('loading-view');
+        const dashboardView = document.getElementById('dashboard-view');
+        const perfilInfo = document.getElementById('perfil-info');
+        const dispositivosLista = document.getElementById('dispositivos-lista');
+        const dispositivoTemplate = document.getElementById('dispositivo-template');
+        const emptyState = document.getElementById('empty-state'); // Referencia al estado vacío
+
+        let authToken = null;
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key.includes('-auth-token')) {
+                authToken = JSON.parse(localStorage.getItem(key)).access_token;
+                break;
+            }
+        }
+        if (!authToken) { window.location.href = '/mi-cuenta.html'; return; }
+
+        try {
+            const response = await fetch('/api/mi-cuenta', { headers: { 'Authorization': `Bearer ${authToken}` }});
+            if (!response.ok) { localStorage.clear(); window.location.href = '/mi-cuenta.html'; return; }
+            
+            const data = await response.json();
+            perfilInfo.innerHTML = `<p><strong>Hola, ${data.perfil.nombre || 'Usuario'}</strong> (${data.perfil.email})</p>`;
+            dispositivosLista.innerHTML = ''; 
+
+            // --- ¡MEJORA! Manejo del Estado Vacío ---
+            if (!data.dispositivos || data.dispositivos.length === 0) {
+                emptyState.style.display = 'block'; // Mostrar mensaje
+            } else {
+                emptyState.style.display = 'none'; // Ocultar mensaje
+                data.dispositivos.forEach(disp => {
+                    const card = dispositivoTemplate.content.cloneNode(true);
+                    // ... (llenar datos de la tarjeta como antes) ...
+                     card.querySelector('.nombre-plan').textContent = disp.planes_lete.nombre_plan;
+                     card.querySelector('.device-id').textContent = disp.device_id;
+                     card.querySelector('.estado').textContent = disp.estado.toUpperCase();
+                     card.querySelector('.estado').className = `estado estado-${disp.estado}`;
+                     card.querySelector('.precio').textContent = disp.planes_lete.precio;
+                
+                     const btnCancelar = card.querySelector('.btn-cancelar');
+                     if (disp.estado !== 'active' && disp.estado !== 'paused') { // Permitir cancelar si está activo o pausado
+                         btnCancelar.style.display = 'none'; 
+                     } else {
+                         btnCancelar.addEventListener('click', async () => {
+                             if (confirm(`¿Cancelar suscripción del dispositivo ${disp.device_id}?`)) {
+                                 // Lógica para llamar a /api/cancelar-suscripcion
+                                 try {
+                                     const cancelResponse = await fetch('/api/cancelar-suscripcion', {
+                                         method: 'POST',
+                                         headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json'},
+                                         body: JSON.stringify({ device_id: disp.device_id })
+                                     });
+                                     const cancelData = await cancelResponse.json();
+                                     if (!cancelResponse.ok) throw new Error(cancelData.error);
+                                     alert('Suscripción cancelada. La página se recargará.');
+                                     window.location.reload(); // Recargar para ver el cambio
+                                 } catch (cancelError) {
+                                     alert(`Error al cancelar: ${cancelError.message}`);
+                                 }
+                             }
+                         });
+                     }
+                     dispositivosLista.appendChild(card);
+                });
+            }
+            // --- Fin Mejora ---
+            
+            loadingView.style.display = 'none';
+            dashboardView.style.display = 'block';
+
+        } catch (error) {
+            console.error('Error cargando dashboard:', error);
+            loadingView.innerHTML = '<h2>Error al cargar datos. <a href="/mi-cuenta.html">Intenta iniciar sesión</a>.</h2>';
+        }
+    });
+    </script>
+</body>
+</html>

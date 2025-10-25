@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registro de Dispositivo - Mr. Frío</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div id="verificando-view"><h2>Verificando Dispositivo...</h2><p>Por favor, espera.</p></div>
+            <div id="error-view" class="mensaje mensaje-error" style="display: none;"></div>
+            
+            <div id="registro-view" style="display: none;">
+                <h1>Activa tu Dispositivo</h1>
+                <div id="resumen-plan"></div>
+
+                <form id="form-registro" novalidate> <label for="nombre">Nombre Completo</label>
+                    <input type="text" id="nombre" name="nombre" required>
+
+                    <label for="email">Correo Electrónico</label>
+                    <input type="email" id="email" name="email" required>
+                    <span id="email-error" class="error-mensaje"></span>
+
+                    <label for="telefono">Teléfono WhatsApp (10 dígitos)</label>
+                    <input type="tel" id="telefono" name="telefono" required pattern="\d{10}" title="Ingresa 10 dígitos numéricos">
+                    <span id="telefono-error" class="error-mensaje"></span>
+
+                    <label for="tipo_tarifa">
+                        Tipo de Tarifa CFE
+                        <span class="help-icon" onclick="abrirModal(event, 'modal-tarifa')">?</span>
+                    </label>
+                    <select id="tipo_tarifa" name="tipo_tarifa" required>
+                        <option value="01">Tarifa 01</option>
+                        <option value="01A">Tarifa 01A</option>
+                        <option value="01B">Tarifa 01B</option>
+                        <option value="PDBT">Tarifa PDBT</option>
+                        <option value="DAC">Tarifa DAC</option>
+                    </select>
+
+                    <label for="fecha_corte">
+                        Última Fecha de Corte
+                    <span class="help-icon" onclick="abrirModal(event, 'modal-fecha-corte')">?</span>
+                    </label>
+                    <input type="date" id="fecha_corte" name="fecha_corte" required>
+
+                    <label for="lectura_medidor_inicial">Lectura Actual Medidor (Opcional)</label>
+                    <input type="number" step="any" id="lectura_medidor_inicial" name="lectura_medidor_inicial" placeholder="Solo para afinar cálculos iniciales">
+
+                    <label for="consumo_recibo_anterior">
+                        Consumo Último Recibo (kWh) (Opcional)
+                        <span class="help-icon" onclick="abrirModal(event, 'modal-consumo')">?</span>
+                    </label>
+                    <input type="number" step="any" id="consumo_recibo_anterior" name="consumo_recibo_anterior" placeholder="Solo para afinar cálculos iniciales">
+
+
+                    <div class="cf-turnstile" data-sitekey="0x4AAAAAAB7ToeH9BA4BywJO"></div>
+                    
+                    <button type="submit" id="btn-submit">Activar (1 Mes Gratis)</button>
+                </form>
+                <div id="mensaje-registro" class="mensaje"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal-tarifa" class="modal-overlay" onclick="cerrarModal('modal-tarifa')">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <span class="modal-close" onclick="cerrarModal('modal-tarifa')">&times;</span>
+            <h2>¿Dónde encontrar tu Tarifa CFE?</h2>
+            <p>Busca esta sección en tu recibo:</p>
+            <img src="recibo-tarifa.png" alt="Recibo CFE mostrando la tarifa"> </div>
+    </div>
+    <div id="modal-consumo" class="modal-overlay" onclick="cerrarModal('modal-consumo')">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <span class="modal-close" onclick="cerrarModal('modal-consumo')">&times;</span>
+            <h2>¿Dónde encontrar tu Consumo Anterior (kWh)?</h2>
+            <p>Busca esta sección en tu recibo:</p>
+            <img src="recibo-consumo.png" alt="Recibo CFE mostrando el consumo en kWh"> </div>
+    </div>
+    <div id="modal-fecha-corte" class="modal-overlay" onclick="cerrarModal('modal-fecha-corte')">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <span class="modal-close" onclick="cerrarModal('modal-fecha-corte')">&times;</span>
+        <h2>¿Dónde encontrar tu última Fecha de Corte?</h2>
+        <p>Busca esta sección en tu recibo de CFE. Es la última fecha de "Periodo facturado".</p>
+        
+        <img src="recibo-fecha-corte.png" alt="Recibo CFE mostrando la fecha de corte"> 
+    </div>
+</div>
+
+
+    <script>
+    // --- Referencias a elementos ---
+    const verificandoView = document.getElementById('verificando-view');
+    const errorView = document.getElementById('error-view');
+    const registroView = document.getElementById('registro-view');
+    const resumenPlan = document.getElementById('resumen-plan');
+    const formRegistro = document.getElementById('form-registro');
+    const mensajeRegistro = document.getElementById('mensaje-registro');
+    const btnSubmit = document.getElementById('btn-submit');
+    const emailInput = document.getElementById('email');
+    const telefonoInput = document.getElementById('telefono');
+    const emailError = document.getElementById('email-error');
+    const telefonoError = document.getElementById('telefono-error');
+    let deviceId = ''; // Guardaremos el ID del dispositivo aquí
+
+    // --- Funciones de Validación Inline ---
+    function validarEmail() {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(emailInput.value)) {
+            emailInput.classList.add('invalido');
+            emailError.textContent = 'Introduce un correo válido (ej. tu@correo.com)';
+            emailError.style.display = 'block';
+            return false;
+        } else {
+            emailInput.classList.remove('invalido');
+            emailError.style.display = 'none';
+            return true;
+        }
+    }
+
+    function validarTelefono() {
+        const telRegex = /^\d{10}$/;
+        if (!telRegex.test(telefonoInput.value)) {
+            telefonoInput.classList.add('invalido');
+            telefonoError.textContent = 'Introduce exactamente 10 dígitos numéricos.';
+            telefonoError.style.display = 'block';
+            return false;
+        } else {
+            telefonoInput.classList.remove('invalido');
+            telefonoError.style.display = 'none';
+            return true;
+        }
+    }
+    
+    // Validar al perder el foco
+    emailInput.addEventListener('blur', validarEmail);
+    telefonoInput.addEventListener('blur', validarTelefono);
+
+    // Validar al escribir (para quitar el error si corrigen)
+    emailInput.addEventListener('input', () => { if (emailInput.classList.contains('invalido')) validarEmail(); });
+    telefonoInput.addEventListener('input', () => { if (telefonoInput.classList.contains('invalido')) validarTelefono(); });
+
+    // --- Funciones para Modales ---
+    // --- FUNCIÓN NUEVA ---
+function abrirModal(event, idModal) {
+    if (event) {
+        event.stopPropagation(); // ¡Detiene el clic para que no active el label!
+    }
+    document.getElementById(idModal).style.display = 'flex';
+}
+    function cerrarModal(idModal) {
+        document.getElementById(idModal).style.display = 'none';
+    }
+
+    // --- Lógica Principal (al cargar la página) ---
+    document.addEventListener('DOMContentLoaded', async () => {
+        const params = new URLSearchParams(window.location.search);
+        deviceId = params.get('dispositivo');
+
+        if (!deviceId) {
+            verificandoView.style.display = 'none';
+            errorView.textContent = 'Error: Código QR inválido. No se encontró ID.';
+            errorView.style.display = 'block';
+            return;
+        }
+
+        try {
+            const response = await fetch(`/api/verificar-dispositivo?device_id=${deviceId}`);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Error al verificar.');
+
+            resumenPlan.innerHTML = `<p>Activando <strong>${data.planes_lete.nombre_plan}</strong>.<br>Precio post-prueba: <strong>$${data.planes_lete.precio} MXN/mes</strong>.</p>`;
+            verificandoView.style.display = 'none';
+            registroView.style.display = 'block';
+        } catch (error) {
+            verificandoView.style.display = 'none';
+            errorView.textContent = `Error: ${error.message}`;
+            errorView.style.display = 'block';
+        }
+    });
+
+    // --- Manejar el Envío del Formulario ---
+    formRegistro.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        // Ejecutar validaciones antes de enviar
+        const esEmailValido = validarEmail();
+        const esTelefonoValido = validarTelefono();
+        // Validar que todos los campos requeridos estén llenos (HTML5 lo hace, pero reforzamos)
+        const otrosCamposValidos = [...formRegistro.querySelectorAll('[required]')].every(el => el.value.trim() !== '');
+
+        if (!esEmailValido || !esTelefonoValido || !otrosCamposValidos) {
+            mensajeRegistro.textContent = 'Por favor, corrige los campos marcados en rojo.';
+            mensajeRegistro.className = 'mensaje mensaje-error';
+            mensajeRegistro.style.display = 'block';
+            return; // Detener envío
+        }
+
+        // Estado de carga visual
+        btnSubmit.disabled = true;
+        btnSubmit.innerHTML = 'Procesando... <span class="spinner"></span>'; // Añadir spinner
+        mensajeRegistro.style.display = 'none';
+
+        const formData = new FormData(formRegistro);
+        const clienteData = Object.fromEntries(formData.entries());
+        // --- NUEVO CÁLCULO DE FECHA ---
+const fechaCorteInput = clienteData.fecha_corte; // Ej: "2025-05-22"
+if (fechaCorteInput) {
+    // Le agregamos la hora para evitar problemas de zona horaria
+    const fecha = new Date(fechaCorteInput + 'T00:00:00'); 
+
+    // Obtenemos el día del mes (1-31)
+    clienteData.dia_de_corte = fecha.getDate(); 
+
+    // Obtenemos el mes (0=Ene, 1=Feb...). Le sumamos 1 para que sea 1-12.
+    const mes = fecha.getMonth() + 1; 
+
+    // Si el mes es par (Feb, Abr, etc.), el ciclo es "par"
+    clienteData.ciclo_bimestral = (mes % 2 === 0) ? 'par' : 'impar';
+}
+// Ya no necesitamos enviar la fecha completa al backend
+delete clienteData.fecha_corte; 
+// --- FIN DEL NUEVO CÁLCULO ---
+
+        clienteData.device_id = deviceId;
+
+        try {
+            const response = await fetch('/api/registrar-cliente', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(clienteData)
+            });
+            const data = await response.json();
+
+            if (!response.ok) {
+                // El backend ya debería devolver un error amigable
+                throw new Error(data.error || 'No se pudo completar el registro.');
+            }
+            
+            window.location.href = data.checkout_url;
+
+        } catch (error) {
+            mensajeRegistro.textContent = `Error: ${error.message}`;
+            mensajeRegistro.className = 'mensaje mensaje-error';
+            mensajeRegistro.style.display = 'block';
+            btnSubmit.disabled = false;
+            btnSubmit.innerHTML = 'Activar (1 Mes Gratis)'; // Restaurar botón
+            // Resetear Turnstile si falla
+            try { turnstile.reset(); } catch (e) {}
+        }
+    });
+    </script>
+</body>
+</html>

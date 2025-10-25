@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>¡Bienvenido! - Mr. Frío</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1 style="color: var(--color-exito);">✅ ¡Felicidades!</h1>
+            <h2>Tu dispositivo ha sido activado.</h2>
+            <p style="text-align: center;">Tu primer mes de servicio es completamente gratis. El primer cobro se realizará automáticamente al finalizar el periodo de prueba.</p>
+            <p id="mensaje-email" style="text-align: center;">Hemos enviado un enlace de acceso a tu correo. Si no lo ves, revisa tu carpeta de spam.</p>
+            <button onclick="window.location.href='/mi-cuenta.html'">Ir a Mi Cuenta</button>
+        </div>
+    </div>
+    <script>
+        // Intentar obtener el email de la URL (si el backend lo añade)
+        const params = new URLSearchParams(window.location.search);
+        const email = params.get('email'); // Buscamos un parámetro ?email=...
+        if (email) {
+            document.getElementById('mensaje-email').innerHTML = `Hemos enviado un enlace de acceso a <strong>${email}</strong>. Si no lo ves, revisa tu carpeta de spam.`;
+        }
+    </script>
+</body>
+</html>

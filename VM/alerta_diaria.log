@@ -1,0 +1,89 @@
+Traceback (most recent call last):
+  File "/home/galj_octavio/alerta_diaria.py", line 9, in <module>
+    import psycopg2
+ModuleNotFoundError: No module named 'psycopg2'
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+✅ Se encontraron 4 clientes en la base de datos.
+Ejecutando a las 2025-10-17 07:00:03 CST
+
+--- Procesando cliente: Juan Gallardo (30C6F7261434) ---
+
+Enviando WhatsApp (Plantilla HX4ca5614eaba3486fbbdd14d463b8ee5a) a: +5213310043159...
+✔️ Alerta enviada exitosamente.
+
+--- Procesando cliente: Miriam Montero (prueba1) ---
+INFO: No se encontraron datos de consumo de ayer para Miriam Montero. No se enviará reporte.
+
+--- Procesando cliente: Miriam Montero (prueba) ---
+INFO: No se encontraron datos de consumo de ayer para Miriam Montero. No se enviará reporte.
+
+--- Procesando cliente: LUIS FRANCISCO (prueba 3) ---
+INFO: No se encontraron datos de consumo de ayer para LUIS FRANCISCO. No se enviará reporte.
+
+--- Script de Reporte Diario v3.6 completado. ---
+==================================================
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+✅ Se encontraron 2 clientes en la base de datos.
+Ejecutando a las 2025-10-18 07:00:07 CST
+
+--- Procesando cliente: Juan Gallardo (30C6F7261434) ---
+INFO: No se encontraron datos de consumo de ayer para Juan Gallardo. No se enviará reporte.
+
+--- Procesando cliente: Juan Octavio (30C6F7261434) ---
+INFO: No se encontraron datos de consumo de ayer para Juan Octavio. No se enviará reporte.
+
+--- Script de Reporte Diario v3.6 completado. ---
+==================================================
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+✅ Se encontraron 2 clientes en la base de datos.
+Ejecutando a las 2025-10-19 07:00:03 CST
+
+--- Procesando cliente: Juan Gallardo (30C6F7261434) ---
+INFO: No se encontraron datos de consumo de ayer para Juan Gallardo. No se enviará reporte.
+
+--- Procesando cliente: Miriam Montero  (None) ---
+⚠️ No se pudo determinar el periodo de corte para Miriam Montero . Omitiendo.
+
+--- Script de Reporte Diario v3.6 completado. ---
+==================================================
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+✅ Se encontraron 1 clientes en la base de datos.
+Ejecutando a las 2025-10-20 07:00:03 CST
+
+--- Procesando cliente: Juan Octavio (None) ---
+INFO: No se encontraron datos de consumo de ayer para Juan Octavio. No se enviará reporte.
+
+--- Script de Reporte Diario v3.6 completado. ---
+==================================================
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+❌ ERROR al conectar con la base de datos de clientes: column "device_id" does not exist
+LINE 2:             SELECT device_id, telefono_whatsapp, kwh_promedi...
+                           ^
+
+No hay clientes para procesar. Terminando script.
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+❌ ERROR al conectar con la base de datos de clientes: column "device_id" does not exist
+LINE 2:             SELECT device_id, telefono_whatsapp, kwh_promedi...
+                           ^
+
+No hay clientes para procesar. Terminando script.
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+❌ ERROR al conectar con la base de datos de clientes: column "device_id" does not exist
+LINE 2:             SELECT device_id, telefono_whatsapp, kwh_promedi...
+                           ^
+
+No hay clientes para procesar. Terminando script.
+==================================================
+--- Iniciando Script de Reporte Diario v3.6 ---
+❌ ERROR al conectar con la base de datos de clientes: column "device_id" does not exist
+LINE 2:             SELECT device_id, telefono_whatsapp, kwh_promedi...
+                           ^
+
+No hay clientes para procesar. Terminando script.
