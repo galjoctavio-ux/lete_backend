@@ -17,7 +17,8 @@
                 <h1>Activa tu Dispositivo</h1>
                 <div id="resumen-plan"></div>
 
-                <form id="form-registro" novalidate> <label for="nombre">Nombre Completo</label>
+                <form id="form-registro" novalidate>
+                    <label for="nombre">Nombre Completo</label>
                     <input type="text" id="nombre" name="nombre" required>
 
                     <label for="email">Correo Electrónico</label>
@@ -46,16 +47,20 @@
                     </label>
                     <input type="date" id="fecha_corte" name="fecha_corte" required>
 
-                    <label for="lectura_medidor_inicial">Lectura Actual Medidor (Opcional)</label>
-                    <input type="number" step="any" id="lectura_medidor_inicial" name="lectura_medidor_inicial" placeholder="Solo para afinar cálculos iniciales">
+                    <label for="lectura_medidor_inicial">Lectura Actual del Medidor (kWh)</label>
+                    <input type="number" step="any" id="lectura_medidor_inicial" name="lectura_medidor_inicial" required>
 
                     <label for="consumo_recibo_anterior">
-                        Consumo Último Recibo (kWh) (Opcional)
+                        Consumo Último Recibo (kWh)
                         <span class="help-icon" onclick="abrirModal(event, 'modal-consumo')">?</span>
                     </label>
-                    <input type="number" step="any" id="consumo_recibo_anterior" name="consumo_recibo_anterior" placeholder="Solo para afinar cálculos iniciales">
+                    <input type="number" step="any" id="consumo_recibo_anterior" name="consumo_recibo_anterior" required>
 
-
+                    <label for="lectura_cierre_periodo_anterior">
+                        Lectura Cierre Periodo Anterior (kWh)
+                        <span class="help-icon" onclick="abrirModal(event, 'modal-lectura-cierre')">?</span>
+                    </label>
+                    <input type="number" step="any" id="lectura_cierre_periodo_anterior" name="lectura_cierre_periodo_anterior" required>
                     <div class="cf-turnstile" data-sitekey="0x4AAAAAAB7ToeH9BA4BywJO"></div>
                     
                     <button type="submit" id="btn-submit">Activar (1 Mes Gratis)</button>
@@ -89,8 +94,15 @@
     </div>
 </div>
 
-
-    <script>
+<div id="modal-lectura-cierre" class="modal-overlay" onclick="cerrarModal('modal-lectura-cierre')">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <span class="modal-close" onclick="cerrarModal('modal-lectura-cierre')">&times;</span>
+        <h2>¿Dónde encontrar la Lectura de Cierre?</h2>
+        <p>En tu recibo de CFE, busca el valor de "Lectura Actual". Es la lectura con la que CFE cerró tu último periodo.</p>
+        <img src="recibo-lectura-cierre.png" alt="Recibo CFE mostrando la Lectura Anterior">
+        </div>
+</div>
+<script>
     // --- Referencias a elementos ---
     const verificandoView = document.getElementById('verificando-view');
     const errorView = document.getElementById('error-view');

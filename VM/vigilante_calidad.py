@@ -4,6 +4,7 @@
 # - Utiliza una columna JSONB en la BD para almacenar estadísticas.
 # - Agrupa el día en 5 bloques de comportamiento para mayor precisión.
 # - Requiere 2 "strikes" consecutivos para enviar una alerta de anomalía.
+# - MODIFICADO: Incluye chequeo de primera medición para enviar felicitación.
 # -------------------------------------------------------------------
 
 # --- 1. Importaciones ---
@@ -19,6 +20,7 @@ import pytz
 from tenacity import retry, stop_after_attempt, wait_exponential
 import calendar
 import math
+from influxdb_client import InfluxDBClient
 
 # --- 2. Carga de Variables de Entorno ---
 load_dotenv()
@@ -36,6 +38,10 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_URL = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
 ADMIN_WHATSAPP_NUMBER = os.environ.get("ADMIN_WHATSAPP_NUMBER")
+INFLUX_URL = os.environ.get("INFLUX_URL")
+INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN")
+INFLUX_ORG = os.environ.get("INFLUX_ORG")
+INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET_NEW")
 
 TPL_PICOS_VOLTAJE = os.environ.get("TPL_PICOS_VOLTAJE")
 TPL_BAJO_VOLTAJE = os.environ.get("TPL_BAJO_VOLTAJE")
@@ -43,6 +49,10 @@ TPL_FUGA_CORRIENTE = os.environ.get("TPL_FUGA_CORRIENTE")
 TPL_BRINCO_ESCALON = os.environ.get("TPL_BRINCO_ESCALON")
 TPL_CONSUMO_FANTASMA = os.environ.get("TPL_CONSUMO_FANTASMA")
 TPL_DISPOSITIVO_OFFLINE = os.environ.get("TPL_DISPOSITIVO_OFFLINE")
+
+# --- ¡NUEVA VARIABLE REQUERIDA! ---
+# Añade esta variable a tu archivo .env con el SID de la plantilla de Twilio
+TPL_FELICITACION_CONEXION = os.environ.get("TPL_FELICITACION_CONEXION")
 
 # Lógica de Negocio y Reglas
 ZONA_HORARIA_LOCAL = pytz.timezone('America/Mexico_City')
@@ -64,18 +74,27 @@ TARIFAS_CFE_UMBRALES = {
 # --- 4. Funciones ---
 
 def obtener_clientes(conn):
-    """Obtiene una lista de clientes, incluyendo la nueva columna de estadísticas."""
+    """Obtiene una lista de clientes, incluyendo estadísticas y datos del dispositivo."""
     try:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
         cursor.execute("""
-            SELECT device_id, telefono_whatsapp, nombre, dia_de_corte, tipo_tarifa, ciclo_bimestral,
-                   notificacion_escalon1_enviada, notificacion_escalon2_enviada,
-                   estadisticas_consumo
-            FROM clientes
+            SELECT 
+                d.device_id, 
+                c.telefono_whatsapp, c.nombre, c.dia_de_corte, c.tipo_tarifa, c.ciclo_bimestral,
+                c.notificacion_escalon1_enviada, c.notificacion_escalon2_enviada,
+                c.estadisticas_consumo,
+                c.lectura_medidor_inicial,  
+                c.fecha_inicio_servicio,    
+                c.lectura_cierre_periodo_anterior,
+                c.primera_medicion_recibida       -- <-- ¡NUEVO CAMPO!
+            FROM clientes c
+            JOIN dispositivos_lete d ON c.id = d.cliente_id
+            WHERE c.subscription_status = 'active'
         """)
         lista_clientes = cursor.fetchall()
         cursor.close()
-        print(f"✅ Se encontraron {len(lista_clientes)} clientes en la base de datos.")
+        print(f"✅ Se encontraron {len(lista_clientes)} clientes activos en la base de datos.")
         return lista_clientes
     except Exception as e:
         print(f"❌ ERROR al obtener clientes: {e}")
@@ -118,7 +137,13 @@ def marcar_notificacion_enviada(conn, device_id, tipo_bandera):
     print(f"Actualizando bandera '{tipo_bandera}' para {device_id}...")
     try:
         cursor = conn.cursor()
-        sql = f"UPDATE clientes SET {tipo_bandera} = true WHERE device_id = %s"
+        # --- ¡CONSULTA MODIFICADA CON UPDATE...FROM...WHERE! ---
+        sql = f"""
+            UPDATE clientes c
+            SET {tipo_bandera} = true
+            FROM dispositivos_lete d
+            WHERE c.id = d.cliente_id AND d.device_id = %s
+        """
         cursor.execute(sql, (device_id,))
         conn.commit()
         cursor.close()
@@ -130,7 +155,13 @@ def actualizar_estadisticas(conn, device_id, estadisticas_actuales):
     print(f"Actualizando estadísticas para {device_id}...")
     try:
         cursor = conn.cursor()
-        sql = "UPDATE clientes SET estadisticas_consumo = %s WHERE device_id = %s"
+        # --- ¡CONSULTA MODIFICADA CON UPDATE...FROM...WHERE! ---
+        sql = """
+            UPDATE clientes c
+            SET estadisticas_consumo = %s
+            FROM dispositivos_lete d
+            WHERE c.id = d.cliente_id AND d.device_id = %s
+        """
         cursor.execute(sql, (json.dumps(estadisticas_actuales), device_id))
         conn.commit()
         cursor.close()
@@ -165,53 +196,121 @@ def calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral):
             except ValueError: continue
     return max(candidatos_pasados) if candidatos_pasados else None
 
-def obtener_consumo_desde_servidor_local(device_id, fecha_inicio_aware, fecha_fin_aware):
-    """Lee el archivo CSV local, filtra los datos y calcula el consumo en kWh."""
-    archivo_csv = 'mediciones.csv'
+def obtener_consumo_desde_influxdb(device_id, fecha_inicio_aware, fecha_fin_aware):
+    """
+    Obtiene el consumo total de un dispositivo (en kWh) desde InfluxDB 
+    para un rango de tiempo específico.
+    """
+    start_time = fecha_inicio_aware.isoformat()
+    stop_time = fecha_fin_aware.isoformat()
+
+    flux_query = f"""
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: {start_time}, stop: {stop_time})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
+      |> integral(unit: 1s)
+      |> map(fn: (r) => ({{ _value: r._value / 3600000.0 }}))
+      |> sum()
+    """
     try:
-        df = pd.read_csv(archivo_csv)
-        if df.empty: return None, None
-        if 'timestamp_servidor' not in df.columns: return None, None
-        df['timestamp_servidor'] = pd.to_datetime(df['timestamp_servidor'])
-        if df['timestamp_servidor'].dt.tz is None:
-            df['timestamp_servidor'] = df['timestamp_servidor'].dt.tz_localize(ZONA_HORARIA_LOCAL, ambiguous='infer')
-        else:
-            df['timestamp_servidor'] = df['timestamp_servidor'].dt.tz_convert(ZONA_HORARIA_LOCAL)
-        df_filtrado = df[(df['device_id'] == device_id) & (df['timestamp_servidor'] >= fecha_inicio_aware) & (df['timestamp_servidor'] < fecha_fin_aware)]
-        if df_filtrado.empty: return None, None
-        df_calculo = df_filtrado.set_index('timestamp_servidor').sort_index()
-        potencia_media_W = df_calculo['power'].resample('1min').mean()
-        potencia_interpolada = potencia_media_W.interpolate(method='linear', limit=60)
-        kwh_intervalo = (potencia_interpolada / 1000) * (1 / 60.0)
-        kwh_intervalo = kwh_intervalo.fillna(0)
-        total_kwh = kwh_intervalo.sum()
-        return total_kwh, None
-    except Exception: return None, None
+        with InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=10_000) as client:
+            query_api = client.query_api()
+            tables = query_api.query(query=flux_query)
+            if tables and tables[0].records:
+                total_kwh = tables[0].records[0].get_value()
+                return total_kwh, None
+            else:
+                return None, None
+    except Exception as e:
+        print(f"❌ ERROR al consultar InfluxDB (kwh) para {device_id}: {e}")
+        return None, None
 
-def obtener_datos_locales(device_id, minutos_atras):
-    """Obtiene un DataFrame de Pandas con los datos de un dispositivo de los últimos X minutos."""
-    archivo_csv = 'mediciones.csv'
+def obtener_datos_influx_dataframe(device_id, minutos_atras):
+    """Obtiene un DataFrame de Pandas con los datos de InfluxDB de los últimos X minutos."""
+
+    ahora = datetime.now(ZONA_HORARIA_LOCAL)
+    tiempo_limite = ahora - timedelta(minutes=minutos_atras)
+    start_time = tiempo_limite.isoformat()
+
+    flux_query = f"""
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: {start_time})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r.device_id == "{device_id}")
+      |> filter(fn: (r) => r._field == "vrms" or r._field == "leakage" or r._field == "power")
+      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> keep(columns: ["_time", "vrms", "leakage", "power"])
+    """
+
     try:
-        df = pd.read_csv(archivo_csv, parse_dates=['timestamp_servidor'])
-        if df.empty: return None
+        with InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=10_000) as client:
+            df = client.query_api().query_data_frame(query=flux_query)
 
-        ahora = datetime.now(ZONA_HORARIA_LOCAL)
-        tiempo_limite = ahora - timedelta(minutes=minutos_atras)
-        
-        if df['timestamp_servidor'].dt.tz is None:
-            df['timestamp_servidor'] = df['timestamp_servidor'].dt.tz_localize(ZONA_HORARIA_LOCAL, ambiguous='infer')
-        else:
+            if df.empty:
+                return None
+
+            df = df.rename(columns={"_time": "timestamp_servidor"})
             df['timestamp_servidor'] = df['timestamp_servidor'].dt.tz_convert(ZONA_HORARIA_LOCAL)
+            return df
 
-        df_filtrado = df[(df['device_id'] == device_id) & (df['timestamp_servidor'] >= tiempo_limite)].copy()
-        
-        return df_filtrado if not df_filtrado.empty else None
-    except FileNotFoundError: return None
-    except Exception: return None
+    except Exception as e:
+        print(f"❌ ERROR al consultar InfluxDB (DataFrame) para {device_id}: {e}")
+        return None
 
 # --- Funciones de Verificación de Alertas ---
 
+# --- ¡NUEVA FUNCIÓN! ---
+def verificar_primera_medicion(conn, cliente):
+    """Verifica si es la primera medición y envía felicitación."""
+    if cliente['primera_medicion_recibida']:
+        return False # Ya se procesó, no hacer nada.
+    
+    print(f"-> {cliente['nombre']}: Verificando primera medición...")
+    
+    # Consultamos InfluxDB. Si hay CUALQUIER dato reciente, es la primera vez.
+    # Usamos 60 minutos para coincidir con la frecuencia del script
+    df_check = obtener_datos_influx_dataframe(cliente['device_id'], 60) 
+    
+    if df_check is not None and not df_check.empty:
+        print(f"🎉 ¡PRIMERA MEDICIÓN RECIBIDA para {cliente['nombre']}!")
+        
+        # 1. Enviar felicitación
+        if not TPL_FELICITACION_CONEXION:
+            print("⚠️ ⚠️  ADVERTENCIA: TPL_FELICITACION_CONEXION no está configurado en .env. No se puede enviar felicitación.")
+        else:
+            variables = {"1": cliente['nombre']}
+            enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_FELICITACION_CONEXION, variables)
+        
+        # 2. Actualizar la bandera en la BD
+        try:
+            cursor = conn.cursor()
+            sql = """
+                UPDATE clientes c
+                SET primera_medicion_recibida = true
+                FROM dispositivos_lete d
+                WHERE c.id = d.cliente_id AND d.device_id = %s
+            """
+            cursor.execute(sql, (cliente['device_id'],))
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"❌ ERROR al actualizar 'primera_medicion_recibida' para {cliente['device_id']}: {e}")
+        
+        return True # Sí, fue la primera medición.
+    else:
+        print(f" -> {cliente['nombre']}: Aún sin mediciones.")
+        return False
+
+# --- ¡FUNCIÓN MODIFICADA! ---
 def verificar_dispositivo_offline(df, cliente):
+    # --- ¡NUEVA GUARDIA! ---
+    if not cliente['primera_medicion_recibida']:
+        print("-> Dispositivo aún no reporta su primera medición. Omitiendo chequeo offline.")
+        return
+    # --- FIN DE GUARDIA ---
+
     print("-> Verificando estado de conexión...")
     if df is None:
         enviar_alerta_whatsapp(ADMIN_WHATSAPP_NUMBER, TPL_DISPOSITIVO_OFFLINE, {"1": cliente['nombre']})
@@ -271,7 +370,7 @@ def verificar_anomalia_consumo(conn, df, cliente):
     
     es_anomalia = False
     if stats_bloque['n_muestras'] < PERIODO_APRENDIZAJE_MUESTRAS:
-        print(f"   -> En periodo de aprendizaje para '{bloque_actual}' ({stats_bloque['n_muestras'] + 1} muestras).")
+        print(f"    -> En periodo de aprendizaje para '{bloque_actual}' ({stats_bloque['n_muestras'] + 1} muestras).")
         α = 0.2
         if consumo_actual > (media * 3): # Alerta solo para anomalías extremas
             es_anomalia = True
@@ -282,7 +381,7 @@ def verificar_anomalia_consumo(conn, df, cliente):
             
     if es_anomalia:
         stats_bloque['strikes'] += 1
-        print(f"   -> ¡ANOMALÍA! Consumo: {consumo_actual:.0f}W, Límite: {limite_superior:.0f}W. Strike #{stats_bloque['strikes']}.")
+        print(f"    -> ¡ANOMALÍA! Consumo: {consumo_actual:.0f}W, Límite: {limite_superior:.0f}W. Strike #{stats_bloque['strikes']}.")
         if stats_bloque['strikes'] >= NUM_STRIKES_PARA_ALERTA:
             porcentaje = ((consumo_actual / media - 1) * 100) if media > 0 else 0
             hora_legible = ahora.strftime('%I:%M %p')
@@ -309,27 +408,81 @@ def verificar_anomalia_consumo(conn, df, cliente):
     actualizar_estadisticas(conn, cliente['device_id'], estadisticas)
         
 def verificar_brinco_escalon(conn, cliente):
+    """Verifica si el cliente ha cruzado a un nuevo escalón de tarifa CFE, usando datos iniciales."""
     print("-> Verificando brinco de escalón de tarifa...")
     if cliente['tipo_tarifa'] not in TARIFAS_CFE_UMBRALES: return
 
     ultima_corte = calcular_fechas_corte(datetime.now(ZONA_HORARIA_LOCAL), cliente['dia_de_corte'], cliente['ciclo_bimestral'])
-    if not ultima_corte: return
+    if not ultima_corte: 
+        print("    -> No se pudo calcular la última fecha de corte. Omitiendo brinco de escalón.")
+        return
 
-    inicio_periodo = ZONA_HORARIA_LOCAL.localize(datetime.combine(ultima_corte, datetime.min.time()))
-    fin_periodo = datetime.now(ZONA_HORARIA_LOCAL)
+    # Variables
+    device_id = cliente['device_id']
+    fecha_inicio_servicio = cliente.get('fecha_inicio_servicio') # Esto es un datetime.datetime
+    lectura_cierre = cliente.get('lectura_cierre_periodo_anterior')
+    lectura_inicial = cliente.get('lectura_medidor_inicial')
+
+    # 1. Determinar el rango de medición en InfluxDB
     
-    kwh_acumulados, _ = obtener_consumo_desde_servidor_local(cliente['device_id'], inicio_periodo, fin_periodo)
-    if kwh_acumulados is None: return
+    # Por defecto, la medición inicia en el último corte (que es un objeto 'date')
+    fecha_inicio_medicion = ultima_corte
+    
+    # --- INICIO DE LA CORRECCIÓN ---
+    # Comparamos 'date' con 'date'
+    if fecha_inicio_servicio and fecha_inicio_servicio.date() > ultima_corte:
+        # Si la instalación fue después, usamos la fecha de instalación (como 'date')
+        fecha_inicio_medicion = fecha_inicio_servicio.date() 
+    # --- FIN DE LA CORRECCIÓN ---
+    
+    # 2. Consultar el consumo medido por InfluxDB
+    # 'fecha_inicio_medicion' es ahora un objeto 'date' garantizado
+    inicio_periodo_aware = ZONA_HORARIA_LOCAL.localize(datetime.combine(fecha_inicio_medicion, datetime.min.time()))
+    fin_periodo_aware = datetime.now(ZONA_HORARIA_LOCAL)
+    
+    kwh_medidos_influx, _ = obtener_consumo_desde_influxdb(device_id, inicio_periodo_aware, fin_periodo_aware)
+    if kwh_medidos_influx is None: kwh_medidos_influx = 0.0
 
+    # 3. Aplicar la lógica del "Primer Periodo" (Solo si hay datos de lectura inicial)
+    
+    # --- INICIO DE LA CORRECCIÓN ---
+    # Comparamos 'date' con 'date'
+    if (lectura_inicial is not None and 
+        lectura_cierre is not None and 
+        fecha_inicio_servicio and 
+        fecha_inicio_servicio.date() > ultima_corte):
+    # --- FIN DE LA CORRECCIÓN ---
+        
+        # El cliente está en su primer periodo Y se instaló después del corte.
+        
+        # kWh acumulados por CFE ANTES de la instalación
+        consumo_acarreado = float(lectura_inicial) - float(lectura_cierre)
+        
+        # Consumo total real del periodo = Acarreado + Medido por LETE
+        kwh_acumulados = consumo_acarreado + kwh_medidos_influx
+        
+        print(f"    -> Lógica de Primer Periodo aplicada.")
+        print(f"    -> Consumo acarreado (desde corte hasta instalación): {consumo_acarreado:.2f} kWh")
+        print(f"    -> Consumo medido por LETE: {kwh_medidos_influx:.2f} kWh")
+    
+    else:
+        # Lógica de "Periodo Normal" (Segundo periodo en adelante o si se instaló justo en el corte)
+        # Aquí el consumo es simplemente lo que hemos medido desde el inicio del periodo.
+        kwh_acumulados = kwh_medidos_influx
+        print("    -> Lógica de Periodo Normal aplicada.")
+
+    print(f"    -> Total Acumulado para escalón: {kwh_acumulados:.2f} kWh")
+
+    # 4. Verificar contra umbrales (Esta parte NO cambia)
     for umbral in TARIFAS_CFE_UMBRALES[cliente['tipo_tarifa']]:
         bandera_notificacion = f"notificacion_{umbral['bandera']}_enviada"
         if kwh_acumulados > umbral['limite'] and not cliente[bandera_notificacion]:
             variables = {"1": cliente['nombre'], "2": f"{umbral['precio_siguiente']:.2f}"}
             enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_BRINCO_ESCALON, variables)
-            marcar_notificacion_enviada(conn, cliente['device_id'], bandera_notificacion)
-            break
-            
-# --- 5. EJECUCIÓN PRINCIPAL (CORREGIDA) ---
+            marcar_notificacion_enviada(conn, device_id, bandera_notificacion)
+            break    
+                
+# --- 5. EJECUCIÓN PRINCIPAL (CORREGIDA Y MODIFICADA) ---
 def main():
     print("=" * 50)
     print(f"--- Iniciando VIGILANTE v2.3 ({datetime.now(ZONA_HORARIA_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}) ---")
@@ -355,7 +508,13 @@ def main():
     for cliente in clientes:
         print(f"\n--- Verificando alertas para: {cliente['nombre']} ({cliente['device_id']}) ---")
 
-        df_ultima_hora = obtener_datos_locales(cliente['device_id'], 60)
+        # --- ¡NUEVA LÓGICA DE PRIMERA MEDICIÓN! ---
+        fue_la_primera_medicion = verificar_primera_medicion(conn, cliente)
+        if fue_la_primera_medicion:
+            continue # Saltar el resto de chequeos en esta primera ejecución
+        # --- FIN DE LÓGICA ---
+
+        df_ultima_hora = obtener_datos_influx_dataframe(cliente['device_id'], 60)
 
         verificar_dispositivo_offline(df_ultima_hora, cliente)
         verificar_voltaje(df_ultima_hora, cliente)
