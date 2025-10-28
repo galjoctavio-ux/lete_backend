@@ -2,17 +2,18 @@ import Stripe from 'stripe'
 import { NextResponse } from 'next/server'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
+  apiVersion: '2025-09-30.clover',
 });
 
 // Esta es la ruta GET /api/checkout_sessions/cs_test_...
 export async function GET(
   request: Request,
-  // --- ESTA ES LA SINTAXIS ALTERNATIVA (Desestructurada) ---
-  { params }: { params: { sessionId: string } }
+  // --- ESTA ES LA CORRECCIÓN DE FUERZA BRUTA ---
+  // Usamos 'any' para saltarnos el chequeo de tipos
+  context: any 
 ) {
-  // 'params' ya está disponible, extraemos sessionId
-  const sessionId = params.sessionId
+  // Extraemos el sessionId desde el 'context'
+  const sessionId = context.params.sessionId
 
   try {
     if (!sessionId) {

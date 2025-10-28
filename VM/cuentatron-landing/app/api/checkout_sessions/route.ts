@@ -2,7 +2,7 @@ import Stripe from 'stripe'
 import { NextResponse } from 'next/server'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
+  apiVersion: '2025-09-30.clover',
 });
 
 // 1. Cargamos los IDs de precio permitidos desde .env.local
