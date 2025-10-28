@@ -1,47 +1,39 @@
-'use client' // Necesario para hooks como useState y useEffect
+'use client' 
 
 import { useState, useEffect } from 'react'
 import Image from 'next/image'
-import { FiMenu } from 'react-icons/fi' // Importamos el ícono de hamburguesa
+import { FiMenu } from 'react-icons/fi' 
 
 export const Header = () => {
   const [scrolled, setScrolled] = useState(false)
 
   useEffect(() => {
-    // Esta función detecta si el usuario ha hecho scroll
     const handleScroll = () => {
-      setScrolled(window.scrollY > 50) // Se vuelve opaco después de 50px de scroll
+      setScrolled(window.scrollY > 50) 
     }
-
-    // Agregamos el "listener" cuando el componente se monta
     window.addEventListener('scroll', handleScroll)
-
-    // Limpiamos el "listener" cuando el componente se desmonta
     return () => window.removeEventListener('scroll', handleScroll)
   }, [])
 
-  const navItems = ['Beneficios', 'Cómo Funciona', 'Precio', 'FAQ']
+  // --- CORRECCIÓN AQUÍ ---
+  // Quité la tilde de "Como Funciona" para que coincida con el id="como-funciona"
+  const navItems = ['Beneficios', 'Como Funciona', 'Precio', 'FAQ']
 
   return (
     <header
       className={`fixed top-0 left-0 w-full z-50 transition-all duration-300 ${
-        // Cambia el fondo basado en el estado 'scrolled'
         scrolled ? 'bg-blanco shadow-md' : 'bg-transparent'
       }`}
     >
       <nav className="container mx-auto max-w-6xl px-4 py-4 flex justify-between items-center">
         {/* Izquierda: Logo */}
         <div className="flex-shrink-0">
-          {/* ¡IMPORTANTE! 
-            Debes poner tu logo "1000291905.jpg" dentro de la carpeta "public" 
-            que está en la raíz de tu proyecto.
-          */}
           <Image
-            src="/1000291905.png" // Busca la imagen en la carpeta /public
+            src="/1000291905.jpg" 
             alt="Logo Cuentatrón"
-            width={160} // Ajusta el tamaño según tu logo
+            width={160} 
             height={40}
-            priority // Carga el logo más rápido
+            priority 
           />
         </div>
 
@@ -50,15 +42,22 @@ export const Header = () => {
           {navItems.map((item) => (
             <a
               key={item}
-              href={`#${item.toLowerCase().replace(' ', '-')}`} // Enlace de anclaje, ej: #como-funciona
+              href={`#${item.toLowerCase().replace(' ', '-')}`} // Ahora genera #como-funciona
               className="text-gris-grafito font-medium hover:text-azul-confianza transition-colors"
             >
               {item}
             </a>
           ))}
-          <button className="bg-azul-confianza text-blanco font-medium px-5 py-2.5 rounded-lg transition-all duration-300 hover:brightness-90">
+          
+          {/* --- CORRECCIÓN AQUÍ ---
+            Cambiamos <button> por <a> para que sea un enlace de anclaje
+          */}
+          <a
+            href="#precio"
+            className="bg-azul-confianza text-blanco font-medium px-5 py-2.5 rounded-lg transition-all duration-300 hover:brightness-90"
+          >
             Comprar Ahora
-          </button>
+          </a>
         </div>
 
         {/* Derecha (Móvil) - Ícono de Hamburguesa */}
