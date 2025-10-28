@@ -5,11 +5,13 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
   apiVersion: '2024-06-20',
 });
 
-// Esta ruta maneja peticiones GET a /api/checkout_sessions/cs_test_...
+// Esta es la ruta GET /api/checkout_sessions/cs_test_...
 export async function GET(
   request: Request,
+  // --- ESTA ES LA SINTAXIS ALTERNATIVA (Desestructurada) ---
   { params }: { params: { sessionId: string } }
 ) {
+  // 'params' ya está disponible, extraemos sessionId
   const sessionId = params.sessionId
 
   try {
@@ -20,7 +22,7 @@ export async function GET(
     // 1. Pide la sesión a Stripe de forma segura
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-    // 2. Devuelve SOLO el email al frontend (nunca datos sensibles)
+    // 2. Devuelve SOLO el email al frontend
     return NextResponse.json({ 
       customer_email: session.customer_details?.email 
     }, { status: 200 });

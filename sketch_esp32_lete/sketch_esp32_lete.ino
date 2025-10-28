@@ -58,10 +58,11 @@ const unsigned long MEASUREMENT_INTERVAL_MS = 2000;
 const unsigned long SCREEN_CONSUMPTION_INTERVAL_MS = 30000;
 const unsigned long SCREEN_OTHER_INTERVAL_MS = 15000;
 const unsigned long NTP_RETRY_INTERVAL_MS = 120 * 1000;
-const unsigned long SERVER_CHECK_INTERVAL_MS = 4 * 3600 * 1000UL;
+const unsigned long SERVER_CHECK_INTERVAL_MS = 30 * 60 * 1000UL;
 const unsigned long MESSENGER_CYCLE_DELAY_MS = 5000;
 #define WDT_TIMEOUT_SECONDS 180
 #define LONG_PRESS_DURATION_MS 10000
+const unsigned long DAILY_RESTART_INTERVAL_MS = 24 * 3600 * 1000UL; // 24 horas
 
 // --- 5. CONFIGURACIÓN DE RED ---
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -76,6 +77,7 @@ Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 EnergyMonitor emon_phase;
 EnergyMonitor emon_neutral;
 RTC_DS3231 rtc;
+unsigned long last_reboot_check_time = 0;
 
 // Estructura de Datos para las Mediciones
 struct MeasurementData {
@@ -334,7 +336,6 @@ void messengerTask(void * pvParameters) {
         // Chequear si el Núcleo 1 (botón) solicitó un reseteo de WiFi
         bool reset_solicitado = false;
         if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // (Añade 'volatile bool factory_reset_request = false;' a tus variables globales)
             if (factory_reset_request) { 
                 reset_solicitado = true;
                 factory_reset_request = false; // Bajar la bandera
@@ -377,19 +378,10 @@ void messengerTask(void * pvParameters) {
                 WiFi.reconnect();
             }
             
-            // Esperar el ciclo de delay y re-chequear el estado en el próximo bucle
-            // --- 9. RE-SINCRONIZACIÓN PERIÓDICA DE RTC ---
-            // Forzar una re-sincronización de NTP cada 7 días para corregir drift
-            const unsigned long NTP_RESYNC_INTERVAL_MS = 7 * 24 * 3600 * 1000UL;
-
-            // Usamos 'last_ntp_attempt' para re-usar el timer de NTP
-            if (time_synced && (millis() - last_ntp_attempt > NTP_RESYNC_INTERVAL_MS)) {
-                if (DEBUG_MODE) Serial.println("[N0] Forzando re-sincronización de NTP para corregir drift del RTC...");
-                if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    time_synced = false; // Bajar la bandera para forzar el bloque NTP
-                    xSemaphoreGive(sharedVarsMutex);
-                }
-            }
+            /* * NOTA: El código de re-sincronización de 7 días estaba aquí (sección 9 original),
+             * lo cual era un bug, ya que solo se ejecutaría si el WiFi ESTABA DESCONECTADO.
+             * Se movió a la nueva Sección 6B, donde se ejecuta correctamente.
+            */
             vTaskDelay(pdMS_TO_TICKS(MESSENGER_CYCLE_DELAY_MS)); 
             continue; // Vuelve al inicio del bucle for(;;)
         }
@@ -444,51 +436,94 @@ void messengerTask(void * pvParameters) {
             }
         }
 
-        // --- 6. GESTIÓN DE HORA (NTP) Y REPORTE DE ARRANQUE ---
-        // (Solo corre si no está sincronizado Y ha pasado el intervalo)
-        if (!time_synced && millis() - last_ntp_attempt > NTP_RETRY_INTERVAL_MS) {
-            last_ntp_attempt = millis();
-            if(DEBUG_MODE) Serial.println("[N0] ==> Intentando sincronizar NTP...");
+        // =========================================================================
+        // --- INICIO DE LA LÓGICA DE TIEMPO Y ENVÍO (v14.1 - RTC-FIRST) ---
+        // =========================================================================
+
+        // --- 6A. REPORTE DE ARRANQUE (BASADO EN RTC) ---
+        // Misión: Enviar el reporte de arranque tan pronto como sea posible
+        // usando la hora del RTC, sin depender de NTP.
+        // Esto desbloquea el envío de datos de la SD.
+        if (client.connected() && !boot_time_reported) {
+            
+            // ¡Usar la hora del RTC! Es la más fiable que tenemos al arrancar.
+            // Se resta millis() para obtener el timestamp de cuando el ESP32 *realmente* arrancó.
+            long boot_time_unix = rtc.now().unixtime() - (millis() / 1000);
+            
+            // Chequeo de sanidad: Asegura que la hora del RTC es válida (ej. > 1 Enero 2024)
+            // 1704067200 es el timestamp de 2024-01-01 00:00:00 GMT
+            if (boot_time_unix > 1704067200) { 
+                if(DEBUG_MODE) Serial.println("[N0] Hora del RTC válida detectada.");
+                char jsonPayload[128];
+                snprintf(jsonPayload, sizeof(jsonPayload), 
+                         "{\"device_id\":\"%s\",\"boot_time_unix\":%lu}", 
+                         deviceIdForMqtt.c_str(), boot_time_unix);
+                
+                if (client.publish(TOPIC_BOOT, jsonPayload, true)) { // Publicar con retención
+                    if(DEBUG_MODE) Serial.printf("[N0] ÉXITO: Reporte de arranque (vía RTC) enviado: %s\n", jsonPayload);
+                    boot_time_reported = true; // <-- ¡CRÍTICO! ESTO DESBLOQUEA EL ENVÍO DE DATOS
+                } else {
+                    if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al enviar reporte de arranque (RTC).");
+                }
+            } else {
+                if(DEBUG_MODE) Serial.println("[N0-Debug] Hora del RTC no es fiable (batería agotada?). Esperando NTP para reporte de arranque...");
+                // Si la hora del RTC no es válida, esperará a que el bloque 6B (NTP) funcione.
+            }
+        }
+
+        // --- 6B. GESTIÓN DE HORA (NTP OPORTUNISTA) ---
+        // Misión: Sincronizar NTP en segundo plano para ajustar el RTC,
+        // sin bloquear el funcionamiento principal.
+        
+        bool needs_ntp_sync = !time_synced; // Si nunca ha sincronizado en este arranque
+        
+        // (Corrección de Bug v14.1)
+        // Se define la constante aquí, ya que en el código original estaba
+        // dentro de un 'if' y no era accesible globalmente.
+        const unsigned long NTP_RESYNC_INTERVAL_MS = 7 * 24 * 3600 * 1000UL; // 7 días
+
+        // Chequeo de re-sincronización periódica (cada 7 días)
+        if (time_synced && (millis() - last_ntp_attempt > NTP_RESYNC_INTERVAL_MS)) {
+             if (DEBUG_MODE) Serial.println("[N0] Forzando re-sincronización de NTP para corregir drift del RTC...");
+             if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                 time_synced = false; // Bajar la bandera para forzar el bloque NTP
+                 xSemaphoreGive(sharedVarsMutex);
+             }
+             needs_ntp_sync = true;
+        }
+
+        // (Solo corre si necesita sincronizar Y ha pasado el intervalo de reintento)
+        if (needs_ntp_sync && millis() - last_ntp_attempt > NTP_RETRY_INTERVAL_MS) {
+            last_ntp_attempt = millis(); // Marcar el intento, incluso si falla
+            if(DEBUG_MODE) Serial.println("[N0] ==> Intentando sincronizar/ajustar NTP (en segundo plano)...");
             configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
             struct tm timeinfo;
-            if (getLocalTime(&timeinfo, 5000)) {
+            
+            if (getLocalTime(&timeinfo, 5000)) { // 5 segundos de timeout
                 if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     time_synced = true;
                     xSemaphoreGive(sharedVarsMutex);
                 }
                 if(DEBUG_MODE) Serial.println("[N0] Hora NTP sincronizada con éxito.");
 
-                // (Mejora v14.0) AJUSTE OPORTUNISTA DEL RTC
+                // AJUSTE OPORTUNISTA DEL RTC
                 if(DEBUG_MODE) Serial.println("[N0] Ajustando RTC (DS3231) con la hora NTP...");
                 rtc.adjust(DateTime(time(NULL))); 
 
-                // Reporte de arranque (solo se envía una vez por reinicio)
-                if (!boot_time_reported && client.connected()) {
-                    long boot_time_unix = time(NULL) - (millis() / 1000);
-                    char jsonPayload[128];
-                    snprintf(jsonPayload, sizeof(jsonPayload), 
-                             "{\"device_id\":\"%s\",\"boot_time_unix\":%lu}", 
-                             deviceIdForMqtt.c_str(), boot_time_unix);
-                    
-                    if (client.publish(TOPIC_BOOT, jsonPayload, true)) { // Publicar con retención
-                        if(DEBUG_MODE) Serial.printf("[N0] ÉXITO: Reporte de arranque enviado: %s\n", jsonPayload);
-                        boot_time_reported = true;
-                    } else {
-                        if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al enviar reporte de arranque.");
-                    }
-                }
+                // Si el reporte de arranque (6A) falló antes por culpa de un RTC sin batería,
+                // ahora se re-intentará en el siguiente ciclo.
+                
             } else {
-                if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al obtener hora NTP (timeout).");
+                if(DEBUG_MODE) Serial.println("[N0] ERROR: Fallo al obtener hora NTP (timeout). El dispositivo continuará con la hora del RTC.");
             }
         }
 
         // --- 7. PROCESAMIENTO DE ARCHIVOS DE LA SD (MODO RÁFAGA) ---
-        // (Solo corre si el MQTT está conectado y el arranque ya se reportó)
+        // (Ahora solo depende de 'boot_time_reported', que se activa en 6A con el RTC)
         if (client.connected() && boot_time_reported) {
             // --- 7a. CHEQUEO DE ESPACIO EN SD ---
-            // (Límite 50MB, puedes ajustarlo)
             const uint64_t MAX_SD_USAGE_BYTES = 50ULL * 1024ULL * 1024ULL;
-            const int FILES_TO_PURGE = 10; // Número de archivos a borrar a la vez
+            const int FILES_TO_PURGE = 10; 
 
             if (SD.usedBytes() > MAX_SD_USAGE_BYTES) {
                 if (DEBUG_MODE) Serial.println("[N0] ⚠️ ADVERTENCIA: SD casi llena. Purgando archivos antiguos...");
@@ -496,35 +531,27 @@ void messengerTask(void * pvParameters) {
                 File rootPurge = SD.open("/");
                 if (rootPurge) {
                     File fileToPurge;
-                    char oldestFiles[FILES_TO_PURGE][20]; // Espacio para "/1234567890.dat"
+                    char oldestFiles[FILES_TO_PURGE][20]; 
                     uint32_t oldestTimestamps[FILES_TO_PURGE];
 
-                    // Inicializar con el valor máximo
                     for(int i=0; i<FILES_TO_PURGE; i++) {
                         oldestTimestamps[i] = UINT32_MAX;
                         strcpy(oldestFiles[i], "");
                     }
 
-                    // Encontrar los 10 archivos más antiguos (con el timestamp más bajo)
                     while(fileToPurge = rootPurge.openNextFile()) {
                         String nameStr = fileToPurge.name();
                         const char* name = nameStr.c_str();
 
-                        // Asegurarse que es un archivo .dat y no el buffer
                         if (strstr(name, ".dat") && !strstr(name, "buffer.dat")) {
-                            // Extraer el timestamp (ej. de "/1678886400.dat")
                             uint32_t timestamp = strtoul(name + 1, NULL, 10);
-
                             if (timestamp > 0) {
-                                // Insertar en la lista ordenada
                                 for(int i=0; i<FILES_TO_PURGE; i++) {
                                     if (timestamp < oldestTimestamps[i]) {
-                                        // Mover los demás hacia abajo
                                         for (int j = FILES_TO_PURGE - 1; j > i; j--) {
                                             oldestTimestamps[j] = oldestTimestamps[j-1];
                                             strcpy(oldestFiles[j], oldestFiles[j-1]);
                                         }
-                                        // Insertar el nuevo
                                         oldestTimestamps[i] = timestamp;
                                         strcpy(oldestFiles[i], name);
                                         break;
@@ -536,19 +563,17 @@ void messengerTask(void * pvParameters) {
                     }
                     rootPurge.close();
 
-                    // Borrar los 10 archivos encontrados
                     if(DEBUG_MODE) Serial.println("[N0] Borrando los 10 archivos más antiguos...");
                     for(int i=0; i<FILES_TO_PURGE; i++) {
                         if (strlen(oldestFiles[i]) > 0) {
-                            if(DEBUG_MODE) Serial.printf("   - Purgando: %s\n", oldestFiles[i]);
+                            if(DEBUG_MODE) Serial.printf("   - Purgando: %s\n", oldestFiles[i]);
                             SD.remove(oldestFiles[i]);
                         }
                     }
                 }
             }
 
-            // (El resto del código de la "Sección 7" para buscar y enviar archivos
-            // continúa aquí abajo sin cambios...)
+            // --- 7b. LÓGICA DE ENVÍO DE ARCHIVOS .DAT ---
             if(DEBUG_MODE) Serial.println("[N0] Buscando archivos .dat en la SD para enviar...");
             File root = SD.open("/");
             if (!root) {
@@ -589,14 +614,12 @@ void messengerTask(void * pvParameters) {
                         line.trim();
                         if (line.length() > 0) {
                             MeasurementData data;
-                            // (Lógica v14.0) Parsea el timestamp Unix
                             int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f,%f", 
                                                       &data.sequence_number, &data.timestamp, &data.vrms, &data.irms_phase, 
                                                       &data.irms_neutral, &data.power, &data.va, &data.power_factor, &data.leakage, &data.temp_cpu);
                             
                             if (parsed_items == 10) {
                                 char jsonPayload[256];
-                                // (Lógica v14.0) Envía el 'ts_unix'
                                 snprintf(jsonPayload, sizeof(jsonPayload),
                                          "{\"ts_unix\":%lu,\"vrms\":%.2f,\"irms_p\":%.3f,\"irms_n\":%.3f,\"pwr\":%.2f,\"va\":%.2f,\"pf\":%.2f,\"leak\":%.3f,\"temp\":%.1f,\"seq\":%u}",
                                          data.timestamp, data.vrms, data.irms_phase, data.irms_neutral, data.power, data.va, data.power_factor, data.leakage, data.temp_cpu, data.sequence_number);
@@ -643,11 +666,51 @@ void messengerTask(void * pvParameters) {
             if(DEBUG_MODE) Serial.println("[N0-Debug] Búsqueda de archivos finalizada para este ciclo.");
 
         } else if (client.connected() && !boot_time_reported) {
-            // Caso borde: MQTT conectado pero NTP aún no responde
-            if(DEBUG_MODE) Serial.println("[N0-Debug] Esperando sincronización NTP antes de enviar reporte de arranque.");
+            // Este mensaje ahora es normal si el RTC no tiene batería Y NTP está fallando.
+            if(DEBUG_MODE) Serial.println("[N0-Debug] Esperando hora válida (RTC o NTP) para enviar reporte de arranque.");
         }
         
-        // --- 8. FIN DE CICLO ---
+        // --- 8. REINICIO DIARIO PROGRAMADO (APROXIMADO) ---
+        if (millis() - last_reboot_check_time > DAILY_RESTART_INTERVAL_MS) {
+        
+        // (Lógica de reinicio seguro)
+        bool safeToReboot = !client.connected(); 
+        if (client.connected()) {
+            File rootCheck = SD.open("/");
+            bool filesPending = false;
+            if (rootCheck) {
+                File checkFile = rootCheck.openNextFile();
+                while(checkFile){
+                    String fname = checkFile.name();
+                    if (fname.endsWith(".dat") && fname != "/buffer.dat") {
+                        filesPending = true;
+                        checkFile.close();
+                        break;
+                    }
+                    checkFile.close();
+                    checkFile = rootCheck.openNextFile();
+                }
+                rootCheck.close();
+            }
+            if (!filesPending) {
+                safeToReboot = true;
+            }
+        }
+
+        if (safeToReboot) {
+            if (DEBUG_MODE) Serial.println("[N0] Ejecutando reinicio diario programado...");
+            delay(1000); 
+            ESP.restart();
+        } else {
+             if (DEBUG_MODE) Serial.println("[N0] Reinicio diario pospuesto: Operación MQTT o archivos pendientes.");
+             last_reboot_check_time = millis() - DAILY_RESTART_INTERVAL_MS + 10000; 
+        }
+    } else {
+         last_reboot_check_time = millis();
+    }
+
+
+        // --- 9. FIN DE CICLO ---
         if(DEBUG_MODE) Serial.printf("[N0] <<< Fin del bucle. Esperando %lu ms.\n", MESSENGER_CYCLE_DELAY_MS);
         vTaskDelay(pdMS_TO_TICKS(MESSENGER_CYCLE_DELAY_MS));
     }
