@@ -1,4 +1,4 @@
-# Ignorar todos los archivos .env en cualquier carpeta
+# Ignoraar todos los archivos .env en cualquier carpeta
 *.env
 *.local
 *.env.local
