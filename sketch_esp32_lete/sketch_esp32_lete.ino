@@ -672,6 +672,12 @@ void setup() {
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Serial.println(" OK.");
 
+    // ✅ AGREGAR ESTO AQUÍ (ANTES DE TODO):
+    // --- 1.5 INICIALIZAR STACK DE WIFI ---
+    Serial.print("Inicializando stack de WiFi...");
+    WiFi.mode(WIFI_STA); // Modo Station (cliente) // <-- LA LÍNEA CLAVE
+    Serial.println(" OK.");
+
     // --- 2. INICIALIZAR RTC ---
     Serial.print("Inicializando RTC (DS3231)...");
     if (!rtc.begin()) {
@@ -707,6 +713,14 @@ void setup() {
     // --- 5. INICIALIZAR SISTEMA (MUTEX Y WATCHDOG) ---
     Serial.print("Configurando sistema multitarea (Mutex y Watchdog)...");
     sharedVarsMutex = xSemaphoreCreateMutex();
+    // --- VERIFICACIÓN AÑADIDA ---
+    if (sharedVarsMutex == NULL) {
+        Serial.println("\nERROR CRÍTICO: Fallo al crear el Mutex. Memoria insuficiente.");
+        Serial.println("El sistema se detendrá.");
+        drawBootScreen("ERROR: MUTEX");
+        while(1) delay(1000); // Detener el arranque
+    }
+    // --- FIN DE LA VERIFICACIÓN ---
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
@@ -735,16 +749,18 @@ void setup() {
     Serial.print("Configurando OTA...");
     drawBootScreen("Iniciando OTA...");
     
-    ArduinoOTA.setHostname("lete-monitor"); // Puedes cambiar "lete-monitor" por "cuentatron-XXXX"
+    ArduinoOTA.setHostname("Cuentatron"); // Puedes cambiar "lete-monitor" por "cuentatron-XXXX"
     ArduinoOTA.setPassword(OTA_PASSWORD);
+    // --- AÑADIR ESTA LÍNEA ---
+    Serial.printf("\n[DEBUG] Heap libre ANTES de ArduinoOTA.begin(): %d bytes\n", ESP.getFreeHeap());
     ArduinoOTA.begin();
     Serial.println(" OK.");
 
     // --- 8. INICIAR TAREAS DE LOS NÚCLEOS ---
     Serial.print("Iniciando tareas en los núcleos 0 y 1...");
     drawBootScreen("Iniciando tareas...");
-    xTaskCreatePinnedToCore(writerTask, "WriterTask", 10000, NULL, 2, &writerTaskHandle, 1);
-    xTaskCreatePinnedToCore(messengerTask, "MessengerTask", 32768, NULL, 1, &messengerTaskHandle, 0);
+    xTaskCreatePinnedToCore(writerTask, "WriterTask", 8192, NULL, 2, &writerTaskHandle, 1);
+    xTaskCreatePinnedToCore(messengerTask, "MessengerTask", 16384, NULL, 1, &messengerTaskHandle, 0);
     Serial.println(" OK.");
     
     drawBootScreen("¡Listo!");
