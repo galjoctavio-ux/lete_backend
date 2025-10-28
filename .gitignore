@@ -1,1 +1,12 @@
+# Ignorar todos los archivos .env en cualquier carpeta
 *.env
+
+# Ignorar el archivo de secretos del ESP32
+secrets.h
+
+# Ignorar la carpeta de compilación (build) del ESP32
+sketch_esp32_lete/build/
+
+# Archivos comunes de Python (opcional pero recomendado)
+__pycache__/
+*.pyc

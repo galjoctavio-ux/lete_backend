@@ -136,12 +136,11 @@ void drawConsumptionScreen() {
     display.clearDisplay();
 
     float vrms, irms, power;
-    bool s_status;
+  
     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         vrms = latest_vrms;
         irms = latest_irms_phase;
         power = latest_power;
-        s_status = server_status;
         xSemaphoreGive(sharedVarsMutex);
     }
     
@@ -174,7 +173,7 @@ void drawConsumptionScreen() {
     // --- CAMBIO: Icono de Nube Dinámico ---
     display.setCursor(45, 56);
     display.print("Nube:");
-    display.write(s_status ? 251 : 7); // 251 = Checkmark (√), 7 = Bullet (•)
+    
 
     display.setCursor(90, 56);
     display.printf("FP:%.2f", power_factor);
