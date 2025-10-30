@@ -1,0 +1,939 @@
+/* ---------------------------------- */
+/* 1. VARIABLES GLOBALES         */
+/* ---------------------------------- */
+:root {
+    /* Paleta de Colores (Según Branding) */
+    --color-primario: #0F5868;       /* Azul/Verde oscuro */
+    --color-secundario: #2AA79B;     /* Verde menta */
+    --color-texto: #2F3A3A;          /* Gris oscuro (casi negro) */
+    --color-acento: #FF8A3D;         /* Naranja */
+    --color-fondo: #F7F7F7;          /* Gris claro (fondo) */
+    --color-blanco: #FFFFFF;
+
+    /* Tipografía */
+    --fuente-principal: 'Roboto', sans-serif;
+
+    /* Layout */
+    --ancho-maximo: 1100px;
+    --radio-borde: 6px;
+}
+
+/* ---------------------------------- */
+/* 2. RESET BÁSICO Y GLOBALES    */
+/* ---------------------------------- */
+
+/* Reseteo de Box-sizing para un layout predecible */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html {
+    /* Scroll-behavior suave */
+    scroll-behavior: smooth;
+    /* Hacemos que 1rem = 10px para facilitar cálculos */
+    font-size: 62.5%; 
+}
+
+body {
+    font-family: var(--fuente-principal);
+    font-size: 1.6rem; /* Equivale a 16px */
+    line-height: 1.6;
+    color: var(--color-texto);
+    background-color: var(--color-blanco); /* Usamos blanco para el body, y el gris claro para secciones */
+    
+    /* Evita que el contenido salte cuando aparece la scrollbar */
+    overflow-y: scroll; 
+}
+
+h1, h2, h3, h4 {
+    color: var(--color-primario);
+    line-height: 1.2;
+    margin-bottom: 1.5rem;
+}
+
+p {
+    margin-bottom: 1.5rem;
+}
+
+a {
+    color: var(--color-secundario);
+    text-decoration: none;
+    transition: color 0.3s ease;
+}
+
+a:hover {
+    color: var(--color-acento);
+}
+
+img {
+    max-width: 100%;
+    display: block;
+}
+
+/* ---------------------------------- */
+/* 3. CLASES DE UTILIDAD         */
+/* ---------------------------------- */
+
+/* Contenedor principal para centrar contenido */
+.container {
+    max-width: var(--ancho-maximo);
+    margin: 0 auto;
+    padding: 0 2rem; /* Padding lateral para móviles */
+}
+
+/* ---------------------------------- */
+/* 4. ESTILOS DE BOTONES (Globales) */
+/* ---------------------------------- */
+.btn {
+    display: inline-block;
+    padding: 1.2rem 2.8rem;
+    font-size: 1.6rem;
+    font-weight: 700;
+    text-align: center;
+    border: 2px solid transparent;
+    border-radius: var(--radio-borde);
+    cursor: pointer;
+    transition: all 0.3s ease;
+    text-transform: none; /* El branding no pide mayúsculas forzadas */
+    white-space: nowrap; /* Evita que el texto del botón se parta */
+}
+
+.btn-primario {
+    background-color: var(--color-acento); /* Naranja */
+    color: var(--color-blanco);
+    border-color: var(--color-acento);
+}
+
+.btn-primario:hover {
+    background-color: #E67A35; /* Naranja más oscuro (generado) */
+    border-color: #E67A35;
+    color: var(--color-blanco);
+}
+
+.btn-secundario {
+    background-color: transparent;
+    color: var(--color-blanco);
+    border: 2px solid var(--color-blanco); /* Borde blanco como pide el estilo secundario */
+}
+
+.btn-secundario:hover {
+    background-color: var(--color-blanco);
+    color: var(--color-primario); /* Al hacer hover, fondo blanco y texto en color primario */
+}
+
+
+/* ---------------------------------- */
+/* 5. SECCIÓN HERO                 */
+/* ---------------------------------- */
+.hero-section {
+    /* Usamos el color primario como fondo sólido mientras carga la imagen */
+    background-color: var(--color-primario); 
+    
+    /* IMAGEN DE FONDO: 
+       Asegúrate de tener una imagen en: 'assets/images/hero-background.jpg' 
+    */
+    
+    /* Creamos el overlay oscuro solicitado usando un degradado sobre la imagen */
+    background-image: linear-gradient(rgba(15, 88, 104, 0.85), rgba(15, 88, 104, 0.85)), url('../assets/images/hero-background.jpg');
+    background-size: cover;
+    background-position: center center;
+    background-repeat: no-repeat;
+    
+    color: var(--color-blanco);
+    padding: 12rem 0; /* Espaciado vertical amplio */
+    text-align: left; /* Alineación del contenido */
+}
+
+.hero-content {
+    /* Limitamos el ancho del texto para mejor legibilidad */
+    max-width: 800px; 
+}
+
+.hero-h1 {
+    color: var(--color-blanco);
+    font-size: 4.8rem; /* Tamaño grande para H1 principal */
+    font-weight: 700;
+    margin-bottom: 2rem;
+}
+
+.hero-subheadline {
+    font-size: 2rem;
+    font-weight: 400;
+    margin-bottom: 3rem;
+    max-width: 90%; /* Evita que el subtítulo sea demasiado ancho */
+}
+
+.hero-cta-group {
+    margin-bottom: 2rem;
+}
+
+/* Separación entre botones */
+.hero-cta-group .btn {
+    margin-right: 1.5rem;
+    margin-bottom: 1rem; /* Para apilamiento en móvil */
+}
+
+.hero-microcopy {
+    font-size: 1.4rem;
+    font-weight: 500;
+    opacity: 0.9;
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Hero Section         */
+/* ---------------------------------- */
+
+/* Ajustes para tablets y móviles */
+@media (max-width: 768px) {
+    .hero-section {
+        padding: 8rem 0;
+        text-align: left; /* Mantenemos alineación izquierda */
+    }
+
+    .hero-h1 {
+        font-size: 3.6rem;
+    }
+
+    .hero-subheadline {
+        font-size: 1.8rem;
+        max-width: 100%;
+    }
+
+    .hero-cta-group .btn {
+        display: block; /* Hace que los botones se apilen verticalmente */
+        margin-right: 0;
+        margin-bottom: 1.5rem;
+        width: 100%;
+        max-width: 350px; /* Evita que sean excesivamente anchos en móvil */
+    }
+
+    /* En móvil, el secundario (borde) podría ser difícil de ver. Lo mantenemos por ahora. */
+    .btn-secundario {
+        background-color: transparent;
+        color: var(--color-blanco);
+    }
+}
+/* ---------------------------------- */
+/* 6. SECCIÓN QUIÉNES SOMOS           */
+/* ---------------------------------- */
+.quienes-somos-section {
+    padding: 8rem 0;
+    background-color: var(--color-fondo); /* Fondo gris claro */
+}
+
+.columnas-2 {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start; /* Alinea los items al inicio */
+    gap: 4rem; /* Espacio entre columnas */
+}
+
+.col-texto {
+    flex-basis: 55%; /* La columna de texto ocupa un poco más */
+}
+
+.col-texto h2 {
+    font-size: 3.6rem;
+    margin-bottom: 2.5rem;
+}
+
+.col-texto p {
+    font-size: 1.8rem;
+}
+
+.col-atributos {
+    flex-basis: 40%; /* La columna de atributos ocupa un poco menos */
+    padding-top: 1rem; /* Alineación visual con el texto */
+}
+
+.lista-atributos {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.lista-atributos li {
+    display: flex;
+    align-items: center;
+    font-size: 2rem;
+    font-weight: 500;
+    margin-bottom: 2rem;
+    color: var(--color-primario);
+}
+
+.icono-atributo {
+    /* (Estilo para el ícono) */
+    font-size: 2.4rem; /* Tamaño del emoji/ícono */
+    color: var(--color-secundario); /* Verde menta para el ícono */
+    margin-right: 1.5rem;
+    flex-shrink: 0; /* Evita que el ícono se encoja */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Quiénes Somos        */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .quienes-somos-section {
+        padding: 6rem 0;
+    }
+
+    .columnas-2 {
+        flex-direction: column; /* Apila las columnas en móvil */
+        gap: 2rem;
+    }
+
+    /* Reseteamos los anchos para que ocupen el 100% */
+    .col-texto,
+    .col-atributos {
+        flex-basis: 100%;
+    }
+
+    .col-texto h2 {
+        font-size: 3rem;
+    }
+
+    .col-atributos {
+        padding-top: 2rem; /* Espacio superior al apilarse */
+    }
+
+    .lista-atributos li {
+        font-size: 1.8rem;
+    }
+}
+
+/* ---------------------------------- */
+/* 7. SECCIÓN ENFOQUE (HIGHLIGHT)     */
+/* ---------------------------------- */
+.enfoque-section {
+    /* Usamos el color primario oscuro para este bloque destacado */
+    background-color: var(--color-primario); 
+    color: var(--color-blanco);
+    padding: 8rem 0;
+    text-align: center; /* Centramos todo el contenido del bloque */
+}
+
+/* Limitamos el ancho del contenido para mejor legibilidad */
+.enfoque-section .container {
+    max-width: 800px;
+}
+
+.enfoque-titulo-corto {
+    font-size: 2rem;
+    font-weight: 500;
+    color: var(--color-secundario); /* Verde menta para el título corto */
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 2rem;
+}
+
+.enfoque-quote {
+    font-size: 4rem;
+    font-weight: 700;
+    color: var(--color-blanco);
+    line-height: 1.3;
+    margin-bottom: 2.5rem;
+    border: none; /* Quitamos bordes por defecto de blockquote */
+}
+
+.enfoque-parrafo {
+    font-size: 1.8rem;
+    font-weight: 400;
+    color: var(--color-fondo); /* Gris claro para el párrafo, da buen contraste */
+    margin-bottom: 0; /* No hay más contenido debajo en este bloque */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Enfoque              */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .enfoque-section {
+        padding: 6rem 0;
+    }
+
+    .enfoque-quote {
+        font-size: 3.2rem;
+    }
+
+    .enfoque-parrafo {
+        font-size: 1.6rem;
+    }
+}
+
+/* ---------------------------------- */
+/* 8. SECCIÓN SOLUCIONES (CARDS)      */
+/* ---------------------------------- */
+.soluciones-section {
+    padding: 8rem 0;
+    background-color: var(--color-fondo); /* Volvemos al gris claro para alternar */
+}
+
+/* Título de sección genérico que podemos reusar */
+.titulo-seccion {
+    text-align: center;
+    font-size: 3.6rem;
+    margin-bottom: 5rem;
+}
+
+.cards-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr); /* 3 columnas en desktop */
+    gap: 3rem; /* Espacio entre las tarjetas */
+}
+
+.card {
+    background-color: var(--color-blanco);
+    border: 1px solid #E0E0E0; /* Borde sutil */
+    border-radius: var(--radio-borde);
+    padding: 3rem;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); /* Sombra suave */
+    
+    /* Usamos flex para ordenar el contenido interno */
+    display: flex;
+    flex-direction: column; 
+    
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.card:hover {
+    transform: translateY(-5px); /* Efecto sutil al pasar el mouse */
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
+}
+
+.card-titulo {
+    font-size: 2.2rem;
+    color: var(--color-primario);
+    margin-bottom: 1.5rem;
+}
+
+.card-copete {
+    font-size: 1.6rem;
+    flex-grow: 1; /* Esto empuja el botón (CTA) al final de la tarjeta */
+    margin-bottom: 2rem;
+}
+
+/* ---------------------------------- */
+/* 9. BOTÓN TERCIARIO (Link style)    */
+/* ---------------------------------- */
+.btn-terciario {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--color-secundario); /* Verde menta */
+    text-decoration: none;
+    transition: color 0.3s ease;
+    align-self: flex-start; /* Se alinea al inicio */
+}
+
+.btn-terciario:hover {
+    color: var(--color-acento); /* Naranja al hacer hover */
+}
+
+/* Estilo para el botón deshabilitado (Muy Pronto) */
+.btn-terciario.disabled {
+    color: #999; /* Gris */
+    cursor: not-allowed;
+    pointer-events: none; /* Desactiva los clics */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Soluciones           */
+/* ---------------------------------- */
+
+@media (max-width: 900px) {
+    /* En tablets, podríamos pasar a 2 columnas si quisiéramos, 
+       pero el brief pide 3 (desktop) y 1 (móvil). 
+       Vamos a 1 columna un poco antes de 768px para que no se aprieten. */
+    .cards-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ---------------------------------- */
+/* 10. SECCIÓN CÓMO TRABAJAMOS      */
+/* ---------------------------------- */
+.metodologia-section {
+    /* Fondo blanco para alternar con la sección gris anterior */
+    background-color: var(--color-blanco); 
+    padding: 8rem 0;
+}
+
+.columnas-3 {
+    display: grid;
+    /* 3 columnas en desktop */
+    grid-template-columns: repeat(3, 1fr); 
+    gap: 4rem; /* Espacio entre columnas */
+    text-align: center; /* Centramos el contenido de cada item */
+}
+
+.metodo-item {
+    /* No se necesita mucho estilo aquí, la rejilla hace el trabajo */
+}
+
+.metodo-icono {
+    font-size: 4.8rem; /* Tamaño grande para el ícono/emoji */
+    color: var(--color-primario);
+    margin-bottom: 1.5rem;
+}
+
+.metodo-titulo {
+    font-size: 2.2rem;
+    color: var(--color-primario);
+    margin-bottom: 1rem;
+}
+
+.metodo-texto {
+    font-size: 1.6rem;
+    margin-bottom: 0;
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Cómo Trabajamos      */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .metodologia-section {
+        padding: 6rem 0;
+    }
+    
+    .columnas-3 {
+        /* 1 columna en móvil */
+        grid-template-columns: 1fr; 
+        gap: 5rem; /* Aumentamos el espacio vertical en móvil */
+    }
+
+    .metodo-icono {
+        font-size: 4.2rem;
+    }
+
+    .metodo-titulo {
+        font-size: 2rem;
+    }
+}
+/* ---------------------------------- */
+/* 11. SECCIÓN CASOS DE USO         */
+/* ---------------------------------- */
+.casos-uso-section {
+    /* Fondo gris claro para alternar */
+    background-color: var(--color-fondo); 
+    padding: 8rem 0;
+}
+
+.casos-uso-grid {
+    /* Limitamos el ancho de la lista para centrarla y mejorar legibilidad */
+    max-width: 900px;
+    margin: 0 auto; /* Centramos el contenedor de la lista */
+}
+
+.lista-casos-uso {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    
+    /* Usamos grid para alinear las dos columnas de la lista en desktop */
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2.5rem 4rem; /* Espacio vertical y horizontal */
+}
+
+.lista-casos-uso li {
+    display: flex;
+    align-items: flex-start; /* Alinea ícono y texto al inicio */
+    font-size: 1.8rem;
+    font-weight: 500;
+    color: var(--color-texto);
+    line-height: 1.5;
+}
+
+.caso-icono {
+    font-size: 2.8rem;
+    color: var(--color-secundario); /* Verde menta para el ícono */
+    margin-right: 1.5rem;
+    padding-top: 0.2rem; /* Ajuste visual leve */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Casos de Uso         */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .casos-uso-section {
+        padding: 6rem 0;
+    }
+
+    .lista-casos-uso {
+        /* 1 columna en móvil */
+        grid-template-columns: 1fr; 
+        gap: 3rem; /* Espacio vertical */
+    }
+
+    .lista-casos-uso li {
+        font-size: 1.6rem;
+    }
+}
+/* ---------------------------------- */
+/* 12. SECCIÓN TESTIMONIO           */
+/* ---------------------------------- */
+.testimonio-section {
+    /* Fondo blanco para alternar */
+    background-color: var(--color-blanco); 
+    padding: 8rem 0;
+}
+
+.testimonio-section .container {
+    /* Centramos el contenido y limitamos el ancho */
+    max-width: 850px;
+    text-align: center;
+}
+
+.testimonio-quote {
+    font-size: 3rem; /* Tamaño de fuente grande para la cita */
+    font-weight: 400;
+    color: var(--color-texto);
+    line-height: 1.5;
+    margin: 4rem 0 2.5rem 0;
+    border: none;
+    font-style: italic; /* Estilo de cita */
+}
+
+.testimonio-firma {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+}
+
+.testimonio-firma img {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%; /* Foto redonda */
+    object-fit: cover;
+}
+
+.testimonio-firma p {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: var(--color-primario);
+    margin: 0;
+}
+
+/* Estilos para la barra de logos opcional */
+.logos-barra {
+    margin-top: 6rem;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 4rem;
+    filter: grayscale(100%); /* Logos en gris para elegancia */
+    opacity: 0.7;
+}
+
+.logos-barra img {
+    max-height: 40px; /* Altura máxima para logos */
+    width: auto;
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Testimonio           */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .testimonio-section {
+        padding: 6rem 0;
+    }
+
+    .testimonio-quote {
+        font-size: 2.4rem; /* Reducimos la cita en móvil */
+    }
+
+    .testimonio-firma p {
+        font-size: 1.6rem;
+    }
+
+    .logos-barra {
+        gap: 3rem;
+    }
+}
+/* ---------------------------------- */
+/* 13. SECCIÓN CTA FINAL            */
+/* ---------------------------------- */
+.cta-final-section {
+    /* Reutilizamos el fondo primario oscuro para un CTA fuerte */
+    background-color: var(--color-primario); 
+    color: var(--color-blanco);
+    padding: 8rem 0;
+    text-align: center;
+}
+
+.cta-final-section .container {
+    max-width: 800px; /* Limitamos ancho para centrar contenido */
+}
+
+.cta-final-section h2 {
+    color: var(--color-blanco);
+    font-size: 3.6rem;
+    margin-bottom: 2rem;
+}
+
+.cta-final-section p {
+    font-size: 1.8rem;
+    color: var(--color-fondo); /* Texto en gris claro para buen contraste */
+    margin-bottom: 3.5rem;
+}
+
+.cta-final-group {
+    display: flex;
+    flex-wrap: wrap; /* Permite que se apilen si no caben */
+    justify-content: center;
+    align-items: center;
+    gap: 2rem; /* Espacio entre botones */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: CTA Final            */
+/* ---------------------------------- */
+
+@media (max-width: 768px) {
+    .cta-final-section {
+        padding: 6rem 0;
+    }
+
+    .cta-final-section h2 {
+        font-size: 3rem;
+    }
+
+    .cta-final-group {
+        flex-direction: column; /* Apila los botones en móvil */
+        gap: 1.5rem;
+    }
+
+    /* Hacemos que los botones ocupen un ancho razonable en móvil */
+    .cta-final-group .btn {
+        width: 100%;
+        max-width: 350px;
+    }
+
+    /* El botón primario (naranja) y secundario (borde blanco) 
+       ya funcionan bien sobre este fondo oscuro. */
+}
+/* ---------------------------------- */
+/* 14. SECCIÓN FOOTER               */
+/* ---------------------------------- */
+.footer-section {
+    /* Fondo gris oscuro (casi negro) del branding */
+    background-color: var(--color-texto); 
+    color: var(--color-fondo); /* Texto en gris claro */
+    padding: 6rem 0 4rem 0;
+    font-size: 1.4rem; /* Texto más pequeño en el footer */
+}
+
+.footer-grid {
+    display: grid;
+    /* 4 columnas en desktop */
+    grid-template-columns: repeat(4, 1fr); 
+    gap: 3rem;
+    
+    /* Centramos el contenido dentro del .container */
+    max-width: var(--ancho-maximo);
+    margin: 0 auto;
+    padding: 0 2rem;
+}
+
+.footer-col {
+    /* Alineación vertical al inicio */
+    align-self: start; 
+}
+
+.footer-logo {
+    font-size: 2.8rem;
+    color: var(--color-blanco);
+    margin-bottom: 1.5rem;
+    font-weight: 700;
+}
+
+.footer-legal {
+    line-height: 1.7;
+    opacity: 0.8;
+}
+
+.footer-titulo-col {
+    font-size: 1.6rem;
+    color: var(--color-blanco);
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.footer-lista {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.footer-lista li {
+    margin-bottom: 1rem;
+}
+
+.footer-lista a,
+.footer-microcopy-legal a {
+    color: var(--color-fondo); /* Gris claro */
+    text-decoration: none;
+    opacity: 0.8;
+    transition: opacity 0.3s ease;
+}
+
+.footer-lista a:hover,
+.footer-microcopy-legal a:hover {
+    opacity: 1;
+    color: var(--color-acento); /* Naranja al hacer hover */
+}
+
+.footer-microcopy-legal {
+    color: var(--color-fondo);
+    opacity: 0.8;
+    line-height: 1.7;
+}
+
+.footer-microcopy-legal a {
+    text-decoration: underline; /* Subrayamos el link legal */
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Footer               */
+/* ---------------------------------- */
+
+@media (max-width: 900px) {
+    .footer-grid {
+        /* 2 columnas en tablets */
+        grid-template-columns: repeat(2, 1fr); 
+        gap: 4rem;
+    }
+}
+
+@media (max-width: 500px) {
+    .footer-grid {
+        /* 1 columna en móvil */
+        grid-template-columns: 1fr; 
+    }
+    
+    .footer-col {
+        text-align: left; /* Aseguramos alineación izquierda */
+    }
+}
+/* ---------------------------------- */
+/* 15. PÁGINA DE CONTACTO (Formulario) */
+/* ---------------------------------- */
+
+.header-simple {
+    background-color: var(--color-blanco);
+    padding: 2rem 0;
+    border-bottom: 1px solid #E0E0E0;
+}
+
+.header-simple-logo {
+    font-size: 2.8rem;
+    color: var(--color-primario);
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.form-section {
+    background-color: var(--color-fondo);
+    padding: 8rem 0;
+}
+
+.form-container {
+    max-width: 700px; /* Ancho ideal para formularios */
+    background-color: var(--color-blanco);
+    border: 1px solid #E0E0E0;
+    border-radius: var(--radio-borde);
+    padding: 4rem;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.form-container h2 {
+    text-align: center;
+    font-size: 3rem;
+    color: var(--color-primario);
+}
+
+.form-container p {
+    text-align: center;
+    font-size: 1.8rem;
+    margin-bottom: 3rem;
+}
+
+.form-group {
+    margin-bottom: 2rem;
+}
+
+.form-group label {
+    display: block;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--color-texto);
+    margin-bottom: 0.8rem;
+}
+
+/* Estilo para inputs y textarea */
+.form-group input[type="text"],
+.form-group input[type="tel"],
+.form-group input[type="email"],
+.form-group textarea {
+    width: 100%;
+    padding: 1.2rem;
+    font-size: 1.6rem;
+    font-family: var(--fuente-principal);
+    border: 1px solid #CCC;
+    border-radius: var(--radio-borde);
+    background-color: var(--color-blanco);
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.form-group input:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: var(--color-primario);
+    box-shadow: 0 0 0 3px rgba(15, 88, 104, 0.2);
+}
+
+.form-group textarea {
+    resize: vertical; /* Permite al usuario ajustar la altura */
+}
+
+.form-microcopy-legal {
+    font-size: 1.4rem;
+    color: #666;
+    text-align: center;
+    margin-top: -1rem;
+    margin-bottom: 2.5rem;
+}
+
+.form-microcopy-legal a {
+    color: var(--color-primario);
+    text-decoration: underline;
+}
+
+.btn-submit {
+    width: 100%; /* Botón de ancho completo */
+    padding: 1.5rem;
+    font-size: 1.8rem;
+}
+
+/* ---------------------------------- */
+/* RESPONSIVE: Formulario           */
+/* ---------------------------------- */
+@media (max-width: 768px) {
+    .form-section {
+        padding: 4rem 0;
+    }
+    .form-container {
+        padding: 3rem 2.5rem;
+    }
+}

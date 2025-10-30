@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <title>Contacto | TESIVIL</title>
+    <meta name="description" content="Contacta a TESIVIL para un piloto, demostración o para discutir tu proyecto de ingeniería y IoT.">
+    <meta name="robots" content="noindex, follow">
+
+    <link rel="stylesheet" href="css/style.css">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+    <header class="header-simple">
+        <div class="container">
+            <a href="/" class="header-simple-logo">TESIVIL</a>
+        </div>
+    </header>
+
+    <section class="form-section">
+        <div class="container form-container">
+            <h2>Cuéntanos sobre tu proyecto</h2>
+            <p>Un ingeniero se pondrá en contacto contigo (no un vendedor).</p>
+
+            <form id="contactForm" action="/api/contacto" method="POST">
+                
+                <div class="form-group">
+                    <label for="nombre">Nombre completo</label>
+                    <input type="text" id="nombre" name="nombre" placeholder="Tu nombre" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="empresa">Empresa / Obra</label>
+                    <input type="text" id="empresa" name="empresa" placeholder="Nombre de tu compañía u obra">
+                </div>
+
+                <div class="form-group">
+                    <label for="telefono">Teléfono</label>
+                    <input type="tel" id="telefono" name="telefono" placeholder="+52 33 XXXX XXXX" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="email">Email de contacto</label>
+                    <input type="email" id="email" name="email" placeholder="tu.correo@ejemplo.com" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="mensaje">¿En qué podemos ayudarte?</label>
+                    <textarea id="mensaje" name="mensaje" rows="6" placeholder="Describe brevemente tu necesidad o proyecto..." required></textarea>
+                </div>
+                
+                <input type="hidden" id="origen" name="origen" value="desconocido">
+
+                <p class="form-microcopy-legal">
+                    Al enviar este formulario aceptas nuestro <a href="/aviso-privacidad" target="_blank">Aviso de Privacidad</a>.
+                </p>
+
+                <div class="form-group">
+                    <button type="submit" class="btn btn-primario btn-submit">Solicitar contacto</button>
+                </div>
+            </form>
+
+            <div id="formStatus" class="form-status-message" style="display: none;"></div>
+            
+        </div>
+    </section>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 1. Leer el parámetro 'origen' de la URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const origenValue = urlParams.get('origen') || 'contacto_directo';
+            
+            // 2. Asignar ese valor al campo oculto del formulario
+            const origenInput = document.getElementById('origen');
+            if (origenInput) {
+                origenInput.value = origenValue;
+            }
+        });
+    </script>
+
+</body>
+<script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 1. Leer el parámetro 'origen' de la URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const origenValue = urlParams.get('origen') || 'contacto_directo';
+            
+            // 2. Asignar ese valor al campo oculto del formulario
+            const origenInput = document.getElementById('origen');
+            if (origenInput) {
+                origenInput.value = origenValue;
+            }
+
+            // 3. Manejar el envío del formulario
+            const form = document.getElementById('contactForm');
+            const formStatus = document.getElementById('formStatus');
+
+            if (form) {
+                form.addEventListener('submit', function(e) {
+                    // Prevenimos el envío tradicional (que recarga la página)
+                    e.preventDefault(); 
+
+                    const submitButton = form.querySelector('.btn-submit');
+                    submitButton.disabled = true;
+                    submitButton.textContent = 'Enviando...';
+
+                    // Convertimos los datos del formulario a un objeto simple
+                    const formData = new FormData(form);
+                    const data = Object.fromEntries(formData.entries());
+
+                    // Esta es la URL completa de tu backend que está corriendo
+                    const endpoint = '/api/contacto'; 
+
+                    // 4. Usamos fetch para enviar los datos al backend
+                    fetch(endpoint, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(data),
+                    })
+                    .then(response => response.json())
+                    .then(result => {
+                        // 5. Mostramos el mensaje de respuesta del servidor
+                        formStatus.textContent = result.message;
+                        formStatus.style.display = 'block';
+
+                        if (result.success) {
+                            // Éxito: Ocultamos el formulario y mostramos mensaje
+                            formStatus.style.color = 'var(--color-primario)';
+                            form.style.display = 'none'; // Oculta el formulario
+                            
+                            // Hacemos scroll hacia el mensaje de éxito
+                            formStatus.scrollIntoView({ behavior: 'smooth' });
+                        } else {
+                            // Error: Mostramos mensaje de error y reactivamos el botón
+                            formStatus.style.color = '#D00000'; // Un color de error
+                            submitButton.disabled = false;
+                            submitButton.textContent = 'Solicitar contacto';
+                        }
+                    })
+                    .catch(error => {
+                        // 6. Manejamos errores de red (ej: backend caído)
+                        console.error('Error en fetch:', error);
+                        formStatus.textContent = 'Error de conexión. Por favor, intenta más tarde.';
+                        formStatus.style.color = '#D00000';
+                        formStatus.style.display = 'block';
+                        submitButton.disabled = false;
+                        submitButton.textContent = 'Solicitar contacto';
+                    });
+                });
+            }
+        });
+    </script>
+
+</body>
+
+</html>
