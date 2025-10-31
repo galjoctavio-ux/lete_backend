@@ -1,10 +1,11 @@
 # -------------------------------------------------------------------
-# Script Vigilante de Calidad de Energía v2.3 (Detección Estadística)
+# Script Vigilante de Calidad de Energía v2.4 (Integración con Telegram)
 # - Implementa detección de anomalías con media y varianza móvil (EWMA).
 # - Utiliza una columna JSONB en la BD para almacenar estadísticas.
 # - Agrupa el día en 5 bloques de comportamiento para mayor precisión.
 # - Requiere 2 "strikes" consecutivos para enviar una alerta de anomalía.
 # - MODIFICADO: Incluye chequeo de primera medición para enviar felicitación.
+# - AÑADIDO: Envío de alertas dual a WhatsApp y Telegram.
 # -------------------------------------------------------------------
 
 # --- 1. Importaciones ---
@@ -26,33 +27,45 @@ from influxdb_client import InfluxDBClient
 load_dotenv()
 
 # --- 3. Configuración General ---
-ENVIAR_WHATSAPP = True
+ENVIAR_ALERTAS = True # Interruptor general para ambas plataformas
 
 DB_HOST = os.environ.get("DB_HOST")
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
+DB_PORT = os.environ.get("DB_PORT", "5432") # Añadido para la conexión principal
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_URL = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
 ADMIN_WHATSAPP_NUMBER = os.environ.get("ADMIN_WHATSAPP_NUMBER")
+
 INFLUX_URL = os.environ.get("INFLUX_URL")
 INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN")
 INFLUX_ORG = os.environ.get("INFLUX_ORG")
 INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET_NEW")
 
+# --- ¡NUEVAS VARIABLES DE TELEGRAM! ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+ADMIN_TELEGRAM_CHAT_ID = os.environ.get("ADMIN_TELEGRAM_CHAT_ID")
+
+# --- Plantillas de Twilio ---
 TPL_PICOS_VOLTAJE = os.environ.get("TPL_PICOS_VOLTAJE")
 TPL_BAJO_VOLTAJE = os.environ.get("TPL_BAJO_VOLTAJE")
 TPL_FUGA_CORRIENTE = os.environ.get("TPL_FUGA_CORRIENTE")
 TPL_BRINCO_ESCALON = os.environ.get("TPL_BRINCO_ESCALON")
 TPL_CONSUMO_FANTASMA = os.environ.get("TPL_CONSUMO_FANTASMA")
 TPL_DISPOSITIVO_OFFLINE = os.environ.get("TPL_DISPOSITIVO_OFFLINE")
-
-# --- ¡NUEVA VARIABLE REQUERIDA! ---
-# Añade esta variable a tu archivo .env con el SID de la plantilla de Twilio
 TPL_FELICITACION_CONEXION = os.environ.get("TPL_FELICITACION_CONEXION")
+
+# (Variables de plantillas de alerta_diaria, cargadas para el formateador)
+CONTENT_SID_AVISO_CORTE_3DIAS = os.environ.get("CONTENT_SID_AVISO_CORTE_3DIAS")
+CONTENT_SID_DIA_DE_CORTE = os.environ.get("CONTENT_SID_DIA_DE_CORTE")
+CONTENT_SID_REPORTE_INICIAL = os.environ.get("CONTENT_SID_REPORTE_INICIAL")
+CONTENT_SID_REPORTE_MAS = os.environ.get("CONTENT_SID_REPORTE_MAS")
+CONTENT_SID_REPORTE_MENOS = os.environ.get("CONTENT_SID_REPORTE_MENOS")
+CONTENT_SID_RECORDATORIO_CONEXION = os.environ.get("CONTENT_SID_RECORDATORIO_CONEXION")
 
 # Lógica de Negocio y Reglas
 ZONA_HORARIA_LOCAL = pytz.timezone('America/Mexico_City')
@@ -78,16 +91,19 @@ def obtener_clientes(conn):
     try:
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
+        # --- ¡CONSULTA MODIFICADA! ---
         cursor.execute("""
             SELECT 
                 d.device_id, 
-                c.telefono_whatsapp, c.nombre, c.dia_de_corte, c.tipo_tarifa, c.ciclo_bimestral,
+                c.telefono_whatsapp, 
+                c.telegram_chat_id,                 -- <-- AÑADIDO
+                c.nombre, c.dia_de_corte, c.tipo_tarifa, c.ciclo_bimestral,
                 c.notificacion_escalon1_enviada, c.notificacion_escalon2_enviada,
                 c.estadisticas_consumo,
                 c.lectura_medidor_inicial,  
                 c.fecha_inicio_servicio,    
                 c.lectura_cierre_periodo_anterior,
-                c.primera_medicion_recibida       -- <-- ¡NUEVO CAMPO!
+                c.primera_medicion_recibida
             FROM clientes c
             JOIN dispositivos_lete d ON c.id = d.cliente_id
             WHERE c.subscription_status = 'active'
@@ -103,7 +119,7 @@ def obtener_clientes(conn):
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def enviar_alerta_whatsapp(telefono_destino, content_sid, content_variables):
     """Envía un mensaje de WhatsApp o lo simula en pantalla según el interruptor."""
-    if not ENVIAR_WHATSAPP:
+    if not ENVIAR_ALERTAS:
         print("\n--- SIMULACIÓN DE ALERTA WHATSAPP (Envío desactivado) ---")
         print(f"    -> Destinatario: {telefono_destino}")
         print(f"    -> Plantilla (SID): {content_sid}")
@@ -121,12 +137,111 @@ def enviar_alerta_whatsapp(telefono_destino, content_sid, content_variables):
         "To": f"whatsapp:{telefono_destino}"
     }
     print(f"\nEnviando WhatsApp (Plantilla {content_sid}) a: {telefono_destino}...")
-    response = requests.post(TWILIO_URL, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), data=payload)
-    if response.status_code == 201:
-        print(f"✔️ Alerta enviada exitosamente.")
+    try:
+        response = requests.post(TWILIO_URL, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), data=payload)
+        if response.status_code == 201:
+            print(f"✔️ Alerta enviada exitosamente.")
+        else:
+            print(f"⚠️  Error al enviar alerta. Código: {response.status_code}, Respuesta: {response.text}")
+            response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ERROR de conexión al enviar alerta de WhatsApp: {e}")
+        raise
+
+# --- ¡NUEVAS FUNCIONES DE TELEGRAM! ---
+
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
+def enviar_alerta_telegram(chat_id, message_text):
+    """Envía un mensaje de Telegram o lo simula en pantalla."""
+    if not ENVIAR_ALERTAS:
+        print("\n--- SIMULACIÓN DE ALERTA TELEGRAM (Envío desactivado) ---")
+        print(f"    -> Destinatario (Chat ID): {chat_id}")
+        print(f"    -> Mensaje: {message_text}")
+        print("---------------------------------------------------------")
+        return
+
+    if not chat_id or not message_text:
+        print(f"⚠️  Chat ID ({chat_id}) o Mensaje ({message_text}) vacío. No se envía alerta de Telegram.")
+        return
+    
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠️ ⚠️  ADVERTENCIA: TELEGRAM_BOT_TOKEN no está configurado en .env. No se puede enviar alerta.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message_text,
+        'parse_mode': 'Markdown' # Habilitamos Markdown para **negritas**, *cursivas*, etc.
+    }
+    
+    print(f"\nEnviando Telegram a: {chat_id}...")
+    try:
+        response = requests.post(url, data=payload, timeout=5)
+        response_json = response.json()
+        
+        if response.status_code == 200 and response_json.get('ok'):
+            print(f"✔️ Alerta de Telegram enviada exitosamente.")
+        else:
+            error_msg = response_json.get('description', response.text)
+            print(f"⚠️  Error al enviar alerta de Telegram. Código: {response.status_code}, Respuesta: {error_msg}")
+            response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ERROR de conexión al enviar alerta de Telegram: {e}")
+        raise # Re-lanza para que tenacity pueda reintentar
+
+def formatear_mensaje_telegram(template_sid, variables):
+    """
+    Traduce las plantillas de Twilio a mensajes de texto para Telegram.
+    ¡REVISA Y AJUSTA ESTOS MENSAJES A TU GUSTO!
+    """
+    
+    # --- Plantillas de vigilante_calidad.py ---
+    if template_sid == TPL_FELICITACION_CONEXION:
+        return f"¡Felicidades {variables.get('1', 'usuario')}! Tu dispositivo LETE se ha conectado por primera vez. 🎉\n\nYa estás monitoreando tu consumo."
+    
+    elif template_sid == TPL_PICOS_VOLTAJE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos *{variables.get('2', 'varios')} picos de alto voltaje* en tu instalación. ⚡️\nTe recomendamos usar reguladores en aparatos sensibles."
+    
+    elif template_sid == TPL_BAJO_VOLTAJE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos *voltaje bajo* en tu instalación. Esto puede dañar motores y compresores (ej. refrigerador). 📉"
+        
+    elif template_sid == TPL_FUGA_CORRIENTE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos una posible *fuga de corriente*. ⚠️\nEsto puede aumentar tu recibo y es un riesgo. Te recomendamos contactar a un electricista."
+        
+    elif template_sid == TPL_BRINCO_ESCALON:
+        return f"Hola {variables.get('1', 'usuario')}, has superado un escalón de CFE. 📈\nTu tarifa para el consumo excedente ahora es de *${variables.get('2', 'X.XX')} por kWh*."
+        
+    elif template_sid == TPL_CONSUMO_FANTASMA:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos un consumo inusual a las {variables.get('2', 'HH:MM')}. 👻\nTu consumo aumentó un *{variables.get('3', 'X')}%* comparado con tu promedio para esa hora."
+        
+    elif template_sid == TPL_DISPOSITIVO_OFFLINE:
+        return f"ALERTA ADMIN: El dispositivo de *{variables.get('1', 'Cliente')}* está offline. 🚫"
+
+    # --- Plantillas de alerta_diaria.py ---
+    elif template_sid == CONTENT_SID_AVISO_CORTE_3DIAS:
+        return f"Hola {variables.get('1', 'usuario')}, te recordamos que tu fecha de corte es el *{variables.get('2', 'fecha')}*. 🗓"
+        
+    elif template_sid == CONTENT_SID_DIA_DE_CORTE:
+        return f"Hola {variables.get('1', 'usuario')}, ¡hoy es tu día de corte! ✂️\n\nTu consumo final del periodo fue de *{variables.get('2', 'X.XX')} kWh*, con un costo estimado de *${variables.get('3', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_REPORTE_INICIAL:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh*.\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados. 📊"
+        
+    elif template_sid == CONTENT_SID_REPORTE_MAS:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 🔺 (más alto que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_REPORTE_MENOS:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 👇 (más bajo que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_RECORDATORIO_CONEXION:
+        return f"Hola {variables.get('1', 'usuario')}, notamos que aún no has conectado tu dispositivo LETE. ¡Conéctalo para empezar a monitorear! 🔌"
+        
     else:
-        print(f"⚠️  Error al enviar alerta. Código: {response.status_code}, Respuesta: {response.text}")
-        response.raise_for_status()
+        print(f"⚠️  ADVERTENCIA: Plantilla desconocida en formatear_mensaje_telegram: {template_sid}")
+        return f"Alerta del sistema (SID: {template_sid}). Variables: {json.dumps(variables)}"
+
+# --- Fin de Funciones de Telegram ---
 
 def marcar_notificacion_enviada(conn, device_id, tipo_bandera):
     """Actualiza una bandera de notificación en la base de datos."""
@@ -259,9 +374,9 @@ def obtener_datos_influx_dataframe(device_id, minutos_atras):
         print(f"❌ ERROR al consultar InfluxDB (DataFrame) para {device_id}: {e}")
         return None
 
-# --- Funciones de Verificación de Alertas ---
+# --- Funciones de Verificación de Alertas (MODIFICADAS) ---
 
-# --- ¡NUEVA FUNCIÓN! ---
+# --- ¡FUNCIÓN MODIFICADA! ---
 def verificar_primera_medicion(conn, cliente):
     """Verifica si es la primera medición y envía felicitación."""
     if cliente['primera_medicion_recibida']:
@@ -281,7 +396,11 @@ def verificar_primera_medicion(conn, cliente):
             print("⚠️ ⚠️  ADVERTENCIA: TPL_FELICITACION_CONEXION no está configurado en .env. No se puede enviar felicitación.")
         else:
             variables = {"1": cliente['nombre']}
+            
+            # Enviar a ambos canales
+            mensaje_telegram = formatear_mensaje_telegram(TPL_FELICITACION_CONEXION, variables)
             enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_FELICITACION_CONEXION, variables)
+            enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
         
         # 2. Actualizar la bandera en la BD
         try:
@@ -312,15 +431,20 @@ def verificar_dispositivo_offline(df, cliente):
     # --- FIN DE GUARDIA ---
 
     print("-> Verificando estado de conexión...")
+    variables = {"1": cliente['nombre']}
+    mensaje_telegram = formatear_mensaje_telegram(TPL_DISPOSITIVO_OFFLINE, variables)
+        
     if df is None:
-        enviar_alerta_whatsapp(ADMIN_WHATSAPP_NUMBER, TPL_DISPOSITIVO_OFFLINE, {"1": cliente['nombre']})
+        enviar_alerta_whatsapp(ADMIN_WHATSAPP_NUMBER, TPL_DISPOSITIVO_OFFLINE, variables)
+        enviar_alerta_telegram(ADMIN_TELEGRAM_CHAT_ID, mensaje_telegram)
         return
 
     ultima_medicion = df['timestamp_servidor'].max()
     minutos_desde_ultima_medicion = (datetime.now(ZONA_HORARIA_LOCAL) - ultima_medicion).total_seconds() / 60
     
     if minutos_desde_ultima_medicion > 25:
-        enviar_alerta_whatsapp(ADMIN_WHATSAPP_NUMBER, TPL_DISPOSITIVO_OFFLINE, {"1": cliente['nombre']})
+        enviar_alerta_whatsapp(ADMIN_WHATSAPP_NUMBER, TPL_DISPOSITIVO_OFFLINE, variables)
+        enviar_alerta_telegram(ADMIN_TELEGRAM_CHAT_ID, mensaje_telegram)
         
 def verificar_voltaje(df, cliente):
     if df is None: return
@@ -329,12 +453,18 @@ def verificar_voltaje(df, cliente):
     picos_altos = df[df['vrms'] > UMBRAL_VOLTAJE_ALTO].shape[0]
     if picos_altos >= CANTIDAD_EVENTOS_VOLTAJE_PARA_ALERTA:
         variables = {"1": cliente['nombre'], "2": str(picos_altos)}
+        
+        mensaje_telegram = formatear_mensaje_telegram(TPL_PICOS_VOLTAJE, variables)
         enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_PICOS_VOLTAJE, variables)
+        enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
 
     picos_bajos = df[df['vrms'] < UMBRAL_VOLTAJE_BAJO].shape[0]
     if picos_bajos >= CANTIDAD_EVENTOS_VOLTAJE_PARA_ALERTA:
         variables = {"1": cliente['nombre']}
+        
+        mensaje_telegram = formatear_mensaje_telegram(TPL_BAJO_VOLTAJE, variables)
         enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_BAJO_VOLTAJE, variables)
+        enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
 
 def verificar_fuga_corriente(df, cliente):
     if df is None: return
@@ -343,7 +473,10 @@ def verificar_fuga_corriente(df, cliente):
     fuga_promedio = df['leakage'].mean()
     if fuga_promedio > UMBRAL_FUGA_CORRIENTE:
         variables = {"1": cliente['nombre']}
+        
+        mensaje_telegram = formatear_mensaje_telegram(TPL_FUGA_CORRIENTE, variables)
         enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_FUGA_CORRIENTE, variables)
+        enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
 
 def verificar_anomalia_consumo(conn, df, cliente):
     """Compara el consumo actual con el perfil estadístico del cliente."""
@@ -386,7 +519,11 @@ def verificar_anomalia_consumo(conn, df, cliente):
             porcentaje = ((consumo_actual / media - 1) * 100) if media > 0 else 0
             hora_legible = ahora.strftime('%I:%M %p')
             variables = {"1": cliente['nombre'], "2": hora_legible, "3": f"{porcentaje:.0f}"}
+            
+            mensaje_telegram = formatear_mensaje_telegram(TPL_CONSUMO_FANTASMA, variables)
             enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_CONSUMO_FANTASMA, variables)
+            enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
+            
             stats_bloque['strikes'] = 0
     else:
         stats_bloque['strikes'] = 0
@@ -478,20 +615,23 @@ def verificar_brinco_escalon(conn, cliente):
         bandera_notificacion = f"notificacion_{umbral['bandera']}_enviada"
         if kwh_acumulados > umbral['limite'] and not cliente[bandera_notificacion]:
             variables = {"1": cliente['nombre'], "2": f"{umbral['precio_siguiente']:.2f}"}
+            
+            mensaje_telegram = formatear_mensaje_telegram(TPL_BRINCO_ESCALON, variables)
             enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_BRINCO_ESCALON, variables)
+            enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
+            
             marcar_notificacion_enviada(conn, device_id, bandera_notificacion)
             break    
                 
 # --- 5. EJECUCIÓN PRINCIPAL (CORREGIDA Y MODIFICADA) ---
 def main():
     print("=" * 50)
-    print(f"--- Iniciando VIGILANTE v2.3 ({datetime.now(ZONA_HORARIA_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}) ---")
+    print(f"--- Iniciando VIGILANTE v2.4 ({datetime.now(ZONA_HORARIA_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
     conn = None
     try:
         # --- INICIO DE LA CORRECCIÓN ---
         # Ambas líneas deben estar indentadas para pertenecer al bloque 'try'
-        DB_PORT = os.environ.get("DB_PORT", "5432")
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
         # --- FIN DE LA CORRECCIÓN ---
         print("✅ Conexión con Base de Datos exitosa.")
@@ -526,7 +666,7 @@ def main():
         conn.close()
         print("\n🔌 Conexión con Base de Datos cerrada.")
 
-    print("\n--- VIGILANTE v2.3 completado. ---")
+    print(f"\n--- VIGILANTE v2.4 (con Telegram) completado. ---")
     print("=" * 50)
 
 if __name__ == "__main__":

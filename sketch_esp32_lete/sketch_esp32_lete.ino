@@ -1,6 +1,6 @@
 /*
 ==========================================================================
-== FIRMWARE CUENTATRÓN - MONITOR DE ENERGÍA v14.0
+== FIRMWARE CUENTATRÓN - MONITOR DE ENERGÍA v15.0
 ==
 == ARQUITECTURA:
 == - Núcleo 1 (Medición): 100% autónomo, prioriza la escritura en SD.
@@ -11,8 +11,8 @@
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
-#include <ESPmDNS.h>
-#include <ArduinoOTA.h>
+// #include <ESPmDNS.h>      // <-- CAMBIO: Eliminado. No se necesita para Arduino OTA.
+// #include <ArduinoOTA.h>   // <-- CAMBIO: Eliminado. Actualización solo por HTTP OTA.
 #include <DNSServer.h>
 #include <WiFiManager.h>
 #include <Wire.h>
@@ -33,9 +33,10 @@
 #include <Adafruit_NeoPixel.h>
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 14.0; // Actualizado a la nueva arquitectura
+// <-- CAMBIO: Actualizada la versión para reflejar las nuevas características
+const float FIRMWARE_VERSION = 15.0; 
 const bool OLED_CONECTADA = true;
-const bool DEBUG_MODE = true;
+const bool DEBUG_MODE = false;
 
 // --- 3. CONFIGURACIÓN DE PINES ---
 #define BUTTON_PIN 13
@@ -64,8 +65,11 @@ const unsigned long MESSENGER_CYCLE_DELAY_MS = 5000;
 
 // --- 4B. LÍMITES Y PARÁMETROS DE OPERACIÓN (NUEVO) ---
 #define WDT_TIMEOUT_SECONDS 180         // Límite del Watchdog
+// <-- CAMBIO: Añadida constante para el botón de mantenimiento (5 seg)
+const unsigned long MAINTENANCE_PRESS_DURATION_MS = 5000; 
 #define LONG_PRESS_DURATION_MS 10000    // Pulsación larga para reset WiFi
-const uint64_t MAX_SD_USAGE_BYTES = 50ULL * 1024ULL * 1024ULL; // 50MB
+// <-- CAMBIO: Aumentado el límite a 14,000 MB (aprox 14GB)
+const uint64_t MAX_SD_USAGE_BYTES = 14000ULL * 1024ULL * 1024ULL; // 14,000MB
 const int FILES_TO_PURGE_ON_FULL = 10;  // Cuántos archivos borrar si la SD se llena
 // Límites de validación
 const float VALIDATION_VOLTAGE_MIN = 50.0;
@@ -109,12 +113,14 @@ float phase_cal = 1.7;
 SemaphoreHandle_t sharedVarsMutex;
 float latest_vrms = 0.0, latest_irms_phase = 0.0, latest_irms_neutral = 0.0;
 float latest_power = 0.0, latest_leakage = 0.0, latest_temp_cpu = 0.0;
-bool subscription_active = false;
-bool pago_vencido = false;
-int dias_de_gracia_restantes = 0;
-String sub_next_payment_str = "--/--/----";
-long sub_active_until_ts = 0;
+// <-- CAMBIO: Eliminadas variables de suscripción (no se usan)
+// bool subscription_active = false;
+// bool pago_vencido = false;
+// int dias_de_gracia_restantes = 0;
+// String sub_next_payment_str = "--/--/----";
+// long sub_active_until_ts = 0;
 bool time_synced = false; // Solo indica si NTP ha corrido, ya no bloquea
+volatile bool mqtt_connected_status = false; // <-- AÑADIR ESTA LÍNEA
 
 // Variables para "Batching" en SD
 const int BATCH_SIZE = 10; // Número de mediciones por archivo
@@ -125,6 +131,8 @@ TaskHandle_t writerTaskHandle;
 TaskHandle_t messengerTaskHandle;
 volatile bool ota_update_request = false;
 volatile bool factory_reset_request = false; // Bandera para el reseteo por botón
+// <-- CAMBIO: Añadida bandera volátil para la nueva solicitud de mantenimiento
+volatile bool maintenance_request = false; 
 int screen_mode = 0;
 unsigned long last_screen_change_time = 0;
 unsigned long button_press_start_time = 0;
@@ -152,21 +160,30 @@ void applyCalibration(); // <-- AÑADIDA: Función para aplicar calibración "en
 void handleFactoryReset();
 bool handleRemoteTasks(); // <-- AÑADIDO: Declaración explícita
 void checkForHttpUpdate(); // <-- AÑADIDO: Declaración explícita
+// <-- CAMBIO: Añadida la declaración de la función de mantenimiento
+void runMaintenanceWindow();
+
 
 // --- 8. INCLUSIÓN DE ARCHIVOS SEPARADOS ---
 #include "oled_screens.h"
 
 // =========================================================================
-// === TAREA 1: ESCRITOR (NÚCLEO 1) - v14.1 (Robusto)
+// === TAREA 1: ESCRITOR (NÚCLEO 1) - v15.0 (Con lógica de botón multi-nivel)
 // === Misión: Medir y guardar en SD. Autorecuperable.
 // =========================================================================
 void writerTask(void * pvParameters) {
     if(DEBUG_MODE) Serial.println("[N1] Tarea de Escritura iniciada en Núcleo 1.");
-    esp_task_wdt_add(NULL);
+    esp_task_wdt_add(NULL); // Añadir esta tarea al Watchdog
 
     unsigned long last_measurement_time = 0;
     const int lecturas_a_descartar = 5;
     int lecturas_descartadas = 0;
+    
+    // <-- CAMBIO: Añadidas variables estáticas para la lógica de pulsación
+    // Estas variables mantienen su valor entre bucles de la tarea
+    static bool maint_triggered_this_press = false;
+    static bool reset_triggered_this_press = false;
+
     
     for (;;) { // <-- INICIO DEL BUCLE INFINITO PRINCIPAL
         esp_task_wdt_reset();
@@ -302,31 +319,66 @@ void writerTask(void * pvParameters) {
             }
         } // Fin de if (measurement interval)
         
-        // --- 3. SECCIÓN DE GESTIÓN DE PANTALLA Y BOTÓN (SIMPLIFICADO) ---
+        // --- 3. SECCIÓN DE GESTIÓN DE PANTALLA Y BOTÓN (v15.0) ---
         
-        // (SIMPLIFICADO) --- Lógica de Botón (Solo Pulsación Larga) ---
-        if (digitalRead(BUTTON_PIN) == LOW) {
+        // <-- CAMBIO: Lógica de Botón Multi-Nivel (5s y 10s) -->
+        if (digitalRead(BUTTON_PIN) == LOW) { // Botón está presionado
+            
             if (!button_is_pressed) {
-                button_press_start_time = currentMillis;
+                // --- INICIO DE PULSACIÓN ---
+                // Es la primera vez que detectamos la pulsación
                 button_is_pressed = true;
-            } else if (currentMillis - button_press_start_time > LONG_PRESS_DURATION_MS) {
-                
-                drawGenericMessage("Reseteo WiFi", "Solicitado...");
-                pixels.setPixelColor(0, pixels.Color(255, 0, 255)); pixels.show();
-                
-                factory_reset_request = true; 
-                
-                button_is_pressed = false; // Evita que se repita la solicitud
-                delay(2000); // Pausa para que el usuario vea el mensaje
+                button_press_start_time = currentMillis;
+                // Reseteamos las banderas de acción para esta *nueva* pulsación
+                maint_triggered_this_press = false; 
+                reset_triggered_this_press = false;
+            
+            } else {
+                // --- BOTÓN SE MANTIENE PRESIONADO ---
+                unsigned long press_duration = currentMillis - button_press_start_time;
+
+                // Chequear Nivel 2 (10 seg): Reseteo de Fábrica
+                // Se comprueba primero la acción de MÁS tiempo
+                if (press_duration > LONG_PRESS_DURATION_MS && !reset_triggered_this_press) {
+                    reset_triggered_this_press = true;
+                    maint_triggered_this_press = true; // El reseteo anula (incluye) el mantenimiento
+                    
+                    factory_reset_request = true; // Activar bandera para Núcleo 0
+                    
+                    // Mostrar feedback visual
+                    drawGenericMessage("Reseteo WiFi", "Solicitado...");
+                    pixels.setPixelColor(0, pixels.Color(255, 0, 255)); pixels.show(); // Magenta
+                    
+                    // Pausar esta tarea (Núcleo 1) para que el usuario vea el mensaje
+                    // Usamos vTaskDelay por ser seguro con RTOS
+                    vTaskDelay(pdMS_TO_TICKS(2000)); 
+                }
+                // Chequear Nivel 1 (5 seg): Mantenimiento
+                else if (press_duration > MAINTENANCE_PRESS_DURATION_MS && !maint_triggered_this_press) {
+                    maint_triggered_this_press = true;
+                    
+                    maintenance_request = true; // Activar bandera para Núcleo 0
+
+                    // Mostrar feedback visual
+                    drawGenericMessage("Mantenimiento", "Solicitado...");
+                    pixels.setPixelColor(0, pixels.Color(0, 255, 255)); pixels.show(); // Cian
+                    
+                    // Pausar esta tarea (Núcleo 1) para que el usuario vea el mensaje
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
             }
-        } else {
-            // (SIMPLIFICADO) Se eliminó la lógica de "pulsación corta"
-            button_is_pressed = false;
+
+        } else { // Botón NO está presionado
+            // --- BOTÓN SUELTO ---
+            button_is_pressed = false; // Rearmar el sistema para la próxima pulsación
         }
 
-        // (SIMPLIFICADO) --- Lógica de Pantalla (Solo Consumo) ---
+        // --- Lógica de Pantalla (Solo Consumo) ---
         if (OLED_CONECTADA) {
             // (SIMPLIFICADO) Se eliminó toda la rotación, modos y chequeo de pago.
+            // NOTA: Esta línea sobrescribirá los mensajes de "Mantenimiento" o "Reseteo"
+            // después de que la pausa de 2s termine. Esto es correcto,
+            // la pantalla debe volver a mostrar el consumo normal.
             drawConsumptionScreen();
         }
         
@@ -335,14 +387,13 @@ void writerTask(void * pvParameters) {
 }
 
 // =========================================================================
-// === TAREA 2: MENSAJERO (NÚCLEO 0) - v14.1 (Robusto)
+// === TAREA 2: MENSAJERO (NÚCLEO 0) - v15.0 (Robusto)
 // === Misión: Gestionar WiFi/MQTT, enviar datos y ejecutar mantenimiento.
 // =========================================================================
 void messengerTask(void * pvParameters) {
     if(DEBUG_MODE) Serial.println("[N0] Tarea de Mensajero iniciada en Núcleo 0.");
     esp_task_wdt_add(NULL);
     
-    // (CAMBIO) Variables para chequeos periódicos eliminadas (last_server_check, last_ntp_attempt)
     bool maintenance_window_triggered = false; // Para que el mantenimiento corra solo una vez
     const int MAINTENANCE_HOUR = 3; // 3 AM
     const int MAINTENANCE_MINUTE = 0; // 3:00 AM
@@ -352,25 +403,47 @@ void messengerTask(void * pvParameters) {
 
         // --- 1. TAREAS INMEDIATAS (NO REQUIEREN WIFI) ---
         esp_task_wdt_reset();
-        ArduinoOTA.handle(); // Siempre escuchar por peticiones OTA
-
-        // Chequear si el Núcleo 1 (botón) solicitó un reseteo de WiFi
+        // <-- CAMBIO: Eliminado ArduinoOTA.handle(). Ya no se usa OTA local.
+        
+        // <-- CAMBIO: Añadidas banderas para ambas solicitudes del Núcleo 1
         bool reset_solicitado = false;
+        bool maint_solicitado = false; 
+
+        // <-- CAMBIO: Chequeo de banderas de solicitud (Mantenimiento y Reseteo)
         if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            
             if (factory_reset_request) { 
                 reset_solicitado = true;
                 factory_reset_request = false; // Bajar la bandera
             }
+            
+            // <-- CAMBIO: Chequear la nueva bandera de mantenimiento
+            if (maintenance_request) { 
+                maint_solicitado = true;
+                maintenance_request = false; // Bajar la bandera
+            }
+
             xSemaphoreGive(sharedVarsMutex);
         }
 
+        // Ejecutar Reseteo (si se solicitó)
         if (reset_solicitado) {
             if (DEBUG_MODE) Serial.println("[N0] Reseteo de WiFi solicitado. Borrando credenciales...");
             drawGenericMessage("Reseteo WiFi", "Borrando...");
             WiFiManager wm;
             wm.resetSettings();
-            delay(2000);
+            // <-- CAMBIO: Reemplazado delay() por vTaskDelay() para seguridad de RTOS.
+            vTaskDelay(pdMS_TO_TICKS(2000)); 
             ESP.restart(); // Forzar reinicio para entrar al portal
+        }
+        
+        // <-- CAMBIO: Implementación de la solicitud de mantenimiento por botón
+        // Se ejecuta si se presionó el botón (y no se está reseteando)
+        if (maint_solicitado) {
+            if (DEBUG_MODE) Serial.println("[N0] Mantenimiento (por boton) solicitado. Ejecutando...");
+            // Se llama a la misma función que se usa a las 3 AM.
+            // Esta función AHORA podrá retornar sin reiniciar (lo haremos en la Parte 4).
+            runMaintenanceWindow(); 
         }
         
         // --- 2. GESTIÓN DE CONEXIÓN WIFI ---
@@ -389,7 +462,8 @@ void messengerTask(void * pvParameters) {
                 wm.setConnectTimeout(300); // 5 minutos
                 if (!wm.autoConnect("LETE-Monitor-Config")) {
                     Serial.println("[N0] Fallo al conectar desde el portal. Reiniciando...");
-                    delay(3000);
+                    // <-- CAMBIO: Reemplazado delay() por vTaskDelay()
+                    vTaskDelay(pdMS_TO_TICKS(3000));
                     ESP.restart();
                 }
                 Serial.println("[N0] WiFi conectado vía Portal.");
@@ -410,11 +484,27 @@ void messengerTask(void * pvParameters) {
         // --- 3. MANTENIMIENTO DE CONEXIÓN MQTT ---
         if (client.connected()) {
             client.loop(); 
+            // <-- INICIO DE CAMBIO: Actualizar bandera para OLED
+            if (!mqtt_connected_status) { // Solo escribir si cambia
+                 if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    mqtt_connected_status = true;
+                    xSemaphoreGive(sharedVarsMutex);
+                 }
+            }
+            // <-- FIN DE CAMBIO
+        } else {
+            // <-- INICIO DE CAMBIO: Actualizar bandera para OLED
+            if (mqtt_connected_status) { // Solo escribir si cambia
+                 if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    mqtt_connected_status = false;
+                    xSemaphoreGive(sharedVarsMutex);
+                 }
+            }
+            // <-- FIN DE CAMBIO
         }
 
         // --- 4. TAREAS PERIÓDICAS (SUPABASE Y OTA HTTP) ---
-        // (CAMBIO) Esta sección fue eliminada. Ya no se checa el servidor
-        // periódicamente, solo durante la ventana de mantenimiento.
+        // (Esta sección se mantiene eliminada, es correcto)
 
         // --- 5. LÓGICA DE CONEXIÓN MQTT (SI ES NECESARIO) ---
         if (!client.connected()) {
@@ -425,10 +515,8 @@ void messengerTask(void * pvParameters) {
                 deviceIdForMqtt.replace(":", "");
             }
 
-            // (CAMBIO) Ahora confía en la variable cargada desde la SD en setup()
             if (currentServerUrl.isEmpty() || currentServerUrl == "") {
                 if (DEBUG_MODE) Serial.println("[N0] URL del servidor MQTT aún no definida. Esperando a la ventana de mantenimiento...");
-                // (Se saltará el envío de datos, lo cual es correcto)
             } else {
                 client.setServer(currentServerUrl.c_str(), MQTT_PORT);
                 client.setKeepAlive(60);
@@ -445,7 +533,7 @@ void messengerTask(void * pvParameters) {
         }
 
         // --- 6A. REPORTE DE ARRANQUE (BASADO EN RTC) ---
-        // (Esta lógica sigue igual)
+        // (Esta lógica sigue igual, es correcta)
         if (client.connected() && !boot_time_reported) {
             long boot_time_unix = rtc.now().unixtime() - (millis() / 1000);
             
@@ -468,17 +556,16 @@ void messengerTask(void * pvParameters) {
         }
 
         // --- 6B. GESTIÓN DE HORA (NTP OPORTUNISTA) ---
-        // (CAMBIO) Esta sección fue eliminada. El NTP ahora solo
-        // se ejecuta 1 vez al día dentro de runMaintenanceWindow().
+        // (Esta sección se mantiene eliminada, es correcto)
 
         // --- 7. PROCESAMIENTO DE ARCHIVOS DE LA SD (MODO RÁFAGA) ---
-        // (CAMBIO) Solo depende de que MQTT esté conectado y el arranque reportado.
-        // (CAMBIO) Se quita la comprobación de suscripción.
+        // (CAMBIO) Se quita la comprobación de suscripción (ya estaba hecho).
         if (client.connected() && boot_time_reported && !sd_card_failed) {
             
             // --- 7a. CHEQUEO DE ESPACIO EN SD (Lógica sin cambios) ---
+            // (Usará el nuevo límite de 14GB que definimos en la Parte 1)
             if (SD.usedBytes() > MAX_SD_USAGE_BYTES) {
-                if (DEBUG_MODE) Serial.println("[N0] ⚠️ ADVERTENCIA: SD casi llena. Purgando archivos antiguos...");
+                if (DEBUG_MODE) Serial.println("[N0] ⚠️ ADVERTENCIA: SD casi llena (límite de 14GB). Purgando archivos antiguos...");
                 drawGenericMessage("Almacenamiento", "Purgando SD...");
 
                 File rootPurge = SD.open("/");
@@ -490,6 +577,7 @@ void messengerTask(void * pvParameters) {
             }
 
             // --- 7b. LÓGICA DE ENVÍO DE ARCHIVOS .DAT ---
+            // (Esta lógica es correcta, no se modifica)
             if(DEBUG_MODE) Serial.println("[N0] Buscando archivos .dat en la SD para enviar...");
             File root = SD.open("/");
             if (!root) {
@@ -505,10 +593,6 @@ void messengerTask(void * pvParameters) {
                 if (filename.endsWith(".dat") && filename != "/buffer.dat") {
                     if(DEBUG_MODE) Serial.printf("\n[N0] ==> Archivo de batch encontrado: %s\n", filename.c_str());
 
-                    // (CAMBIO) Chequeo de suscripción ELIMINADO.
-                    // if (!puede_enviar_datos) { ... }
-
-                    // Procesar y enviar por MQTT línea por línea
                     bool batch_success = true;
                     String topic_mediciones = String(TOPIC_MEDICIONES) + deviceIdForMqtt;
 
@@ -516,8 +600,6 @@ void messengerTask(void * pvParameters) {
                         String line = file_to_process.readStringUntil('\n');
                         line.trim();
                         if (line.length() > 0) {
-                            // ... (La lógica de sscanf y snprintf sigue igual) ...
-                            // (Omitida por brevedad)
                             MeasurementData data;
                             int parsed_items = sscanf(line.c_str(), "%u,%lu,%f,%f,%f,%f,%f,%f,%f,%f", 
                                                       &data.sequence_number, &data.timestamp, &data.vrms, &data.irms_phase, 
@@ -569,7 +651,7 @@ void messengerTask(void * pvParameters) {
             if(DEBUG_MODE) Serial.println("[N0-Debug] Esperando hora válida (RTC) para enviar reporte de arranque.");
         }
         
-        // --- 8. (NUEVO) VENTANA DE MANTENIMIENTO Y REINICIO DIARIO (BASADO EN RTC) ---
+        // --- 8. (v15.0) VENTANA DE MANTENIMIENTO Y REINICIO DIARIO (BASADO EN RTC) ---
         if (!rtc_failed) {
             DateTime now = rtc.now();
             
@@ -579,33 +661,10 @@ void messengerTask(void * pvParameters) {
                 if(DEBUG_MODE) Serial.printf("[N0] Son las %d:%d. Hora de mantenimiento.\n", MAINTENANCE_HOUR, MAINTENANCE_MINUTE);
                 maintenance_window_triggered = true; // Marcar como ejecutada para este día
 
-                // (NUEVO) Lógica de reinicio seguro: no reiniciar si hay archivos pendientes
-                bool filesPending = false;
-                if (!sd_card_failed) {
-                    File rootCheck = SD.open("/");
-                    if (rootCheck) {
-                        File checkFile = rootCheck.openNextFile();
-                        while(checkFile){
-                            String fname = checkFile.name();
-                            if (fname.endsWith(".dat") && fname != "/buffer.dat") {
-                                filesPending = true;
-                                checkFile.close();
-                                break;
-                            }
-                            if(checkFile) checkFile.close();
-                            checkFile = rootCheck.openNextFile();
-                        }
-                        rootCheck.close();
-                    }
-                }
-
-                if (filesPending) {
-                    if (DEBUG_MODE) Serial.println("[N0] Mantenimiento pospuesto: Hay archivos pendientes de envío.");
-                    maintenance_window_triggered = false; // Reintentar en el próximo ciclo
-                } else {
-                    // No hay archivos pendientes, es seguro ejecutar el mantenimiento
-                    runMaintenanceWindow(); // Esta función NUNCA retorna (reinicia el ESP)
-                }
+                // <-- CAMBIO: La ventana de mantenimiento ahora se ejecuta SIEMPRE.
+                // La lógica de "filesPending" se ha movido DENTRO de runMaintenanceWindow
+                // para que esa función decida si debe reiniciar o solo retornar.
+                runMaintenanceWindow(); 
 
             } else if (now.hour() != MAINTENANCE_HOUR) {
                 // Si ya no es la hora de mantenimiento, reseteamos la bandera
@@ -621,13 +680,15 @@ void messengerTask(void * pvParameters) {
 }
 
 // =========================================================================
-// === SETUP (ARQUITECTURA v14.1 - NO BLOQUEANTE)
+// === SETUP (ARQUITECTURA v15.0 - NO BLOQUEANTE)
 // =========================================================================
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Dar tiempo a que el monitor serial se conecte
+    // <-- CAMBIO: Reemplazado delay() por vTaskDelay() para seguridad de RTOS
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Dar tiempo a que el monitor serial se conecte
     Serial.println("\n\n==================================================");
-    Serial.println("== INICIANDO FIRMWARE CUENTATRÓN v14.1 (Robusto) ==");
+    // <-- CAMBIO: Actualizada la versión del firmware en el log
+    Serial.println("== INICIANDO FIRMWARE CUENTATRÓN v15.0 (Robusto) ==");
     Serial.println("==================================================");
 
     // --- 1. INICIALIZAR HARDWARE BÁSICO ---
@@ -649,7 +710,6 @@ void setup() {
     if (!rtc.begin()) {
         Serial.println("\nERROR CRÍTICO: No se encontró el módulo RTC. Iniciando en Modo Falla (RTC).");
         rtc_failed = true; // <-- CAMBIO: Activa la bandera de falla
-        // while (1) delay(1000); // <-- CAMBIO: Eliminado el bloqueo
     } else {
         // Si la batería del RTC falló, poner una hora por defecto
         if (rtc.lostPower()) {
@@ -666,10 +726,10 @@ void setup() {
     
     if(rtc_failed) {
         drawBootScreen("ERROR: RTC");
-        delay(2000);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // <-- CAMBIO: vTaskDelay
     } else {
         drawBootScreen("Iniciando...");
-        delay(500);
+        vTaskDelay(pdMS_TO_TICKS(500)); // <-- CAMBIO: vTaskDelay
     }
 
     // --- 4. INICIALIZAR TARJETA SD (MODO FALLA) ---
@@ -680,10 +740,9 @@ void setup() {
         pixels.setPixelColor(0, pixels.Color(255, 0, 0)); pixels.show();
         drawBootScreen("ERROR: SD");
         sd_card_failed = true; // <-- CAMBIO: Activa la bandera de falla
-        delay(2000);
-        // while (1) delay(1000); // <-- CAMBIO: Eliminado el bloqueo
+        vTaskDelay(pdMS_TO_TICKS(2000)); // <-- CAMBIO: vTaskDelay
     } else {
-        Serial.println(" OK.");    
+        Serial.println(" OK.");
     }
 
     // --- 5. INICIALIZAR SISTEMA (MUTEX Y WATCHDOG) ---
@@ -694,7 +753,8 @@ void setup() {
     if (sharedVarsMutex == NULL) {
         Serial.println("\nERROR CRÍTICO: Fallo al crear el Mutex. Memoria insuficiente.");
         drawBootScreen("ERROR: MUTEX");
-        while(1) delay(1000); // Detener el arranque
+        // <-- CAMBIO: Bucle while(1) seguro para RTOS
+        while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); } // Detener el arranque
     }
     
     esp_task_wdt_config_t wdt_config = {
@@ -751,17 +811,12 @@ void setup() {
 
 
     // --- 7. CONFIGURAR OTA (SOBRE ARDUINO) ---
-    Serial.print("Configurando OTA...");
-    drawBootScreen("Iniciando OTA...");
-    
-    ArduinoOTA.setHostname("Cuentatron"); 
-    ArduinoOTA.setPassword(OTA_PASSWORD);
-    Serial.printf("\n[DEBUG] Heap libre ANTES de ArduinoOTA.begin(): %d bytes\n", ESP.getFreeHeap());
-    ArduinoOTA.begin();
-    Serial.println(" OK.");
+    // <-- CAMBIO: Sección 7 eliminada (ya no se usa OTA local)
+    // Serial.print("Configurando OTA...");
+    // ... (código de ArduinoOTA.begin() eliminado) ...
+    // Serial.println(" OK.");
 
     // --- 8. INICIAR TAREAS DE LOS NÚCLEOS ---
-    // (Aún no modificamos esto, lo haremos en el siguiente paso)
     Serial.print("Iniciando tareas en los núcleos 0 y 1...");
     drawBootScreen("Iniciando tareas...");
     xTaskCreatePinnedToCore(writerTask, "WriterTask", 8192, NULL, 2, &writerTaskHandle, 1);
@@ -772,7 +827,7 @@ void setup() {
     Serial.println(" OK.");
     
     drawBootScreen("¡Listo!");
-    delay(1000); 
+    vTaskDelay(pdMS_TO_TICKS(1000)); // <-- CAMBIO: vTaskDelay
 
     Serial.println("\n==================================================");
     Serial.println("== Setup completo. El control pasa a las tareas ==");
@@ -832,8 +887,6 @@ void checkForHttpUpdate() {
     if (DEBUG_MODE) Serial.println("[N0] ¡Nueva versión disponible! Iniciando proceso de actualización...");
 
     // --- 2. VERIFICAR CONECTIVIDAD (FAIL-FAST) ---
-    // (MEJORA: Se mueve aquí, ANTES de suspender las tareas)
-    // Esto evita detener el dispositivo si el servidor de binarios está caído.
     if(DEBUG_MODE) Serial.println("[N0] Verificando conectividad con el servidor de binarios...");
     WiFiClient testClient;
     String binUrl = String(FIRMWARE_BIN_URL);
@@ -841,17 +894,15 @@ void checkForHttpUpdate() {
     int hostEnd = binUrl.indexOf("/", hostStart);
     String host = binUrl.substring(hostStart, hostEnd);
     
-    if (!testClient.connect(host.c_str(), 80)) {
+    // <-- NOTA: testClient.connect() es bloqueante, pero es necesario aquí
+    if (!testClient.connect(host.c_str(), 80)) { 
         if(DEBUG_MODE) Serial.println("[N0] ERROR: No se puede conectar al servidor de binarios. Abortando actualización.");
-        // No reiniciamos, solo abortamos. El dispositivo sigue midiendo.
         return;
     }
     testClient.stop();
     if(DEBUG_MODE) Serial.println("[N0] Conectividad OK.");
 
     // --- 3. PREPARAR SISTEMA PARA ACTUALIZACIÓN ---
-    // Solo ahora que sabemos que hay una versión nueva Y hay conectividad,
-    // suspendemos los sistemas críticos.
     if (DEBUG_MODE) Serial.println("[N0] Preparando sistema...");
     if (OLED_CONECTADA) drawGenericMessage("Actualizando", "Preparando...");
     if (DEBUG_MODE) Serial.printf("[N0-Debug] RAM libre antes de preparar: %d bytes\n", ESP.getFreeHeap());
@@ -859,15 +910,14 @@ void checkForHttpUpdate() {
     // CRÍTICO: Pausar la tarea de medición (Core 1)
     if(DEBUG_MODE) Serial.println("[N0] ==> Pausando Tarea Escritura (Core 1)...");
     vTaskSuspend(writerTaskHandle);
-    delay(500); // Dar tiempo
+    vTaskDelay(pdMS_TO_TICKS(500)); // <-- CAMBIO: vTaskDelay
     
-    // CRÍTICO: Deshabilitar OTA por WiFi (local) para evitar conflictos
-    ArduinoOTA.end();
+    // <-- CAMBIO: Eliminado ArduinoOTA.end() ya que no se usa
     
     // CRÍTICO: Desmontar la SD para evitar corrupción
     if(DEBUG_MODE) Serial.println("[N0] ==> Desmontando SD...");
     SD.end();
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(100)); // <-- CAMBIO: vTaskDelay
     
     if (DEBUG_MODE) Serial.printf("[N0-Debug] RAM libre después de preparar: %d bytes\n", ESP.getFreeHeap());
     
@@ -880,7 +930,7 @@ void checkForHttpUpdate() {
             Serial.printf("[N0] ERROR: RAM insuficiente (%d bytes). Se requieren %d.\n", freeHeap, MIN_HEAP_REQUIRED);
             Serial.println("[N0] Abortando actualización. Reiniciando dispositivo...");
         }
-        delay(3000);
+        vTaskDelay(pdMS_TO_TICKS(3000)); // <-- CAMBIO: vTaskDelay
         ESP.restart(); // Necesario para reanudar la tarea suspendida
     }
     
@@ -939,12 +989,12 @@ void checkForHttpUpdate() {
                 httpUpdate.getLastErrorString().c_str());
         }
         if (OLED_CONECTADA) drawGenericMessage("Actualizacion", "Error!");
-        delay(5000);
+        vTaskDelay(pdMS_TO_TICKS(5000)); // <-- CAMBIO: vTaskDelay
         ESP.restart(); // Reiniciar de todos modos para reanudar la Tarea 1
     }
     
     if (DEBUG_MODE) Serial.println("[N0] Estado inesperado. Reiniciando...");
-    delay(2000);
+    vTaskDelay(pdMS_TO_TICKS(2000)); // <-- CAMBIO: vTaskDelay
     ESP.restart();
 }
 
@@ -1110,7 +1160,7 @@ void handleFactoryReset() {
         while(file){
             String filename = file.name();
             if (filename.endsWith(".dat")) {
-                if (DEBUG_MODE) Serial.printf("[N0-Debug]  - Borrando: %s\n", filename.c_str());
+                if (DEBUG_MODE) Serial.printf("[N0-Debug]   - Borrando: %s\n", filename.c_str());
                 SD.remove("/" + filename);
             }
             file.close();
@@ -1127,12 +1177,14 @@ void handleFactoryReset() {
     if (DEBUG_MODE) Serial.println(" OK.");
 
     // 4. Reiniciar
-    delay(2000);
+    vTaskDelay(pdMS_TO_TICKS(2000)); // <-- CAMBIO: vTaskDelay
     ESP.restart();
 }
 
+
 // =========================================================================
 // --- FUNCIÓN PARA CONTACTAR A SUPABASE (SIMPLIFICADA)
+// --- (RE-AGREGADA DESDE EL ARCHIVO ORIGINAL)
 // =========================================================================
 // Esta función devuelve 'true' si se descargó una nueva calibración (para guardarla)
 bool handleRemoteTasks() {
@@ -1169,14 +1221,10 @@ bool handleRemoteTasks() {
 
         if (error) {
             if (DEBUG_MODE) Serial.printf("[N0] ERROR: Fallo al parsear JSON de tareas: %s\n", error.c_str());
-            // (CAMBIO) No retornamos, intentamos procesar lo que se pueda
         }
             
         // --- 1. PROCESAR ESTADO DE SUSCRIPCIÓN (ELIMINADO) ---
-        // (CAMBIO) Esta lógica fue removida. El dispositivo ya no
-        // se preocupa por la suscripción, solo envía datos.
-        // Las variables (pago_vencido, etc) pueden ser eliminadas
-        // de las variables globales si lo deseas.
+        // (Lógica removida, tal como en v14.1)
 
         // --- 2. PROCESAR LA URL DEL SERVIDOR MQTT (ROBUSTO) ---
         if (doc.containsKey("server_url") && !doc["server_url"].isNull()) {
@@ -1221,7 +1269,6 @@ bool handleRemoteTasks() {
             String cmd = doc["command"];
             if (DEBUG_MODE) Serial.printf("[N0] Tarea de 'comando' recibida: '%s'\n", cmd.c_str());
 
-            // (CAMBIO) Se eliminó el comando "reboot"
             if (cmd == "factory_reset") {
                 if (DEBUG_MODE) Serial.println("[N0] Comando remoto 'factory_reset' recibido. Ejecutando...");
                 handleFactoryReset(); // Llama a la función de reseteo
@@ -1237,19 +1284,25 @@ bool handleRemoteTasks() {
 }
 
 // =========================================================================
-// --- FUNCIÓN DE VENTANA DE MANTENIMIENTO (NUEVO)
-// --- Se ejecuta una vez al día, justo antes del reinicio.
+// --- FUNCIÓN DE VENTANA DE MANTENIMIENTO (v15.0 - MODIFICADA)
+// --- (RE-AGREGADA Y MODIFICADA)
 // =========================================================================
 void runMaintenanceWindow() {
+    
+    // Esta función ahora puede ser llamada por el botón o a las 3AM.
+    // NO debe reiniciar si hay archivos pendientes, a menos que
+    // el WiFi esté caído (en ese caso es un error irrecuperable).
+
     if (WiFi.status() != WL_CONNECTED) {
-        if(DEBUG_MODE) Serial.println("[N0] Omitiendo ventana de mantenimiento: WiFi desconectado. Se reiniciará.");
-        delay(3000);
+        if(DEBUG_MODE) Serial.println("[N0-Mantto] Omitiendo ventana de mantenimiento: WiFi desconectado. Se reiniciará.");
+        drawGenericMessage("Mantenimiento", "Error: WiFi");
+        vTaskDelay(pdMS_TO_TICKS(3000)); // <-- CAMBIO: vTaskDelay
         ESP.restart();
-        return;
+        return; // No se alcanzará, pero es una buena práctica
     }
 
     if(DEBUG_MODE) Serial.println("\n[N0] ==============================================");
-    if(DEBUG_MODE) Serial.println("[N0] === INICIANDO VENTANA DE MANTENIMIENTO DIARIO ===");
+    if(DEBUG_MODE) Serial.println("[N0] === INICIANDO VENTANA DE MANTENIMIENTO... ===");
     if(DEBUG_MODE) Serial.println("[N0] ==============================================");
 
     drawGenericMessage("Mantenimiento", "Iniciando...");
@@ -1273,7 +1326,6 @@ void runMaintenanceWindow() {
     }
 
     // --- 2. Tareas Remotas (Supabase) ---
-    // (Esta función ya fue modificada para no checar suscripción y guardar config)
     if(DEBUG_MODE) Serial.println("[N0-Mantto] 2. Buscando tareas en Supabase...");
     drawGenericMessage("Mantenimiento", "Buscando tareas...");
     bool newConfig = handleRemoteTasks(); 
@@ -1285,14 +1337,52 @@ void runMaintenanceWindow() {
     // --- 3. Actualización de Firmware (HTTP) ---
     if(DEBUG_MODE) Serial.println("[N0-Mantto] 3. Buscando actualizaciones de firmware...");
     drawGenericMessage("Mantenimiento", "Buscando updates...");
-    checkForHttpUpdate(); // Esta función ya existe
+    checkForHttpUpdate(); // Esta función REINICIA automáticamente si tiene éxito.
 
-    // --- 4. Reinicio ---
-    // Si checkForHttpUpdate() encontró una actualización, el dispositivo ya se habrá reiniciado.
-    // Si llegamos a este punto, significa que no hubo actualización y debemos reiniciar manualmente.
+    // --- 4. (v15.0) REINICIO CONDICIONAL ---
+    // Si llegamos a este punto, significa que no hubo actualización y 
+    // debemos decidir si reiniciar o solo retornar (si fue llamado por botón o hay archivos).
     
-    if(DEBUG_MODE) Serial.println("[N0-Mantto] Mantenimiento completo. Reiniciando sistema...");
-    drawGenericMessage("Mantenimiento", "Reiniciando...");
-    delay(3000);
-    ESP.restart();
+    if(DEBUG_MODE) Serial.println("[N0-Mantto] 4. Chequeando archivos pendientes antes de decidir el reinicio...");
+
+    bool filesPending = false;
+    if (!sd_card_failed) {
+        File rootCheck = SD.open("/");
+        if (rootCheck) {
+            File checkFile;
+            // Usamos un bucle while más seguro que no depende de que checkFile sea true
+            while(true) {
+                checkFile = rootCheck.openNextFile();
+                if (!checkFile) {
+                    // No hay más archivos
+                    break;
+                }
+                String fname = checkFile.name();
+                if (fname.endsWith(".dat") && fname != "/buffer.dat") {
+                    filesPending = true;
+                    if(DEBUG_MODE) Serial.printf("[N0-Mantto] Archivo pendiente detectado: %s\n", fname.c_str());
+                    checkFile.close();
+                    break; // Salir del bucle while(true)
+                }
+                checkFile.close(); // Cerrar el handle del archivo actual
+            }
+            rootCheck.close(); // Cerrar el handle del directorio raíz
+        }
+    }
+
+    // --- 5. (v15.0) DECISIÓN FINAL ---
+    if (filesPending) {
+        if (DEBUG_MODE) Serial.println("[N0-Mantto] Mantenimiento completo. OMITIENDO reinicio (hay archivos pendientes).");
+        drawGenericMessage("Mantenimiento", "Completado");
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Mostrar mensaje por 2s
+        return; // <-- CAMBIO CRÍTICO: Retorna al bucle de messengerTask
+    
+    } else {
+        // No hay archivos pendientes, es seguro reiniciar.
+        if (DEBUG_MODE) Serial.println("[N0-Mantto] Mantenimiento completo. No hay archivos pendientes. Reiniciando sistema...");
+        drawGenericMessage("Mantenimiento", "Reiniciando...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP.restart();
+        // Esta línea nunca se alcanzará
+    }
 }

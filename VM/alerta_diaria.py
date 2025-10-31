@@ -1,8 +1,10 @@
 # -------------------------------------------------------------------
-# Script de Alertas Diarias para LETE v4.0 (Migrado a InfluxDB y DB Unificada)
+# Script de Alertas Diarias para LETE v4.1 (Integración con Telegram)
 # - Lee datos de consumo desde InfluxDB en lugar de CSV.
 # - Consultas a PostgreSQL actualizadas para la nueva estructura (clientes/dispositivos_lete).
 # - Se implementa la lógica de "Primer Periodo" para proyecciones precisas.
+# - AÑADIDO: Envío de alertas dual a WhatsApp y Telegram.
+# - CORREGIDO: Lógica de proyección para evitar valores inflados.
 # -------------------------------------------------------------------
 
 # --- 1. Importaciones ---
@@ -38,6 +40,10 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
 TWILIO_URL = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
 
+# --- ¡NUEVA CONFIGURACIÓN DE TELEGRAM! ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# (No se usa ADMIN_TELEGRAM_CHAT_ID aquí, pero es bueno tenerlo)
+
 # --- ¡NUEVA CONFIGURACIÓN DE INFLUXDB! ---
 INFLUX_URL = os.environ.get("INFLUX_URL")
 INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN")
@@ -50,6 +56,17 @@ CONTENT_SID_DIA_DE_CORTE = os.environ.get("CONTENT_SID_DIA_DE_CORTE")
 CONTENT_SID_REPORTE_INICIAL = os.environ.get("CONTENT_SID_REPORTE_INICIAL")
 CONTENT_SID_REPORTE_MAS = os.environ.get("CONTENT_SID_REPORTE_MAS")
 CONTENT_SID_REPORTE_MENOS = os.environ.get("CONTENT_SID_REPORTE_MENOS")
+CONTENT_SID_RECORDATORIO_CONEXION = os.environ.get("CONTENT_SID_RECORDATORIO_CONEXION")
+
+# (Variables de plantillas del Vigilante, cargadas para el formateador)
+TPL_FELICITACION_CONEXION = os.environ.get("TPL_FELICITACION_CONEXION")
+TPL_PICOS_VOLTAJE = os.environ.get("TPL_PICOS_VOLTAJE")
+TPL_BAJO_VOLTAJE = os.environ.get("TPL_BAJO_VOLTAJE")
+TPL_FUGA_CORRIENTE = os.environ.get("TPL_FUGA_CORRIENTE")
+TPL_BRINCO_ESCALON = os.environ.get("TPL_BRINCO_ESCALON")
+TPL_CONSUMO_FANTASMA = os.environ.get("TPL_CONSUMO_FANTASMA")
+TPL_DISPOSITIVO_OFFLINE = os.environ.get("TPL_DISPOSITIVO_OFFLINE")
+
 
 # --- Lógica de Negocio y Reglas ---
 IVA = 1.16
@@ -80,22 +97,31 @@ TARIFAS_CFE = {
 def obtener_clientes():
     """
     Obtiene la lista de clientes y sus datos relevantes, uniendo las tablas
-    clientes y dispositivos_lete. Incluye campos para lógica de "Primer Periodo".
+    clientes y dispositivos_lete. Incluye campos para lógica de "Primer Periodo"
+    y el nuevo "telegram_chat_id".
     """
     try:
         conn = psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
         cursor = conn.cursor()
         
-        # --- ¡CONSULTA MODIFICADA CON JOIN! ---
+        # --- ¡CONSULTA MODIFICADA CON JOIN Y NUEVO CAMPO! ---
         # Se añaden lectura_cierre_periodo_anterior y lectura_medidor_inicial
         cursor.execute("""
             SELECT 
-                d.device_id, c.telefono_whatsapp, c.kwh_promedio_diario, c.nombre, 
-                c.dia_de_corte, c.tipo_tarifa, c.fecha_inicio_servicio, c.ciclo_bimestral,
-                c.notificacion_corte_3dias_enviada, c.notificacion_dia_corte_enviada,
+                d.device_id, 
+                c.telefono_whatsapp, 
+                c.telegram_chat_id,                 -- <-- AÑADIDO
+                c.kwh_promedio_diario, 
+                c.nombre, 
+                c.dia_de_corte, 
+                c.tipo_tarifa, 
+                c.fecha_inicio_servicio, 
+                c.ciclo_bimestral,
+                c.notificacion_corte_3dias_enviada, 
+                c.notificacion_dia_corte_enviada,
                 c.lectura_cierre_periodo_anterior, 
                 c.lectura_medidor_inicial,
-                c.primera_medicion_recibida      -- <-- AÑADIR ESTA LÍNEA
+                c.primera_medicion_recibida
             FROM clientes c
             JOIN dispositivos_lete d ON c.id = d.cliente_id
             WHERE c.subscription_status = 'active'
@@ -243,6 +269,92 @@ def enviar_alerta_whatsapp(telefono_destino, content_sid, content_variables):
         print(f"⚠️  Error al enviar alerta. Código: {response.status_code}, Respuesta: {response.text}")
         response.raise_for_status()
 
+# --- ¡NUEVAS FUNCIONES DE TELEGRAM! ---
+
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
+def enviar_alerta_telegram(chat_id, message_text):
+    """Envía un mensaje de Telegram."""
+    if not chat_id or not message_text:
+        print(f"⚠️  Chat ID ({chat_id}) o Mensaje ({message_text}) vacío. No se envía alerta de Telegram.")
+        return
+    
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠️ ⚠️  ADVERTENCIA: TELEGRAM_BOT_TOKEN no está configurado en .env. No se puede enviar alerta.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': chat_id,
+        'text': message_text,
+        'parse_mode': 'Markdown' # Habilitamos Markdown para **negritas**, *cursivas*, etc.
+    }
+    
+    print(f"\nEnviando Telegram a: {chat_id}...")
+    try:
+        response = requests.post(url, data=payload, timeout=5)
+        response_json = response.json()
+        
+        if response.status_code == 200 and response_json.get('ok'):
+            print(f"✔️ Alerta de Telegram enviada exitosamente.")
+        else:
+            error_msg = response_json.get('description', response.text)
+            print(f"⚠️  Error al enviar alerta de Telegram. Código: {response.status_code}, Respuesta: {error_msg}")
+            response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ERROR de conexión al enviar alerta de Telegram: {e}")
+        raise # Re-lanza para que tenacity pueda reintentar
+
+def formatear_mensaje_telegram(template_sid, variables):
+    """
+    Traduce las plantillas de Twilio a mensajes de texto para Telegram.
+    ¡REVISA Y AJUSTA ESTOS MENSAJES A TU GUSTO!
+    """
+    
+    # --- Plantillas de alerta_diaria.py ---
+    if template_sid == CONTENT_SID_AVISO_CORTE_3DIAS:
+        return f"Hola {variables.get('1', 'usuario')}, te recordamos que tu fecha de corte es el *{variables.get('2', 'fecha')}*. 🗓"
+        
+    elif template_sid == CONTENT_SID_DIA_DE_CORTE:
+        return f"Hola {variables.get('1', 'usuario')}, ¡hoy es tu día de corte! ✂️\n\nTu consumo final del periodo fue de *{variables.get('2', 'X.XX')} kWh*, con un costo estimado de *${variables.get('3', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_REPORTE_INICIAL:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh*.\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados. 📊"
+        
+    elif template_sid == CONTENT_SID_REPORTE_MAS:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 🔺 (más alto que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_REPORTE_MENOS:
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 👇 (más bajo que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
+        
+    elif template_sid == CONTENT_SID_RECORDATORIO_CONEXION:
+        return f"Hola {variables.get('1', 'usuario')}, notamos que aún no has conectado tu dispositivo LETE. ¡Conéctalo para empezar a monitorear! 🔌"
+
+    # --- Plantillas de vigilante_calidad.py (Incluidas para robustez) ---
+    elif template_sid == TPL_FELICITACION_CONEXION:
+        return f"¡Felicidades {variables.get('1', 'usuario')}! Tu dispositivo LETE se ha conectado por primera vez. 🎉\n\nYa estás monitoreando tu consumo."
+    
+    elif template_sid == TPL_PICOS_VOLTAJE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos *{variables.get('2', 'varios')} picos de alto voltaje* en tu instalación. ⚡️\nTe recomendamos usar reguladores en aparatos sensibles."
+    
+    elif template_sid == TPL_BAJO_VOLTAJE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos *voltaje bajo* en tu instalación. Esto puede dañar motores y compresores (ej. refrigerador). 📉"
+        
+    elif template_sid == TPL_FUGA_CORRIENTE:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos una posible *fuga de corriente*. ⚠️\nEsto puede aumentar tu recibo y es un riesgo. Te recomendamos contactar a un electricista."
+        
+    elif template_sid == TPL_BRINCO_ESCALON:
+        return f"Hola {variables.get('1', 'usuario')}, has superado un escalón de CFE. 📈\nTu tarifa para el consumo excedente ahora es de *${variables.get('2', 'X.XX')} por kWh*."
+        
+    elif template_sid == TPL_CONSUMO_FANTASMA:
+        return f"Hola {variables.get('1', 'usuario')}, detectamos un consumo inusual a las {variables.get('2', 'HH:MM')}. 👻\nTu consumo aumentó un *{variables.get('3', 'X')}%* comparado con tu promedio para esa hora."
+        
+    elif template_sid == TPL_DISPOSITIVO_OFFLINE:
+        return f"ALERTA ADMIN: El dispositivo de *{variables.get('1', 'Cliente')}* está offline. 🚫"
+        
+    else:
+        print(f"⚠️  ADVERTENCIA: Plantilla desconocida en formatear_mensaje_telegram: {template_sid}")
+        return f"Alerta del sistema (SID: {template_sid}). Variables: {json.dumps(variables)}"
+
 # --- 7. Funciones de Lógica de Negocio ---
 def calcular_costo_estimado(kwh_consumidos, tipo_tarifa):
     """Calcula el costo aproximado del recibo de CFE usando la estructura de tarifas."""
@@ -290,18 +402,23 @@ def calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral):
     proxima_fecha_de_corte = date(ano_proximo, mes_proximo, dia_proximo)
     return ultima_fecha_de_corte, proxima_fecha_de_corte
 
-# --- 8. Lógica de Procesamiento de Clientes ---
+# --- 8. Lógica de Procesamiento de Clientes (MODIFICADA) ---
 def _enviar_alerta_3_dias(cliente, proxima_fecha_de_corte):
-    # Desempaquetado (solo 10 campos, los nuevos van al final y no se usan aquí)
-    (device_id, telefono, _, nombre, _, _, _, _, _, _, _, _) = cliente
+    # Desempaquetado (14 campos)
+    (device_id, telefono, telegram_chat_id, _, nombre, _, _, _, _, _, _, _, _, _) = cliente
     print("INFO: Enviando alerta de 3 días para el corte.")
     variables = {"1": nombre, "2": proxima_fecha_de_corte.strftime('%d de %B')}
+    
+    # Enviar a ambos canales
+    mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_AVISO_CORTE_3DIAS, variables)
     enviar_alerta_whatsapp(telefono, CONTENT_SID_AVISO_CORTE_3DIAS, variables)
+    enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+    
     marcar_notificacion_enviada(device_id, 'notificacion_corte_3dias')
 
 def _enviar_alerta_dia_de_corte(cliente, ultima_corte, proxima_corte):
-    # Desempaquetado (solo 10 campos)
-    (device_id, telefono, _, nombre, _, tipo_tarifa, _, _, _, _, _, _) = cliente
+    # Desempaquetado (14 campos)
+    (device_id, telefono, telegram_chat_id, _, nombre, _, tipo_tarifa, _, _, _, _, _, _, _) = cliente
     print("INFO: Enviando alerta de DÍA DE CORTE con resumen final.")
     
     # Calcula el consumo final del periodo que HOY termina
@@ -316,15 +433,20 @@ def _enviar_alerta_dia_de_corte(cliente, ultima_corte, proxima_corte):
     costo_final = calcular_costo_estimado(consumo_final, tipo_tarifa)
     
     variables = {"1": nombre, "2": f"{consumo_final:.2f}", "3": f"{costo_final:.2f}"}
+    
+    # Enviar a ambos canales
+    mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_DIA_DE_CORTE, variables)
     enviar_alerta_whatsapp(telefono, CONTENT_SID_DIA_DE_CORTE, variables)
+    enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+    
     marcar_notificacion_enviada(device_id, 'notificacion_dia_corte')
 
 def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
     # --- ¡DESEMPAQUETADO MODIFICADO! ---
-    # Ahora recibimos 12 campos del tuple de cliente
-    (device_id, telefono, kwh_promedio, nombre, _, tipo_tarifa, 
+    # Ahora recibimos 14 campos del tuple de cliente
+    (device_id, telefono, telegram_chat_id, kwh_promedio, nombre, _, tipo_tarifa, 
      fecha_inicio_servicio, _, _, _, 
-     lectura_cierre, lectura_inicial) = cliente
+     lectura_cierre, lectura_inicial, _) = cliente
      
     ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
     
@@ -374,32 +496,75 @@ def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
         
     promedio_float = float(kwh_promedio) if kwh_promedio is not None else 0.0
     
-    # Para el número de días, usamos la fecha de inicio del periodo de Influx
-    numero_dias_transcurridos = (ayer_date - fecha_inicio_periodo_influx).days + 1
-    if numero_dias_transcurridos <= 0: numero_dias_transcurridos = 1
+    # Calculamos los días REALES transcurridos en el periodo del ciclo
+    dias_transcurridos_ciclo = (ayer_date - ultima_fecha_de_corte).days + 1
+    if dias_transcurridos_ciclo <= 0: 
+        dias_transcurridos_ciclo = 1
     
-    # --- LÓGICA DE SELECCIÓN DE PLANTILLA ---
-    if numero_dias_transcurridos < MIN_DIAS_PARA_PROYECCION:
-        print(f"   -> {nombre}: Aún en periodo inicial (sin proyección). Días: {numero_dias_transcurridos}")
+    # --- LÓGICA DE SELECCIÓN DE PLANTILLA (CORREGIDA) ---
+    if dias_transcurridos_ciclo < MIN_DIAS_PARA_PROYECCION:
+        # PERIODO INICIAL: Sin proyección
+        print(f"   -> {nombre}: Aún en periodo inicial (sin proyección). Días del ciclo: {dias_transcurridos_ciclo}")
         variables = {"1": nombre, "2": f"{kwh_ayer:.2f}", "3": f"{kwh_periodo_actual:.2f}"}
-        enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_INICIAL, variables)
-    else:
-        dias_del_ciclo = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
-        if dias_del_ciclo <= 0: dias_del_ciclo = 60 # Fallback
         
-        # La proyección SÍ debe usar los kwh_acarreados para ser precisa
-        proyeccion_kwh = (kwh_periodo_actual / numero_dias_transcurridos) * dias_del_ciclo
+        mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_INICIAL, variables)
+        enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_INICIAL, variables)
+        enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+    else:
+        # CON PROYECCIÓN: Solo proyectamos el consumo medido, NO los acarreados
+        dias_del_ciclo = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
+        if dias_del_ciclo <= 0: 
+            dias_del_ciclo = 60  # Fallback
+        
+        # --- CORRECCIÓN CLAVE ---
+        # Si el cliente instaló después del inicio del ciclo, ajustamos la proyección
+        if fecha_inicio_servicio_date and fecha_inicio_servicio_date > ultima_fecha_de_corte:
+            # Cliente en primer periodo: Proyectamos SOLO el consumo medido
+            dias_con_medicion = (ayer_date - fecha_inicio_servicio_date).days + 1
+            if dias_con_medicion <= 0: 
+                dias_con_medicion = 1
+            
+            # Promedio REAL del cliente (sin acarreados)
+            promedio_diario_real = kwh_medidos_influx / dias_con_medicion
+            
+            # Días restantes del ciclo (desde hoy hasta el corte)
+            dias_restantes = (proxima_fecha_de_corte - hoy_aware.date()).days
+            
+            # Proyección = Acarreados + Consumo ya medido + Estimación de días restantes
+            proyeccion_kwh = kwh_acarreados + kwh_medidos_influx + (promedio_diario_real * dias_restantes)
+            
+            print(f"   -> {nombre}: Primer Periodo. Promedio real: {promedio_diario_real:.2f} kWh/día")
+            print(f"      Acarreados: {kwh_acarreados:.2f}, Medidos: {kwh_medidos_influx:.2f}, Proyección días restantes: {promedio_diario_real * dias_restantes:.2f}")
+        else:
+            # Cliente regular: Proyección simple proporcional
+            promedio_diario = kwh_periodo_actual / dias_transcurridos_ciclo
+            proyeccion_kwh = promedio_diario * dias_del_ciclo
+            
+            print(f"   -> {nombre}: Cliente regular. Promedio: {promedio_diario:.2f} kWh/día")
+        
         costo_estimado = calcular_costo_estimado(proyeccion_kwh, tipo_tarifa)
-        variables = {"1": nombre, "2": f"{kwh_ayer:.2f}", "3": f"{kwh_periodo_actual:.2f}", "4": f"{costo_estimado:.2f}"}
+        
+        print(f"      Proyección total: {proyeccion_kwh:.2f} kWh -> ${costo_estimado:.2f}")
+        
+        variables = {
+            "1": nombre, 
+            "2": f"{kwh_ayer:.2f}", 
+            "3": f"{kwh_periodo_actual:.2f}", 
+            "4": f"{costo_estimado:.2f}"
+        }
         
         if kwh_ayer > promedio_float:
+            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_MAS, variables)
             enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_MAS, variables)
+            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
         else:
+            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_MENOS, variables)
             enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_MENOS, variables)
+            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
 
 def _realizar_cierre_de_ciclo(cliente, fechas_corte):
-    # Desempaquetado (solo 10 campos)
-    (device_id, _, _, nombre, _, _, _, _, _, _, _, _) = cliente
+    # Desempaquetado (14 campos)
+    (device_id, _, _, _, nombre, _, _, _, _, _, _, _, _, _) = cliente
     ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
     print(f"¡Fin de periodo para {nombre}! Realizando cierre...")
     
@@ -419,8 +584,8 @@ def _realizar_cierre_de_ciclo(cliente, fechas_corte):
 def procesar_un_cliente(cliente_data, hoy_aware):
     """Orquesta el procesamiento completo para un único cliente."""
     # --- ¡DESEMPAQUETADO MODIFICADO! ---
-    # Leemos 13 campos, pero solo usamos los primeros 10 para la lógica de flags
-    (device_id, telefono, _, nombre, dia_de_corte, _, fecha_inicio_servicio, ciclo_bimestral, 
+    # Leemos 14 campos
+    (device_id, telefono, telegram_chat_id, _, nombre, dia_de_corte, _, fecha_inicio_servicio, ciclo_bimestral, 
     notif_3dias_enviada, notif_corte_enviada, _, _, 
     primera_medicion_recibida) = cliente_data
      
@@ -435,10 +600,15 @@ def procesar_un_cliente(cliente_data, hoy_aware):
         if dias_desde_activacion >= 1:
             print(f"INFO: {nombre} (activado hace {dias_desde_activacion} días) aún no conecta. Enviando recordatorio DIARIO.")
 
-        # (Asegúrate de tener esta variable en .env)
-            CONTENT_SID_RECORDATORIO_CONEXION = os.environ.get("CONTENT_SID_RECORDATORIO_CONEXION") 
+            # (Asegúrate de tener esta variable en .env)
+            # CONTENT_SID_RECORDATORIO_CONEXION ya se cargó arriba
             variables = {"1": nombre}
+            
+            # Enviar a ambos canales
+            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_RECORDATORIO_CONEXION, variables)
             enviar_alerta_whatsapp(telefono, CONTENT_SID_RECORDATORIO_CONEXION, variables)
+            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+            
         # No marcamos ninguna bandera, se enviará de nuevo mañana
 
         # Como no hay mediciones, no podemos procesar nada más.
@@ -482,13 +652,13 @@ def procesar_un_cliente(cliente_data, hoy_aware):
         return # No se envía reporte diario hoy.
     
     # REGLA 4: Si no se cumplió ninguna regla anterior, se envía el reporte diario.
-    # (Se pasa el cliente_data completo, que incluye los 12 campos)
+    # (Se pasa el cliente_data completo, que incluye los 14 campos)
     _generar_reporte_diario(cliente_data, hoy_aware, (ultima_corte, proxima_corte))
 
 # --- 9. Ejecución Principal ---
 def main():
     print("=" * 50)
-    print(f"--- Iniciando Script de Reporte Diario v4.0 ---")
+    print(f"--- Iniciando Script de Reporte Diario v4.1 (con Telegram - CORREGIDO) ---")
     
     clientes = obtener_clientes()
     if not clientes:
@@ -502,11 +672,11 @@ def main():
         try:
             procesar_un_cliente(cliente, ahora_aware)
         except Exception as e:
-            # cliente[3] es 'nombre' en el tuple
-            nombre_cliente = cliente[3] if len(cliente) > 3 else "ID Desconocido"
+            # cliente[4] es 'nombre' en el nuevo tuple
+            nombre_cliente = cliente[4] if len(cliente) > 4 else "ID Desconocido"
             print(f"❌ ERROR INESPERADO al procesar '{nombre_cliente}'. Saltando. Error: {e}")
 
-    print("\n--- Script de Reporte Diario v4.0 completado. ---")
+    print("\n--- Script de Reporte Diario v4.1 (CORREGIDO) completado. ---")
     print("=" * 50)
 
 if __name__ == "__main__":

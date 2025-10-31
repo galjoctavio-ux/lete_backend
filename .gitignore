@@ -39,3 +39,7 @@ Thumbs.db
 # Archivos del editor
 .vscode/
 .idea/
+
+# Ignorar la carpeta del Entorno Virtual de Python
+venv/
+nginx/

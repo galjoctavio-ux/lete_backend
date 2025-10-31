@@ -1,5 +1,5 @@
 // =========================================================================
-// --- FUNCIONES DE PANTALLA OLED v14.1 (Simplificado)
+// --- FUNCIONES DE PANTALLA OLED v15.0 (Con icono de Nube)
 // =========================================================================
 
 #pragma once
@@ -10,7 +10,6 @@ void drawGenericMessage(String line1, String line2);
 void drawBootScreen(String status);
 void drawUpdateScreen(String status, int percentage);
 void drawConsumptionScreen();
-// (Funciones eliminadas)
 const char* getWifiIcon(int rssi); 
 
 // Inicializa la pantalla OLED
@@ -83,8 +82,6 @@ void drawUpdateScreen(String status, int percentage) {
     }
 }
 
-// (FUNCIÓN ELIMINADA: drawPaymentDueScreen)
-
 // Devuelve el icono de WiFi según la potencia de la señal
 const char* getWifiIcon(int rssi) {
     if (rssi == 0 || rssi < -85) return "\x11"; // Icono bajo o desconectado
@@ -96,17 +93,23 @@ const char* getWifiIcon(int rssi) {
 // Dibuja la pantalla principal de consumo (ÚNICA PANTALLA DE OPERACIÓN)
 void drawConsumptionScreen() {
     if (!OLED_CONECTADA) return;
-    if (DEBUG_MODE) Serial.println("[N1-Debug] Dibujando pantalla: Consumo");
+    
+    // <-- CAMBIO: Desactivado este debug.
+    // Se ejecuta cada 50ms e inunda el monitor serie,
+    // dificultando la depuración de otras tareas.
+    // if (DEBUG_MODE) Serial.println("[N1-Debug] Dibujando pantalla: Consumo");
 
     display.clearDisplay();
 
     float vrms, irms, power;
+    bool nube_conectada = false; // <-- AÑADIDO: Variable local para el estado de la nube
  
-    // (Este Mutex sigue siendo necesario para pasar datos del N1 al N1)
+    // Tomar el Mutex para leer de forma segura las variables compartidas
     if (xSemaphoreTake(sharedVarsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         vrms = latest_vrms;
         irms = latest_irms_phase;
         power = latest_power;
+        nube_conectada = mqtt_connected_status; // <-- AÑADIDO: Leer la bandera de MQTT
         xSemaphoreGive(sharedVarsMutex);
     }
     
@@ -138,14 +141,16 @@ void drawConsumptionScreen() {
     
     display.setCursor(45, 56);
     display.print("Nube:");
-    // (Aquí puedes añadir un icono si client.connected() es true)
+    
+    // <-- CAMBIO: Lógica para mostrar el icono de Nube (MQTT)
+    if (nube_conectada) {
+        display.print("\x10"); // Icono de "check" (tilde)
+    } else {
+        display.print("\x1D"); // Icono de "X" (cruz)
+    }
 
     display.setCursor(90, 56);
     display.printf("FP:%.2f", power_factor);
     
     display.display();
 }
-
-// (FUNCIÓN ELIMINADA: drawDiagnosticsScreen)
-
-// (FUNCIÓN ELIMINADA: drawServiceScreen)

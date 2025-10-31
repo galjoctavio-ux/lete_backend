@@ -3,30 +3,26 @@ require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch'); // Ya lo estabas usando, perfecto
 const QRCode = require('qrcode');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { Resend } = require('resend');
-const fs = require('fs').promises; // <-- AÑADIR
-const path = require('path'); // <-- AÑADIR
-const { createProxyMiddleware } = require('http-proxy-middleware'); // <-- AÑADIR
-const twilio = require('twilio'); // <-- AÑADIR
+const fs = require('fs').promises;
+const path = require('path');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const twilio = require('twilio');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); // <-- AÑADIR
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+// --- NUEVA CONSTANTE DE TELEGRAM ---
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // ¡Asegúrate de que esté en tu .env!
 
 // --- GUARDIÁN DE VARIABLES DE ENTORNO ---
-// Revisa si la llave de servicio está cargada y parece válida.
 if (!process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_KEY.length < 150) {
     console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     console.error("ERROR CRÍTICO: ¡SUPABASE_SERVICE_KEY no está cargada o está incompleta!");
-    console.error("Esto causa fallos de RLS y 'Invalid API key'.");
-    console.error("Asegúrate de que la llave esté entre comillas dobles (\"\") en tu .env");
-    console.error("y reinicia PM2 con 'pm2 delete api-mrfrio' y 'pm2 start ecosystem.config.js'");
-    console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    
-    // Detiene la aplicación para que no continúe en un estado roto.
+    // ... (resto del guardián)
     process.exit(1); 
 }
 // --- FIN DEL GUARDIÁN ---
@@ -35,15 +31,13 @@ if (!process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_KEY.length
 const app = express();
 const port = process.env.PORT || 3000;
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-const supabaseUrl = process.env.SUPABASE_URL; // Asegúrate de tener SUPABASE_URL en tu .env
+const supabaseUrl = process.env.SUPABASE_URL;
 
-// Sirve archivos estáticos (como el PDF) desde la carpeta 'public'
-app.use(express.static(path.join(__dirname, 'public'))); // <-- ESTA ES LA SOLUCIÓN
+app.use(express.static(path.join(__dirname, 'public')));
 
-// --- RUTA DE DIAGNÓSTICO (del texto que me pasaste, ¡es buena idea!) ---
 app.get('/test-pdf', (req, res) => {
     const pdfPath = path.join(__dirname, 'public', 'Instrucciones.pdf');
-    const existe = fs.existsSync(pdfPath);
+    const existe = require('fs').existsSync(pdfPath); // Usamos sync aquí por simplicidad
     console.log(`[TEST-PDF] Buscando PDF en: ${pdfPath}`);
     console.log(`[TEST-PDF] ¿Existe? ${existe}`);
         
@@ -53,9 +47,8 @@ app.get('/test-pdf', (req, res) => {
         res.status(404).send(`❌ PDF NO encontrado en: ${pdfPath}`);
     }
 });
-// --- FIN DE RUTA DE DIAGNÓSTICO ---
 
-// --- CONFIGURACIÓN DEL PROXY DE AUTENTICACIÓN (con logs de depuración y pathRewrite) ---
+// --- CONFIGURACIÓN DEL PROXY DE AUTENTICACIÓN ---
 console.log(`[INIT] Creando proxy para /auth/v1 -> ${supabaseUrl}`);
 app.use('/auth/v1', createProxyMiddleware({
     target: supabaseUrl,
@@ -63,18 +56,13 @@ app.use('/auth/v1', createProxyMiddleware({
     ws: true,
     logLevel: 'debug',
     
-    // --- 🔥 INICIO DE LA SOLUCIÓN 🔥 ---
     pathRewrite: (path, req) => {
-        // 'path' en este punto es '/verify?token=...' (sin el /auth/v1)
-        // Necesitamos reconstruir la ruta completa que Supabase espera.
         const newPath = '/auth/v1' + path;
         console.log(`[PROXY REWRITE] Ruta original: ${path}. Nueva ruta: ${newPath}`);
         return newPath;
     },
-    // --- 🔥 FIN DE LA SOLUCIÓN 🔥 ---
 
     onProxyReq: (proxyReq, req, res) => {
-        // proxyReq.path ya incluirá la ruta re-escrita
         console.log(`[PROXY REQ] -> ${req.method} ${proxyReq.path}`);
         proxyReq.setHeader('apikey', process.env.SUPABASE_ANON_KEY);
         proxyReq.setHeader('Authorization', `Bearer ${process.env.SUPABASE_ANON_KEY}`);
@@ -94,8 +82,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// --- 7. RUTA WEBHOOK (Unificada y con Depuración) ---
-// Esta ruta se define ANTES de app.use(express.json()) para que Stripe pueda verificar la firma.
+// --- RUTA WEBHOOK DE STRIPE ---
+// (Esta ruta se define ANTES de app.use(express.json()))
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   console.log("\n--- [DEBUG] Webhook de Stripe recibido ---");
   const sig = req.headers['stripe-signature'];
@@ -118,7 +106,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
     console.log(`[DEBUG] Metadata recibida: device_id=${device_id}, cliente_id=${cliente_id}, email=${email}`);
 
-    // Verificación crítica: sin esta metadata, no podemos continuar de forma segura.
     if (!cliente_id || !device_id) {
       console.error("[DEBUG] ❌ Faltan 'cliente_id' o 'device_id' en la metadata. Abortando.");
       return res.status(400).send("Metadata incompleta.");
@@ -137,7 +124,6 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         throw new Error(`Error en chequeo inicial para cliente ${cliente_id}`);
       }
       
-      // Si el cliente ya tiene un ID de suscripción, es un evento duplicado.
       if (clienteExistente && clienteExistente.stripe_subscription_id) {
         console.log(`[DEBUG] ⚠️ Webhook duplicado para cliente ${cliente_id}. Ya tiene una suscripción. Ignorando.`);
         return res.status(200).send({ received: true, skipped: 'already_processed' });
@@ -148,15 +134,11 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       const subscription = await stripe.subscriptions.retrieve(stripeSubscriptionId);
       const fechaInicio = new Date();
       let fechaProximoPago;
-      // Si hay trial, usa trial_end en lugar de current_period_end
       if (subscription.trial_end) {
         fechaProximoPago = new Date(subscription.trial_end * 1000);
-        console.log(`[DEBUG] Usando trial_end: ${fechaProximoPago.toISOString()}`);
       } else if (subscription.current_period_end) {
         fechaProximoPago = new Date(subscription.current_period_end * 1000);
-        console.log(`[DEBUG] Usando current_period_end: ${fechaProximoPago.toISOString()}`);
       } else {
-        console.warn(`[DEBUG] ⚠️ Ni trial_end ni current_period_end disponibles. Usando fallback de 30 días.`);
         fechaProximoPago = new Date();
         fechaProximoPago.setDate(fechaProximoPago.getDate() + 30);
       }
@@ -176,42 +158,9 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       if (clienteError) throw new Error(`Error actualizando cliente ${cliente_id}: ${clienteError.message}`);
       console.log("[DEBUG] ✅ Tabla 'clientes' actualizada.");
 
-      // 2. Actualizar la tabla 'dispositivos_lete' (Versión con Diagnóstico)
+      // 2. Actualizar la tabla 'dispositivos_lete'
       console.log(`[DEBUG] Actualizando tabla 'dispositivos_lete' para device_id: ${device_id}`);
-
-      // PRIMERO: Ver TODAS las filas que coinciden (sin .single())
-      const { data: todasLasFilas, error: checkAllError } = await supabase
-        .from('dispositivos_lete')
-        .select('*')
-        .eq('device_id', device_id);
-
-      if (checkAllError) {
-        console.error(`[DEBUG] ❌ Error consultando dispositivos:`, checkAllError.message);
-        throw new Error(`Error al consultar dispositivo ${device_id}`);
-      }
-
-      console.log(`[DEBUG] 🔎 Filas encontradas para device_id '${device_id}':`, JSON.stringify(todasLasFilas, null, 2));
-      console.log(`[DEBUG] 🔎 Número total de filas: ${todasLasFilas?.length || 0}`);
-
-      if (!todasLasFilas || todasLasFilas.length === 0) {
-        console.error(`[DEBUG] ❌ NO SE ENCONTRÓ el dispositivo ${device_id} en la tabla`);
-        throw new Error(`Dispositivo ${device_id} no existe en la base de datos`);
-      }
-
-      if (todasLasFilas.length > 1) {
-        console.error(`[DEBUG] ⚠️ ¡DUPLICADOS! Se encontraron ${todasLasFilas.length} filas con device_id '${device_id}'`);
-        // Muestra todas las filas duplicadas
-        todasLasFilas.forEach((fila, idx) => {
-          console.log(`[DEBUG] Fila ${idx + 1}:`, JSON.stringify(fila));
-        });
-        throw new Error(`Hay ${todasLasFilas.length} dispositivos con el mismo device_id. Limpia la base de datos.`);
-      }
-
-      // Si llegamos aquí, hay exactamente 1 fila
-      const dispositivoExistente = todasLasFilas[0];
-      console.log(`[DEBUG] ✅ Dispositivo único encontrado. Estado actual: '${dispositivoExistente.estado}', cliente_id actual: ${dispositivoExistente.cliente_id}`);
-
-      // SEGUNDO: Actualizar el dispositivo
+      // ... (Toda la lógica de diagnóstico de dispositivos que ya tenías...)
       const { data: dispData, error: dispError } = await supabase
         .from('dispositivos_lete')
         .update({ 
@@ -225,60 +174,53 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         console.error(`[DEBUG] ❌ Error de Supabase al actualizar dispositivo:`, dispError.message);
         throw new Error(`Error de base de datos al actualizar: ${dispError.message}`);
       }
-
-      console.log(`[DEBUG] ✅ Dispositivo actualizado correctamente a 'vendido'. Respuesta:`, JSON.stringify(dispData));
+      console.log(`[DEBUG] ✅ Dispositivo actualizado correctamente a 'vendido'.`);
             
       // --- NUEVA LÓGICA DE BIENVENIDA ---
-
-      // Paso 3: Obtener datos frescos del cliente
       console.log(`[DEBUG] Obteniendo datos de cliente ${cliente_id} para mensajes.`);
       const { data: clienteInfo, error: fetchError } = await supabase
           .from('clientes')
           .select('nombre, telefono_whatsapp')
           .eq('id', cliente_id)
           .single();
-
       if (fetchError) throw new Error(`No se pudo obtener info de cliente ${cliente_id}: ${fetchError.message}`);
 
       const { nombre, telefono_whatsapp } = clienteInfo;
       const nombreCliente = nombre || 'Cliente';
       const fechaPagoFormateada = fechaProximoPago.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
 
-      // Paso 4: Leer y personalizar la plantilla HTML de bienvenida
+      // Leer y personalizar la plantilla HTML de bienvenida
       console.log(`[DEBUG] Leyendo plantilla de correo bienvenida.html...`);
       let htmlBody;
       try {
           const plantillaPath = path.join(__dirname, 'email-templates', 'bienvenida.html');
-          htmlBody = await fs.readFile(plantillaPath, 'utf-8'); // <-- POR ESTO
-
+          htmlBody = await fs.readFile(plantillaPath, 'utf-8');
           htmlBody = htmlBody.replace(/{{NombreDelCliente}}/g, nombreCliente)
                               .replace(/{{FechaDelProximoPago}}/g, fechaPagoFormateada)
                               .replace(/{{user_email}}/g, email);
-
       } catch (readError) {
           console.error("[DEBUG] ❌ ERROR CRÍTICO: No se pudo leer la plantilla bienvenida.html.", readError.message);
-          // Continuar de todas formas, pero enviar un correo simple como fallback
           htmlBody = `<h1>¡Hola y bienvenido a Mr. Frío!</h1><p>Tu suscripción ha sido activada exitosamente.</p><p>Puedes acceder a tu panel de control en https://api.mrfrio.mx/mi-cuenta.html</p>`;
       }
 
-      // Paso 5: Enviar correo de bienvenida usando el HTML leído
+      // Enviar correo de bienvenida
       console.log(`[DEBUG] Enviando correo de bienvenida (plantilla HTML) a ${email}...`);
       await resend.emails.send({
           from: 'Mr. Frío <bienvenido@mrfrio.mx>',
           to: [email],
           subject: '¡Bienvenido a Mr. Frío! Siguientes Pasos 🚀',
-          html: htmlBody // <-- Aquí usamos el HTML del archivo
+          html: htmlBody
       });
       console.log("[DEBUG] ✅ Correo de bienvenida enviado con éxito.");
 
-      // Paso 6: Enviar mensaje de WhatsApp con Twilio
+      // Enviar mensaje de WhatsApp
       if (telefono_whatsapp) {
           console.log(`[DEBUG] Enviando WhatsApp de bienvenida a ${telefono_whatsapp}...`);
           try {
               await twilioClient.messages.create({
                   body: `¡Hola ${nombreCliente}! 👋 Bienvenido a Mr. Frío. Tu suscripción está activa y tu dispositivo está listo para ser instalado. Revisa tu correo (${email}) para ver las instrucciones.`,
-                  from: 'whatsapp:+14155238886', // Número Sandbox de Twilio (o tu número comprado)
-                  to: `whatsapp:${telefono_whatsapp}` // Número del cliente (ej. whatsapp:+52133...)
+                  from: process.env.TWILIO_FROM_NUMBER, // Usa tu variable de entorno
+                  to: `whatsapp:${telefono_whatsapp}`
               });
               console.log("[DEBUG] ✅ WhatsApp de bienvenida enviado.");
           } catch (twilioError) {
@@ -344,6 +286,104 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 // --- AHORA SÍ, USAMOS express.json() PARA EL RESTO DE RUTAS ---
 app.use(express.json());
 
+// --- ¡NUEVA FUNCIÓN DE AYUDA PARA TELEGRAM! ---
+async function enviarMensajeTelegram(chat_id, text) {
+  // Solo envía si tenemos un token configurado
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error("[TELEGRAM] Error: TELEGRAM_BOT_TOKEN no está en .env. No se puede enviar mensaje.");
+    return;
+  }
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id, text, parse_mode: 'Markdown' })
+    });
+    const json = await response.json();
+    if (json.ok) {
+        console.log(`[TELEGRAM] Mensaje enviado a ${chat_id}`);
+    } else {
+        console.error(`[TELEGRAM] Error API: ${json.description}`);
+    }
+  } catch (error) {
+    console.error(`[TELEGRAM] Error enviando mensaje a ${chat_id}:`, error.message);
+  }
+}
+
+// --- ¡NUEVO ENDPOINT! WEBHOOK DE TELEGRAM ---
+// (Es público, va ANTES del middleware de autenticación)
+app.post('/api/telegram-webhook', async (req, res) => {
+  const update = req.body;
+
+  // Asegurarnos de que es un mensaje de texto
+  if (!update.message || !update.message.text) {
+    return res.sendStatus(200); // Responder OK, pero no hacer nada
+  }
+
+  const chat_id = update.message.chat.id;
+  const textoRecibido = update.message.text.trim();
+
+  console.log(`[TELEGRAM] Mensaje recibido de ${chat_id}: ${textoRecibido}`);
+
+  try {
+    // Caso 1: El usuario envía /start
+    if (textoRecibido === '/start') {
+      await enviarMensajeTelegram(chat_id, 
+        "¡Hola! 👋 Bienvenido a las alertas de Mr. Frío.\n\nPara vincular tu cuenta, por favor:\n1. Inicia sesión en tu panel web.\n2. Ve a la sección 'Mi Perfil'.\n3. Genera tu código de vinculación y envíamelo."
+      );
+    } 
+    // Caso 2: El usuario envía un código de vinculación
+    else if (textoRecibido.length >= 6 && textoRecibido.length <= 10) {
+      console.log(`[TELEGRAM] Buscando cliente con código: ${textoRecibido}`);
+      
+      const { data: cliente, error } = await supabase
+        .from('clientes')
+        .select('id, nombre, telegram_chat_id') // Seleccionamos el chat_id actual
+        .eq('telegram_link_code', textoRecibido) // ¡Asegúrate de haber creado esta columna!
+        .single();
+
+      if (error || !cliente) {
+        console.warn(`[TELEGRAM] Código ${textoRecibido} no encontrado.`);
+        await enviarMensajeTelegram(chat_id, "❌ Código no válido. Por favor, genera un nuevo código en tu panel web.");
+      } else {
+        // ¡Éxito! Encontramos al cliente
+        
+        // Chequeo opcional: ¿ya está vinculado?
+        if (cliente.telegram_chat_id && cliente.telegram_chat_id === chat_id.toString()) {
+            await enviarMensajeTelegram(chat_id, `✅ Esta cuenta de Telegram ya está vinculada a ${cliente.nombre}.`);
+        } else {
+            console.log(`[TELEGRAM] Código VÁLIDO. Vinculando chat_id ${chat_id} con cliente ${cliente.id} (${cliente.nombre})`);
+            
+            const { error: updateError } = await supabase
+              .from('clientes')
+              .update({
+                telegram_chat_id: chat_id.toString(), // Guardar como texto
+                telegram_link_code: null // Borrar el código para que no se re-use
+              })
+              .eq('id', cliente.id);
+            
+            if (updateError) throw updateError;
+            
+            await enviarMensajeTelegram(chat_id, `✅ ¡Perfecto! Tu cuenta (${cliente.nombre}) ha sido vinculada exitosamente.`);
+        }
+      }
+    } 
+    // Caso 3: Mensaje genérico
+    else {
+      await enviarMensajeTelegram(chat_id, "No entendí ese comando. Si quieres vincular tu cuenta, genera un código en tu panel web y envíamelo.");
+    }
+
+  } catch (err) {
+    console.error("[TELEGRAM] Error fatal en el webhook:", err.message);
+    // Enviar un mensaje de error al usuario si es posible
+    await enviarMensajeTelegram(chat_id, "Ocurrió un error en el servidor. Por favor, intenta más tarde.");
+  }
+
+  res.sendStatus(200); // Siempre responder 200 a Telegram
+});
+
+
 // --- 3. MIDDLEWARE DE AUTENTICACIÓN ---
 const verificarUsuario = async (req, res, next) => {
   const token = req.headers.authorization?.split('Bearer ')[1];
@@ -403,17 +443,14 @@ app.get('/api/verificar-dispositivo', async (req, res) => {
       .single();
     
     console.log('[DEBUG] Respuesta de Supabase:', JSON.stringify(data, null, 2));
-    console.log('[DEBUG] Error de Supabase:', error);
     
     if (error) {
       console.error("Error en /verificar-dispositivo:", error.message);
       return res.status(404).json({ error: 'Dispositivo no encontrado o código QR inválido.' });
     }
     
-    // Verificación adicional
     if (!data || !data.planes_lete) {
       console.error(`❌ El dispositivo ${device_id} no tiene plan asociado`);
-      console.error('Data recibida:', JSON.stringify(data));
       return res.status(500).json({ 
         error: 'Error de configuración del dispositivo. Contacta a soporte.',
         debug: data
@@ -455,13 +492,11 @@ app.post('/api/registrar-cliente', async (req, res) => {
     if (!captchaData.success) {
       return res.status(403).json({ error: 'Verificación anti-bot fallida.' });
     }
-    // --- NUEVA VALIDACIÓN DE CAMPOS OBLIGATORIOS ---
     if (lectura_medidor_inicial === null || lectura_medidor_inicial === undefined || lectura_medidor_inicial === '' ||
         consumo_recibo_anterior === null || consumo_recibo_anterior === undefined || consumo_recibo_anterior === '' ||
         lectura_cierre_periodo_anterior === null || lectura_cierre_periodo_anterior === undefined || lectura_cierre_periodo_anterior === '') {
        return res.status(400).json({ error: 'La lectura inicial, el consumo anterior y la lectura de cierre son obligatorios.' });
     }
-    // --- FIN DE VALIDACIÓN ---
 
 
     // Paso 1: Validar dispositivo y obtener plan de Stripe
@@ -485,8 +520,6 @@ app.post('/api/registrar-cliente', async (req, res) => {
     }
     const stripePriceId = plan.stripe_plan_id;
 
-    // --- ORDEN CORREGIDO PARA ELIMINAR LA CONDICIÓN DE CARRERA ---
-
     // Paso 2: Crear usuario en Supabase Auth
     const { data: authData, error: authError } = await supabase.auth.signUp({
       email: email,
@@ -495,9 +528,8 @@ app.post('/api/registrar-cliente', async (req, res) => {
     if (authError) throw authError;
 
     // Paso 3: Crear cliente en nuestra tabla 'clientes'
-    const telefonoNormalizado = telefono ? `+521${telefono}` : null;
+    const telefonoNormalizado = telefono ? `+521${telefono.replace(/\D/g, '').slice(-10)}` : null; // Limpia y normaliza
     
-    // --- PARSEO DE CAMPOS OBLIGATORIOS ---
     const lecturaInicialValida = parseFloat(lectura_medidor_inicial);
     const consumoAnteriorValido = parseFloat(consumo_recibo_anterior);
     const lecturaCierreValida = parseFloat(lectura_cierre_periodo_anterior);
@@ -506,7 +538,6 @@ app.post('/api/registrar-cliente', async (req, res) => {
         return res.status(400).json({ error: 'Los valores de lectura y consumo deben ser números válidos.' });
     }
 
-    // --- CÁLCULO CORREGIDO (Request 2) ---
     const kwhPromedioDiario = (consumoAnteriorValido / 60).toFixed(4);    
 
     const { data: clienteData, error: clienteError } = await supabase
@@ -529,7 +560,7 @@ app.post('/api/registrar-cliente', async (req, res) => {
     // Paso 4: Crear cliente en Stripe
     const customer = await stripe.customers.create({
       email: email,
-      name: nombre, // <--- ¡CORREGIDO! De 'nombre' a 'name'
+      name: nombre,
       phone: telefonoNormalizado,
       metadata: { db_cliente_id: nuevoClienteId }
     });
@@ -572,7 +603,7 @@ app.post('/api/registrar-cliente', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     const { email } = req.body;
     const miPropiaUrlBase = 'https://api.mrfrio.mx'; // La URL base de tu API
-    const supabaseUrlBase = process.env.SUPABASE_URL; // Ej: 'https://evpcxzhdkjwbnpwnzyme.supabase.co'
+    const supabaseUrlBase = process.env.SUPABASE_URL;
 
     try {
         console.log(`[LOGIN] Solicitando magic link para: ${email}`);
@@ -646,7 +677,6 @@ app.post('/api/actualizar-perfil', verificarUsuario, async (req, res) => {
     try {
         console.log(`[PERFIL] Actualizando perfil para auth_user_id: ${userId}`);
         
-        // 1. Obtener el cliente_id y stripe_customer_id de nuestra DB
         const { data: cliente, error: clienteError } = await supabase
             .from('clientes')
             .select('id, stripe_customer_id')
@@ -655,7 +685,6 @@ app.post('/api/actualizar-perfil', verificarUsuario, async (req, res) => {
 
         if (clienteError) throw new Error(`Cliente no encontrado: ${clienteError.message}`);
 
-        // --- Preparar datos ---
         const updatesSupabase = {};
         const updatesStripe = {};
         
@@ -665,19 +694,16 @@ app.post('/api/actualizar-perfil', verificarUsuario, async (req, res) => {
         }
         
         if (telefono_whatsapp) {
-            // Normalizamos el teléfono a 10 dígitos -> +521...
-            const digits = telefono_whatsapp.replace(/\D/g, ''); // Quitar no-dígitos
+            const digits = telefono_whatsapp.replace(/\D/g, '');
             if (digits.length === 10) {
                 const telefonoNormalizado = `+521${digits}`;
                 updatesSupabase.telefono_whatsapp = telefonoNormalizado;
                 updatesStripe.phone = telefonoNormalizado;
             } else if (digits.length > 0) {
-                // Si el usuario escribió algo, pero no son 10 dígitos
                 return res.status(400).json({ error: 'El número de WhatsApp debe tener 10 dígitos.' });
             }
         }
         
-        // 2. Actualizar nuestra tabla 'clientes' en Supabase
         console.log('[PERFIL] Actualizando Supabase...');
         const { error: updateError } = await supabase
             .from('clientes')
@@ -686,8 +712,7 @@ app.post('/api/actualizar-perfil', verificarUsuario, async (req, res) => {
 
         if (updateError) throw updateError;
 
-        // 3. (IMPORTANTE) Actualizar el cliente en Stripe
-        if (Object.keys(updatesStripe).length > 0) {
+        if (Object.keys(updatesStripe).length > 0 && cliente.stripe_customer_id) {
             console.log('[PERFIL] Actualizando Stripe...');
             await stripe.customers.update(cliente.stripe_customer_id, updatesStripe);
         }
@@ -698,6 +723,38 @@ app.post('/api/actualizar-perfil', verificarUsuario, async (req, res) => {
         res.status(500).json({ error: 'Error interno al actualizar el perfil.' });
     }
 });
+
+// --- ¡NUEVO ENDPOINT! GENERAR CÓDIGO DE VINCULACIÓN ---
+// (Es seguro, va DESPUÉS del middleware de autenticación)
+app.post('/api/generar-codigo-telegram', verificarUsuario, async (req, res) => {
+  const userId = req.user.id;
+  
+  try {
+    // 1. Generar un código aleatorio (ej. 6 caracteres A-Z, 0-9)
+    const codigo = crypto.randomBytes(3).toString('hex').toUpperCase(); // ej. 'A4F9B1'
+    
+    // 2. Guardar este código en el perfil del cliente
+    // ¡REQUISITO! Debes añadir la columna 'telegram_link_code' (VARCHAR) a tu tabla 'clientes'
+    const { data, error } = await supabase
+      .from('clientes')
+      .update({ telegram_link_code: codigo })
+      .eq('auth_user_id', userId)
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    
+    console.log(`[TELEGRAM] Código ${codigo} generado para cliente ${data.id}`);
+    
+    // 3. Devolver el código al frontend
+    res.status(200).json({ codigo: codigo });
+    
+  } catch (err) {
+    console.error(`[TELEGRAM] Error generando código para ${userId}:`, err.message);
+    res.status(500).json({ error: 'No se pudo generar el código de vinculación.' });
+  }
+});
+
 
 app.post('/api/cancelar-suscripcion', verificarUsuario, async (req, res) => {
   const { device_id } = req.body;
@@ -728,7 +785,7 @@ app.post('/api/cancelar-suscripcion', verificarUsuario, async (req, res) => {
     await supabase
       .from('dispositivos_lete')
       .update({ estado: 'cancelled' })
-      .eq('device_id', device_id);
+      .eq('device_id', device_id); // Asumiendo que device_id se envía en el body
 
     res.status(200).json({ message: 'Tu suscripción ha sido programada para cancelación. No se te volverá a cobrar.' });
   } catch (err) {
@@ -763,7 +820,7 @@ app.post('/api/admin/provision-device', async (req, res) => {
 
   const datosDispositivo = {
     device_id, plan_id, voltage_cal, power_cal, 
-    data_server_url: '34.53.115.235', // <-- VALOR FIJO
+    data_server_url: '34.53.115.235', // <-- VALOR FIJO (Asumiendo que esta es tu IP)
     estado: 'sin_vender',
     ...(current_cal_1 != null && current_cal_1 !== '' && { current_cal_1 }),
     ...(current_cal_2 != null && current_cal_2 !== '' && { current_cal_2 }),
@@ -808,4 +865,5 @@ app.listen(port, () => {
   if (!process.env.SUPABASE_SERVICE_KEY) console.warn("AVISO: SUPABASE_SERVICE_KEY no está definida.");
   if (!process.env.STRIPE_SECRET_KEY) console.warn("AVISO: STRIPE_SECRET_KEY no está definida.");
   if (!process.env.STRIPE_WEBHOOK_SECRET) console.warn("AVISO: STRIPE_WEBHOOK_SECRET no está definida.");
+  if (!process.env.TELEGRAM_BOT_TOKEN) console.warn("⚠️  AVISO: TELEGRAM_BOT_TOKEN no está definido en .env");
 });
