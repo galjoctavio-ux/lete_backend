@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 
 """
-RECEPTOR MQTT -> INFLUXDB (v3 - PRODUCCIÓN)
+RECEPTOR MQTT -> INFLUXDB (v5 - PRODUCCIÓN + ANTI-BLOQUEO)
 
 Este script actúa como un servicio intermediario que:
 1. Escucha mensajes MQTT provenientes de dispositivos ESP32.
 2. Maneja los reportes de arranque ('boot_time') y los guarda en PostgreSQL.
-3. Acumula las mediciones en un buffer (batching) de forma segura (thread-safe).
-4. Envía los lotes de mediciones a InfluxDB de forma eficiente y robusta.
-5. Utiliza 'logging' para un monitoreo de nivel de producción.
-6. Carga toda la configuración desde un archivo .env.
+3. Verifica el estado de suscripción del cliente (con caché).
+4. Si está 'active', envía a InfluxDB (batching).
+5. Si está en 'grace_period', guarda en una tabla 'mediciones_pendientes' en PostgreSQL.
+6. Si está 'expired', descarta el dato.
+7. Si la suscripción se reactiva, reenvía los datos pendientes a InfluxDB.
+8. Si la suscripción expira (post-gracia), purga los datos pendientes.
+9. [NUEVO] Mueve lotes "venenosos" (que Influx rechaza) a un archivo .log 
+   en lugar de re-encolarlos, evitando bloqueos ("Poison Pill").
 """
 
 # --- 1. LIBRERÍAS ---
@@ -22,8 +26,9 @@ import logging
 import sys
 import threading
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque
+from psycopg2.extras import execute_values 
 
 # Librerías para InfluxDB
 from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -34,7 +39,6 @@ from influxdb_client.client.exceptions import InfluxDBError
 load_dotenv()
 
 # Configuración de Logging
-# (Se configurará en main() para asegurar que se ejecute primero)
 logger = logging.getLogger(__name__)
 
 # Configuración de Supabase (PostgreSQL)
@@ -42,6 +46,8 @@ DB_HOST = os.environ.get("DB_HOST")
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
+# String de conexión para threads (ya que psycopg2 no es thread-safe)
+DB_CONN_STRING = f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} password={DB_PASS}"
 
 # Configuración de MQTT
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST")
@@ -64,6 +70,10 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 50))
 BATCH_TIMEOUT = int(os.environ.get("BATCH_TIMEOUT", 10))
 MAX_RETRY_ATTEMPTS = int(os.environ.get("MAX_RETRY_ATTEMPTS", 3))
 
+# --- Configuración de Lógica de Suscripción ---
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 300)) # 5 minutos
+GRACE_PERIOD_DAYS = int(os.environ.get("GRACE_PERIOD_DAYS", 30))
+
 # --- 3. Clientes y Conexiones Globales ---
 db_conn = None
 influx_client = None
@@ -73,6 +83,11 @@ influx_write_api = None
 measurement_buffer = deque()
 buffer_lock = threading.Lock()
 last_flush_time = time.time()
+
+# Caché de estados de suscripción (thread-safe)
+device_status_cache = {}
+cache_lock = threading.Lock()
+
 
 # --- 4. Lógica de Base de Datos (PostgreSQL) ---
 
@@ -87,13 +102,7 @@ def connect_db():
             if db_conn and not db_conn.closed:
                 db_conn.close()
             logger.info(f"Conectando a PostgreSQL en {DB_HOST}...")
-            db_conn = psycopg2.connect(
-                host=DB_HOST,
-                user=DB_USER,
-                password=DB_PASS,
-                dbname=DB_NAME,
-                connect_timeout=10
-            )
+            db_conn = psycopg2.connect(DB_CONN_STRING, connect_timeout=10)
             db_conn.autocommit = True
             logger.info("✅ Conexión con PostgreSQL (Supabase) exitosa.")
             return True
@@ -108,13 +117,15 @@ def connect_db():
     return False
 
 def setup_database_schema():
-    """Asegura que la tabla de BOOT SESSIONS exista en PostgreSQL."""
+    """Asegura que las tablas necesarias existan en PostgreSQL."""
     if not db_conn or db_conn.closed:
         if not connect_db():
             return False
     try:
         with db_conn.cursor() as cursor:
             logger.info("Verificando esquema de PostgreSQL...")
+            
+            # 1. Tabla de Sesiones de Arranque
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dispositivo_boot_sessions (
                     device_id VARCHAR(20) PRIMARY KEY,
@@ -122,7 +133,27 @@ def setup_database_schema():
                     last_updated TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-            logger.info("✅ Esquema de PostgreSQL verificado.")
+            
+            # 2. Tabla de mediciones pendientes (para período de gracia)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS mediciones_pendientes (
+                    id BIGSERIAL PRIMARY KEY,
+                    device_id VARCHAR(20) NOT NULL,
+                    ts_unix BIGINT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mediciones_pendientes_device_id 
+                ON mediciones_pendientes (device_id);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mediciones_pendientes_ts_unix
+                ON mediciones_pendientes (ts_unix);
+            """)
+
+            logger.info("✅ Esquema de PostgreSQL verificado (boot_sessions y mediciones_pendientes).")
             return True
     except psycopg2.Error as e:
         logger.error(f"❌ ERROR al configurar el esquema: {e}")
@@ -166,15 +197,45 @@ def connect_influx():
     logger.critical(f"❌ CRÍTICO: No se pudo conectar a InfluxDB después de {max_retries} intentos")
     return False
 
+# --- [NUEVO] Helper Anti-Poison-Pill ---
+def quarantine_failed_batch(points_to_send, original_exception, context_message):
+    """
+    Guarda un lote fallido en un archivo de 'cuarentena' en disco.
+    Esto EVITA que un lote "venenoso" bloquee la pipeline.
+    """
+    try:
+        # Convertir puntos a line protocol para loggear fácilmente
+        failed_data = "\n".join([p.to_line_protocol() for p in points_to_send])
+        
+        # Usar un nombre de archivo único
+        fail_filename = f"failed_batch_{int(time.time())}.log"
+        
+        with open(fail_filename, "w") as f:
+            f.write(f"# Contexto: {context_message}\n")
+            f.write(f"# Falla: {original_exception}\n")
+            f.write(f"# Puntos: {len(points_to_send)}\n")
+            f.write(failed_data)
+
+        logger.warning(f"☣️ {context_message} ({len(points_to_send)} puntos) guardado en '{fail_filename}'. Descartando del buffer.")
+
+    except Exception as log_e:
+        logger.error(f"¡FALLO AL GUARDAR LOTE FALLIDO! ({context_message}): {log_e}")
+    
+    # Devolver False para indicar que el flush falló, pero NO se re-encola.
+    return False
+
+# --- [MODIFICADO] Lógica de InfluxDB con Anti-Bloqueo ---
 def flush_buffer_to_influx():
-    """Envía todas las mediciones acumuladas a InfluxDB en un solo batch."""
+    """
+    Envía todas las mediciones acumuladas a InfluxDB en un solo batch.
+    [v5] Incluye lógica anti-bloqueo ("Poison Pill").
+    """
     global last_flush_time
     
     with buffer_lock:
         if len(measurement_buffer) == 0:
             return True
         
-        # Copiar el buffer y vaciarlo inmediatamente
         points_to_send = list(measurement_buffer)
         measurement_buffer.clear()
     
@@ -182,6 +243,7 @@ def flush_buffer_to_influx():
     
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
+            # 1. Intento de escritura normal
             influx_write_api.write(
                 bucket=INFLUX_BUCKET_NEW, 
                 org=INFLUX_ORG, 
@@ -189,18 +251,19 @@ def flush_buffer_to_influx():
             )
             logger.info(f"✅ Batch enviado exitosamente ({len(points_to_send)} puntos)")
             last_flush_time = time.time()
-            return True
+            return True # <-- ÉXITO
             
         except InfluxDBError as e:
+            # 2. Error de InfluxDB (ej. Bad Request, schema inválido)
             logger.error(f"❌ ERROR de InfluxDB (intento {attempt+1}/{MAX_RETRY_ATTEMPTS}): {e}")
             if attempt < MAX_RETRY_ATTEMPTS - 1:
                 time.sleep(2 ** attempt)  # Backoff exponencial
             else:
-                # Si falla después de todos los intentos, reconectar
+                # 3. Último intento falló. Probar reconexión...
                 logger.warning("🔄 Reconectando a InfluxDB...")
                 if connect_influx():
-                    # Último intento después de reconectar
                     try:
+                        # 4. Último intento después de reconectar
                         influx_write_api.write(
                             bucket=INFLUX_BUCKET_NEW, 
                             org=INFLUX_ORG, 
@@ -208,19 +271,36 @@ def flush_buffer_to_influx():
                         )
                         logger.info(f"✅ Batch enviado tras reconexión")
                         last_flush_time = time.time()
-                        return True
+                        return True # <-- ÉXITO (tras reconexión)
+                    
                     except Exception as e2:
-                        logger.critical(f"❌ CRÍTICO: Fallo final al enviar batch: {e2}")
-                        # Re-añadir al buffer para no perder datos
-                        with buffer_lock:
-                            measurement_buffer.extendleft(reversed(points_to_send))
-                        return False
+                        # 5. [ANTI-BLOQUEO] Influx está UP, pero RECHAZÓ el lote.
+                        # Esta es la "Poison Pill".
+                        logger.critical(f"❌ CRÍTICO: Fallo final al enviar batch (post-reconexión): {e2}")
+                        return quarantine_failed_batch(points_to_send, e2, "Fallo_Post_Reconexion")
+                else:
+                    # 6. [RE-ENCOLAR] Influx está DOWN. No es Poison Pill.
+                    # Re-encolar es lo correcto.
+                    logger.critical("❌ CRÍTICO: No se pudo reconectar a Influx. Re-encolando lote.")
+                    with buffer_lock:
+                        measurement_buffer.extendleft(reversed(points_to_send))
+                    return False
+
         except Exception as e:
-            logger.exception(f"❌ ERROR inesperado en flush. Devolviendo datos al buffer.")
-            with buffer_lock:
-                measurement_buffer.extendleft(reversed(points_to_send))
-            return False
+            # 7. Error inesperado (ej. network, bug en 'to_line_protocol', etc.)
+            logger.exception(f"❌ ERROR inesperado en flush (intento {attempt+1}/{MAX_RETRY_ATTEMPTS})")
+            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                time.sleep(2 ** attempt) # Backoff
+            else:
+                # 8. [ANTI-BLOQUEO] Fallo inesperado persistente.
+                # Podría ser una "Poison Pill" (ej. bug de parseo).
+                logger.critical(f"❌ CRÍTICO: Fallo inesperado final al enviar batch: {e}")
+                return quarantine_failed_batch(points_to_send, e, "Fallo_Inesperado_Persistente")
     
+    # 9. (Si el bucle termina) Fallo, re-encolar por seguridad.
+    logger.error("El bucle de flush terminó inesperadamente. Re-encolando por seguridad.")
+    with buffer_lock:
+        measurement_buffer.extendleft(reversed(points_to_send))
     return False
 
 def check_and_flush_buffer():
@@ -272,26 +352,157 @@ def handle_boot_time(payload_str):
         logger.error(f"❌ ERROR: Boot no es JSON válido: {payload_str}")
     except psycopg2.Error as e:
         logger.error(f"❌ ERROR PostgreSQL en handle_boot_time: {e}")
-        connect_db()
+        connect_db() # Intenta reconectar si falla
     except Exception:
         logger.exception("❌ ERROR inesperado en handle_boot_time")
 
 
 def handle_medicion(payload_str, device_id):
-    """Procesa una medición con timestamp Unix y la agrega al buffer."""
+    """
+    Procesa una medición.
+    Verifica el estado de la suscripción y decide si:
+    1. Envía a InfluxDB (Active)
+    2. Guarda en PostgreSQL (Grace Period)
+    3. Descarta (Expired)
+    """
+    try:
+        # 1. Obtener el estado de la suscripción (usando caché)
+        status = get_device_subscription_status(device_id)
+
+        # 2. Decidir acción basada en el estado
+        if status == 'active':
+            # ---------------------------------
+            # ESTADO: ACTIVO -> Enviar a Influx
+            # ---------------------------------
+            point, _ = parse_payload_to_point(payload_str, device_id)
+            if point:
+                with buffer_lock:
+                    measurement_buffer.append(point)
+                check_and_flush_buffer()
+            
+        elif status == 'grace_period':
+            # ---------------------------------
+            # ESTADO: PERÍODO DE GRACIA -> Guardar localmente
+            # ---------------------------------
+            logger.info(f"Suscripción en gracia para {device_id}. Guardando en búfer local.")
+            try:
+                data = json.loads(payload_str)
+                ts_unix = data.get('ts_unix')
+                if ts_unix:
+                    save_to_local_buffer(device_id, ts_unix, payload_str)
+                else:
+                    logger.warning(f"⚠️ Medición en gracia sin ts_unix: {payload_str}")
+            except json.JSONDecodeError:
+                logger.error(f"❌ ERROR: Medición (en gracia) no es JSON válido: {payload_str}")
+
+        elif status == 'expired' or status == 'unknown':
+            # ---------------------------------
+            # ESTADO: EXPIRADO O DESCONOCIDO -> Descartar
+            # ---------------------------------
+            logger.info(f"Suscripción expirada/desconocida para {device_id}. Descartando datos.")
+            # No hacer nada
+
+    except Exception:
+        logger.exception(f"❌ ERROR inesperado en handle_medicion para {device_id}")
+
+# --- 7. Lógica de Suscripción y Búfer Local ---
+
+def get_device_subscription_status(device_id):
+    """
+    Obtiene el estado de suscripción para un device_id.
+    Usa un caché (thread-safe) para evitar consultas excesivas a la BD.
+    Dispara acciones de reenvío o purga si el estado cambia.
+    """
+    global device_status_cache
+    now = time.time()
+    
+    # 1. Revisar caché
+    with cache_lock:
+        cached_data = device_status_cache.get(device_id)
+        if cached_data and cached_data['cached_until'] > now:
+            return cached_data['status'] # Devolver estado cacheado
+
+    # 2. Cache miss o expirado -> Consultar la BD
+    logger.info(f"Cache miss para {device_id}. Consultando estado en PostgreSQL...")
+    
+    sql = """
+        SELECT c.subscription_status, c.fecha_proximo_pago 
+        FROM clientes c
+        JOIN dispositivos_lete d ON c.id = d.cliente_id
+        WHERE d.device_id = %s
+    """
+    
+    new_status = 'unknown' # Default
+    try:
+        with db_conn.cursor() as cursor:
+            cursor.execute(sql, (device_id,))
+            result = cursor.fetchone()
+            
+        if not result:
+            logger.warning(f"⚠️ No se encontró cliente para device_id {device_id}")
+            new_status = 'unknown'
+        else:
+            sub_status, fecha_proximo_pago = result
+            hoy = datetime.now(timezone.utc)
+            
+            if sub_status == 'active':
+                new_status = 'active'
+            elif fecha_proximo_pago is None:
+                new_status = 'expired' # No activo y sin fecha de pago
+            else:
+                # El cliente no está 'active', verificar período de gracia
+                grace_period_end = fecha_proximo_pago + timedelta(days=GRACE_PERIOD_DAYS)
+                
+                if hoy < grace_period_end:
+                    new_status = 'grace_period'
+                else:
+                    new_status = 'expired' # El período de gracia terminó
+
+    except psycopg2.Error as e:
+        logger.error(f"❌ ERROR PostgreSQL en get_device_subscription_status: {e}")
+        connect_db() # Reconectar
+        return 'unknown' # Devolver 'unknown' en error de BD
+    except Exception:
+        logger.exception("❌ ERROR inesperado en get_device_subscription_status")
+        return 'unknown'
+
+    # 3. Lógica de Transición de Estado (Reenviar o Purgar)
+    with cache_lock:
+        old_status = device_status_cache.get(device_id, {}).get('status')
+        
+        if old_status == 'grace_period' and new_status == 'active':
+            logger.info(f"🎉 ¡Suscripción reactivada para {device_id}! Iniciando reenvío de datos pendientes...")
+            threading.Thread(target=resend_local_buffer, args=(device_id,), daemon=True).start()
+
+        elif old_status == 'grace_period' and new_status == 'expired':
+            logger.warning(f"🗑️ Período de gracia terminado para {device_id}. Purgando datos pendientes...")
+            threading.Thread(target=delete_local_buffer, args=(device_id,), daemon=True).start()
+    
+        # 4. Actualizar caché
+        device_status_cache[device_id] = {
+            'status': new_status,
+            'cached_until': now + CACHE_TTL_SECONDS
+        }
+    
+    logger.info(f"Estado actualizado para {device_id}: {new_status} (Cacheado por {CACHE_TTL_SECONDS}s)")
+    return new_status
+
+
+def parse_payload_to_point(payload_str, device_id):
+    """
+    Función helper para convertir un payload JSON en un Point de Influx.
+    Devuelve (Point, ts_unix) o (None, None) si falla.
+    """
     try:
         data = json.loads(payload_str)
-        ts_unix = data.get('ts_unix')  # <-- ¡Cambiado! Ahora viene en Unix
+        ts_unix = data.get('ts_unix')
 
         if ts_unix is None:
             logger.warning(f"⚠️ Medición inválida (sin ts_unix): {payload_str}")
-            return
+            return None, None
         
-        # Convertir el timestamp Unix a un objeto datetime
         timestamp_dt = datetime.fromtimestamp(ts_unix, tz=timezone.utc)
 
-        # Crear el punto de datos para InfluxDB
-        # Se añaden conversiones float() e int() para mayor robustez
         point = Point("energia") \
             .tag("device_id", device_id) \
             .field("vrms", float(data.get('vrms', 0))) \
@@ -303,22 +514,129 @@ def handle_medicion(payload_str, device_id):
             .field("leakage", float(data.get('leak', 0))) \
             .field("temp_cpu", float(data.get('temp', 0))) \
             .field("sequence", int(data.get('seq', 0))) \
-            .time(timestamp_dt, WritePrecision.S)  # Precisión en segundos
+            .time(timestamp_dt, WritePrecision.S)
         
-        # Agregar al buffer (thread-safe)
-        with buffer_lock:
-            measurement_buffer.append(point)
-        
-        # Verificar si es momento de hacer flush
-        check_and_flush_buffer()
-
+        return point, ts_unix
+    
     except json.JSONDecodeError:
-        logger.error(f"❌ ERROR: Medición no es JSON válido: {payload_str}")
+        logger.error(f"❌ ERROR: Medición (en parse) no es JSON válido: {payload_str}")
+        return None, None
     except Exception:
-        logger.exception("❌ ERROR inesperado en handle_medicion")
+        logger.exception("❌ ERROR inesperado en parse_payload_to_point")
+        return None, None
+
+def save_to_local_buffer(device_id, ts_unix, payload_str):
+    """Guarda una medición en la tabla 'mediciones_pendientes'."""
+    sql = """
+        INSERT INTO mediciones_pendientes (device_id, ts_unix, payload_json)
+        VALUES (%s, %s, %s)
+    """
+    try:
+        with db_conn.cursor() as cursor:
+            cursor.execute(sql, (device_id, ts_unix, payload_str))
+    except psycopg2.Error as e:
+        logger.error(f"❌ ERROR PostgreSQL en save_to_local_buffer: {e}")
+        connect_db() # Reconectar
+    except Exception:
+        logger.exception("❌ ERROR inesperado en save_to_local_buffer")
+
+def resend_local_buffer(device_id):
+    """
+    [EJECUTADO EN UN THREAD]
+    Lee todas las mediciones pendientes de un device_id desde PostgreSQL,
+    las envía a InfluxDB y luego las borra de PostgreSQL.
+    """
+    logger.info(f"[Resend Thread {device_id}] Iniciando.")
+    local_db_conn = None
+    try:
+        local_db_conn = psycopg2.connect(DB_CONN_STRING)
+        
+        points_to_resend = []
+        ids_to_delete = []
+
+        with local_db_conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, payload_json FROM mediciones_pendientes WHERE device_id = %s ORDER BY ts_unix", 
+                (device_id,)
+            )
+            rows = cursor.fetchall()
+        
+        if not rows:
+            logger.info(f"[Resend Thread {device_id}] No hay datos pendientes para reenviar.")
+            return
+
+        logger.info(f"[Resend Thread {device_id}] Procesando {len(rows)} mediciones pendientes...")
+
+        for row in rows:
+            id_db, payload_str = row
+            point, _ = parse_payload_to_point(payload_str, device_id)
+            if point:
+                points_to_resend.append(point)
+                ids_to_delete.append(id_db)
+            else:
+                logger.warning(f"[Resend Thread {device_id}] Omitiendo punto inválido ID: {id_db}")
+
+        if not points_to_resend:
+            logger.info(f"[Resend Thread {device_id}] No hay puntos válidos para reenviar.")
+            return
+
+        logger.info(f"[Resend Thread {device_id}] Enviando {len(points_to_resend)} puntos a InfluxDB...")
+        # NOTA: Este reenvío es "todo o nada". Si falla, se reintentará
+        # la próxima vez que el cliente pase de 'gracia' a 'activo'.
+        # Para producción más robusta, se podría implementar batching aquí también.
+        influx_write_api.write(
+            bucket=INFLUX_BUCKET_NEW, 
+            org=INFLUX_ORG, 
+            record=points_to_resend
+        )
+        logger.info(f"[Resend Thread {device_id}] ✅ Reenvío a InfluxDB exitoso.")
+
+        with local_db_conn.cursor() as cursor:
+            execute_values(
+                cursor, 
+                "DELETE FROM mediciones_pendientes WHERE id IN %s", 
+                [(id,) for id in ids_to_delete]
+            )
+        local_db_conn.commit()
+        logger.info(f"[Resend Thread {device_id}] ✅ {len(ids_to_delete)} registros borrados del búfer local.")
+
+    except Exception:
+        logger.exception(f"❌ ERROR CRÍTICO en [Resend Thread {device_id}]")
+        if local_db_conn:
+            local_db_conn.rollback() # Revertir borrado si Influx falló
+    finally:
+        if local_db_conn:
+            local_db_conn.close()
+            logger.info(f"[Resend Thread {device_id}] Conexión de BD local cerrada.")
+
+def delete_local_buffer(device_id):
+    """
+    [EJECUTADO EN UN THREAD]
+    Borra TODAS las mediciones pendientes para un device_id.
+    """
+    logger.info(f"[Purge Thread {device_id}] Iniciando purga.")
+    local_db_conn = None
+    try:
+        local_db_conn = psycopg2.connect(DB_CONN_STRING)
+        local_db_conn.autocommit = True
+        
+        with local_db_conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM mediciones_pendientes WHERE device_id = %s", 
+                (device_id,)
+            )
+            count = cursor.rowcount
+        
+        logger.info(f"[Purge Thread {device_id}] ✅ Purga completada. {count} registros eliminados.")
+
+    except Exception:
+        logger.exception(f"❌ ERROR CRÍTICO en [Purge Thread {device_id}]")
+    finally:
+        if local_db_conn:
+            local_db_conn.close()
 
 
-# --- 7. Lógica de Conexión MQTT ---
+# --- 8. Lógica de Conexión MQTT ---
 
 def on_connect(client, userdata, flags, rc):
     """Callback que se ejecuta cuando nos conectamos al broker."""
@@ -357,39 +675,31 @@ def on_message(client, userdata, msg):
         logger.exception(f"❌ ERROR fatal en on_message procesando topic {msg.topic}")
 
 
-# --- 8. Thread de Flush Periódico ---
+# --- 9. Thread de Flush Periódico ---
 
 def periodic_flush_thread():
-    """Thread que fuerza el flush del buffer periódicamente."""
+    """Thread que fuerza el flush del buffer de Influx periódicamente."""
     while True:
-        # Este chequeo es ligero, no necesita el lock aún
         time_since_last_flush = time.time() - last_flush_time
         
         if (time_since_last_flush > BATCH_TIMEOUT / 2):
-            # Esperar un poco y luego chequear.
-            # No queremos dormir los 10s completos, 
-            # sino chequear más frecuentemente.
             time.sleep(1) 
             check_and_flush_buffer()
         else:
-            # Si se acaba de hacer flush, dormir más tiempo
             time.sleep(BATCH_TIMEOUT / 2)
 
-# --- 9. Ejecución Principal ---
+# --- 10. Ejecución Principal ---
 
 def main():
     # --- Configuración del Logging ---
-    # Nivel: INFO (captura info, warning, error, critical)
-    # Formato: [Timestamp] - [Nivel] - [Módulo] - [Mensaje]
-    # Salida: stdout (consola)
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
         stream=sys.stdout
     )
 
     logger.info("=" * 60)
-    logger.info("INICIANDO RECEPTOR LETE - v3 (PRODUCCIÓN)")
+    logger.info("INICIANDO RECEPTOR LETE - v5 (LÓGICA ANTI-BLOQUEO)")
     logger.info("=" * 60)
     
     # 1. Conectar a las bases de datos
@@ -409,12 +719,12 @@ def main():
     # 3. Iniciar thread de flush periódico
     flush_thread = threading.Thread(target=periodic_flush_thread, daemon=True)
     flush_thread.start()
-    logger.info("✅ Thread de flush periódico iniciado")
+    logger.info("✅ Thread de flush periódico (Influx) iniciado")
 
     # 4. Configurar cliente MQTT
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION1, 
-        client_id="receptor_servidor_lete_v3"
+        client_id="receptor_servidor_lete_v5" # Nuevo Client ID
     )
     
     if MQTT_USERNAME and MQTT_PASSWORD:
@@ -424,7 +734,6 @@ def main():
     client.on_disconnect = on_disconnect
     client.on_message = on_message
 
-    # Configuración de reconexión automática
     client.reconnect_delay_set(min_delay=1, max_delay=120)
 
     # 5. Conectar al broker
@@ -440,22 +749,23 @@ def main():
     # 6. Iniciar bucle de escucha
     logger.info("\n" + "=" * 60)
     logger.info("🚀 Sistema iniciado. Esperando mensajes MQTT...")
-    logger.info(f"📊 Batching: {BATCH_SIZE} mediciones o {BATCH_TIMEOUT}s")
+    logger.info(f"📊 Batching (Influx): {BATCH_SIZE} mediciones o {BATCH_TIMEOUT}s")
+    logger.info(f"💡 Lógica de Suscripción: TTL de caché de {CACHE_TTL_SECONDS}s, Gracia de {GRACE_PERIOD_DAYS} días.")
+    logger.info(f"☣️ Protección Anti-Bloqueo (Poison Pill) ACTIVADA.")
     logger.info("=" * 60 + "\n")
     
     try:
         client.loop_forever()
     except KeyboardInterrupt:
         logger.info("\n\n🛑 Detectado (Ctrl+C). Cerrando sistema...")
-        # Flush final del buffer
-        logger.info("📤 Enviando últimas mediciones pendientes...")
+        logger.info("📤 Enviando últimas mediciones pendientes (Influx)...")
         flush_buffer_to_influx()
     except Exception:
         logger.exception("❌ ERROR CRÍTICO INESPERADO EN EL BUCLE PRINCIPAL")
     finally:
         if db_conn and not db_conn.closed:
             db_conn.close()
-            logger.info("🔌 Conexión con PostgreSQL cerrada.")
+            logger.info("🔌 Conexión principal con PostgreSQL cerrada.")
         if influx_client:
             influx_client.close()
             logger.info("🔌 Conexión con InfluxDB cerrada.")

@@ -1,11 +1,16 @@
 # -------------------------------------------------------------------
-# Script Vigilante de Calidad de Energía v2.4 (Integración con Telegram)
+# Script Vigilante de Calidad de Energía v2.6 (Lógica Híbrida)
 # - Implementa detección de anomalías con media y varianza móvil (EWMA).
 # - Utiliza una columna JSONB en la BD para almacenar estadísticas.
 # - Agrupa el día en 5 bloques de comportamiento para mayor precisión.
 # - Requiere 2 "strikes" consecutivos para enviar una alerta de anomalía.
 # - MODIFICADO: Incluye chequeo de primera medición para enviar felicitación.
 # - AÑADIDO: Envío de alertas dual a WhatsApp y Telegram.
+# - ¡MEJORA v2.6!: La detección de fuga usa lógica HÍBRIDA:
+#   1. Durante el aprendizaje (50h): Compara con UMBRAL ABSOLUTO (0.5A)
+#      (Esto detecta fugas preexistentes en instalaciones nuevas)
+#   2. Después del aprendizaje: Compara con lógica EWMA (media histórica)
+#      (Esto detecta nuevas fugas o empeoramientos)
 # -------------------------------------------------------------------
 
 # --- 1. Importaciones ---
@@ -72,12 +77,17 @@ ZONA_HORARIA_LOCAL = pytz.timezone('America/Mexico_City')
 UMBRAL_VOLTAJE_ALTO = 139.7
 UMBRAL_VOLTAJE_BAJO = 114.3
 CANTIDAD_EVENTOS_VOLTAJE_PARA_ALERTA = 3
-UMBRAL_FUGA_CORRIENTE = 0.5
+UMBRAL_FUGA_CORRIENTE_MINIMO = 0.5 # Umbral mínimo absoluto para CUALQUIER alerta de fuga
 
-# Configuración para Detección de Anomalías
-NUM_STRIKES_PARA_ALERTA = 2
-DESVIACIONES_ESTANDAR_PARA_ANOMALIA = 2.0
-PERIODO_APRENDIZAJE_MUESTRAS = 20
+# Configuración para Detección de Anomalías (Consumo por Bloque Horario)
+NUM_STRIKES_PARA_ALERTA_CONSUMO = 2
+DESVIACIONES_ESTANDAR_PARA_ANOMALIA_CONSUMO = 2.0
+PERIODO_APRENDIZAJE_MUESTRAS_CONSUMO = 20
+
+# Configuración para Detección de Anomalías (Fuga de Corriente Global)
+NUM_STRIKES_PARA_ALERTA_FUGA = 2 # Requiere 2 strikes consecutivos para alertar
+DESVIACIONES_ESTANDAR_PARA_ANOMALIA_FUGA = 4.0 # Más alto (4.0) para ignorar picos de ruido
+PERIODO_APRENDIZAJE_MUESTRAS_FUGA = 50 # Un periodo más largo (aprox 2 días) para establecer una línea base
 
 TARIFAS_CFE_UMBRALES = {
     '01':  [{'limite': 150, 'precio_siguiente': 1.32, 'bandera': 'escalon1'}, {'limite': 280, 'precio_siguiente': 3.85, 'bandera': 'escalon2'}],
@@ -232,7 +242,7 @@ def formatear_mensaje_telegram(template_sid, variables):
         return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 🔺 (más alto que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
         
     elif template_sid == CONTENT_SID_REPORTE_MENOS:
-        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 👇 (más bajo que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4', 'X.XX')}*."
+        return f"Hola {variables.get('1', 'usuario')}, tu consumo de ayer fue de *{variables.get('2', 'X.XX')} kWh* 👇 (más bajo que tu promedio).\nLlevas *{variables.get('3', 'X.XX')} kWh* acumulados.\n\nTu proyección de pago es de *${variables.get('4Á', 'X.XX')}*."
         
     elif template_sid == CONTENT_SID_RECORDATORIO_CONEXION:
         return f"Hola {variables.get('1', 'usuario')}, notamos que aún no has conectado tu dispositivo LETE. ¡Conéctalo para empezar a monitorear! 🔌"
@@ -466,17 +476,93 @@ def verificar_voltaje(df, cliente):
         enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_BAJO_VOLTAJE, variables)
         enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
 
+# --- ¡MODIFICADO POR GEMINI! (Función de Fuga reescrita con Lógica Híbrida v2.6) ---
 def verificar_fuga_corriente(df, cliente):
+    """
+    Verifica la fuga de corriente usando una LÓGICA HÍBRIDA.
+    1. Durante el aprendizaje: Compara la media actual vs UMBRAL FIJO (0.5A)
+    2. Post-aprendizaje: Compara la media actual vs LÍNEA BASE EWMA
+    NO GUARDA EN BD, solo modifica el objeto 'cliente' en memoria.
+    """
     if df is None: return
-    print("-> Verificando fuga de corriente...")
+    print("-> Verificando fuga de corriente (Lógica Híbrida v2.6)...")
+
+    # 1. Obtener estadísticas de fuga del objeto 'cliente'
+    estadisticas = cliente['estadisticas_consumo'] if cliente['estadisticas_consumo'] is not None else {}
     
-    fuga_promedio = df['leakage'].mean()
-    if fuga_promedio > UMBRAL_FUGA_CORRIENTE:
-        variables = {"1": cliente['nombre']}
+    stats_fuga = estadisticas.get('fuga_stats', {
+        'media': 0.1, # Empezar con una media de 0.1A (ruido base)
+        'varianza': (0.1 * 0.3)**2, # Varianza inicial
+        'n_muestras': 0,
+        'strikes': 0
+    })
+
+    # 2. Calcular datos actuales
+    fuga_actual_media = df['leakage'].mean()
+
+    # 3. Comparar con el modelo estadístico (LÓGICA HÍBRIDA)
+    media_hist = stats_fuga['media']
+    varianza = stats_fuga['varianza']
+    desv_std = math.sqrt(varianza) if varianza > 0 else 0
+    limite_superior_ewma = media_hist + (DESVIACIONES_ESTANDAR_PARA_ANOMALIA_FUGA * desv_std)
+    
+    es_anomalia = False
+    
+    if stats_fuga['n_muestras'] < PERIODO_APRENDIZAJE_MUESTRAS_FUGA:
+        # --- MODO APRENDIZAJE (Primeras 50 horas) ---
+        # Compara la media actual contra el UMBRAL FIJO
+        # Esto captura fugas preexistentes en instalaciones nuevas.
+        print(f"    -> En periodo de aprendizaje para 'fuga_stats' ({stats_fuga['n_muestras'] + 1} muestras).")
+        print(f"    -> Usando umbral fijo de {UMBRAL_FUGA_CORRIENTE_MINIMO}A.")
+        α = 0.2 # Aprender más rápido
         
-        mensaje_telegram = formatear_mensaje_telegram(TPL_FUGA_CORRIENTE, variables)
-        enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_FUGA_CORRIENTE, variables)
-        enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
+        if fuga_actual_media > UMBRAL_FUGA_CORRIENTE_MINIMO:
+            es_anomalia = True
+            
+    else:
+        # --- MODO NORMAL (Post-aprendizaje) ---
+        # Compara la media actual contra la LÍNEA BASE (EWMA)
+        # Esto captura nuevas fugas o fugas que empeoran.
+        α = 0.1 # Aprendizaje normal
+        
+        if fuga_actual_media > limite_superior_ewma and fuga_actual_media > UMBRAL_FUGA_CORRIENTE_MINIMO:
+            es_anomalia = True
+        
+    # 4. Manejar "Strikes" y Alertas
+    if es_anomalia:
+        stats_fuga['strikes'] += 1
+        print(f"    -> ¡ANOMALÍA DE FUGA! Media actual: {fuga_actual_media:.3f}A. Strike #{stats_fuga['strikes']}.")
+        
+        if stats_fuga['strikes'] >= NUM_STRIKES_PARA_ALERTA_FUGA:
+            print("    -> ¡ALERTA DE FUGA ENVIADA!")
+            variables = {"1": cliente['nombre']}
+            
+            mensaje_telegram = formatear_mensaje_telegram(TPL_FUGA_CORRIENTE, variables)
+            enviar_alerta_whatsapp(cliente['telefono_whatsapp'], TPL_FUGA_CORRIENTE, variables)
+            enviar_alerta_telegram(cliente['telegram_chat_id'], mensaje_telegram)
+            
+            stats_fuga['strikes'] = 0 # Resetear después de alertar
+    else:
+        # Si la media actual NO es una anomalía, resetea los strikes.
+        if stats_fuga['strikes'] > 0:
+            print(f"    -> Nivel de fuga normalizado (Actual: {fuga_actual_media:.3f}A). Reseteando strikes.")
+        stats_fuga['strikes'] = 0
+
+    # 5. Actualizar el modelo EWMA (siempre, en ambos modos)
+    # Así, cuando termine el aprendizaje, la media EWMA estará lista.
+    media_nueva = α * fuga_actual_media + (1 - α) * stats_fuga['media']
+    diferencia = fuga_actual_media - media_nueva
+    varianza_nueva = α * (diferencia ** 2) + (1 - α) * stats_fuga['varianza']
+    
+    stats_fuga['media'] = media_nueva
+    stats_fuga['varianza'] = varianza_nueva
+    stats_fuga['n_muestras'] += 1
+    
+    # 6. ACTUALIZAR EL OBJETO 'cliente' EN MEMORIA
+    estadisticas['fuga_stats'] = stats_fuga
+    cliente['estadisticas_consumo'] = estadisticas
+# --- Fin de la modificación ---
+
 
 def verificar_anomalia_consumo(conn, df, cliente):
     """Compara el consumo actual con el perfil estadístico del cliente."""
@@ -489,6 +575,8 @@ def verificar_anomalia_consumo(conn, df, cliente):
 
     estadisticas = cliente['estadisticas_consumo'] if cliente['estadisticas_consumo'] is not None else {}
     
+    # Nota: 'estadisticas' ya puede contener 'fuga_stats' de la función anterior
+    
     stats_bloque = estadisticas.get(bloque_actual, {
         'media': consumo_actual,
         'varianza': (consumo_actual * 0.3)**2,
@@ -499,10 +587,10 @@ def verificar_anomalia_consumo(conn, df, cliente):
     media = stats_bloque['media']
     varianza = stats_bloque['varianza']
     desv_std = math.sqrt(varianza) if varianza > 0 else 0
-    limite_superior = media + (DESVIACIONES_ESTANDAR_PARA_ANOMALIA * desv_std)
+    limite_superior = media + (DESVIACIONES_ESTANDAR_PARA_ANOMALIA_CONSUMO * desv_std)
     
     es_anomalia = False
-    if stats_bloque['n_muestras'] < PERIODO_APRENDIZAJE_MUESTRAS:
+    if stats_bloque['n_muestras'] < PERIODO_APRENDIZAJE_MUESTRAS_CONSUMO:
         print(f"    -> En periodo de aprendizaje para '{bloque_actual}' ({stats_bloque['n_muestras'] + 1} muestras).")
         α = 0.2
         if consumo_actual > (media * 3): # Alerta solo para anomalías extremas
@@ -515,7 +603,7 @@ def verificar_anomalia_consumo(conn, df, cliente):
     if es_anomalia:
         stats_bloque['strikes'] += 1
         print(f"    -> ¡ANOMALÍA! Consumo: {consumo_actual:.0f}W, Límite: {limite_superior:.0f}W. Strike #{stats_bloque['strikes']}.")
-        if stats_bloque['strikes'] >= NUM_STRIKES_PARA_ALERTA:
+        if stats_bloque['strikes'] >= NUM_STRIKES_PARA_ALERTA_CONSUMO:
             porcentaje = ((consumo_actual / media - 1) * 100) if media > 0 else 0
             hora_legible = ahora.strftime('%I:%M %p')
             variables = {"1": cliente['nombre'], "2": hora_legible, "3": f"{porcentaje:.0f}"}
@@ -538,10 +626,13 @@ def verificar_anomalia_consumo(conn, df, cliente):
     
     # Resetea strikes de otros bloques para no arrastrarlos
     for bloque in estadisticas:
-        if bloque != bloque_actual:
+        if bloque != bloque_actual and bloque != 'fuga_stats': # No resetear 'fuga_stats'
             estadisticas[bloque]['strikes'] = 0
             
     estadisticas[bloque_actual] = stats_bloque
+    
+    # ¡Esta función guarda TODO el objeto 'estadisticas' en la BD!
+    # (Incluyendo los cambios de 'fuga_stats' hechos en la función anterior)
     actualizar_estadisticas(conn, cliente['device_id'], estadisticas)
         
 def verificar_brinco_escalon(conn, cliente):
@@ -626,7 +717,7 @@ def verificar_brinco_escalon(conn, cliente):
 # --- 5. EJECUCIÓN PRINCIPAL (CORREGIDA Y MODIFICADA) ---
 def main():
     print("=" * 50)
-    print(f"--- Iniciando VIGILANTE v2.4 ({datetime.now(ZONA_HORARIA_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}) ---")
+    print(f"--- Iniciando VIGILANTE v2.6 ({datetime.now(ZONA_HORARIA_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}) ---")
 
     conn = None
     try:
@@ -658,15 +749,25 @@ def main():
 
         verificar_dispositivo_offline(df_ultima_hora, cliente)
         verificar_voltaje(df_ultima_hora, cliente)
+        
+        # --- ¡MODIFICACIÓN IMPORTANTE DEL FLUJO! ---
+        # 1. 'verificar_fuga_corriente' ahora se ejecuta PRIMERO.
+        #    Modifica el dict 'cliente['estadisticas_consumo']' en memoria.
         verificar_fuga_corriente(df_ultima_hora, cliente)
+        
+        # 2. 'verificar_anomalia_consumo' se ejecuta DESPUÉS.
+        #    Lee el dict modificado, añade sus propios cambios,
+        #    y guarda TODO (fuga + consumo) en la BD.
         verificar_anomalia_consumo(conn, df_ultima_hora, cliente)
+        # --- Fin de la modificación del flujo ---
+        
         verificar_brinco_escalon(conn, cliente)
 
     if conn:
         conn.close()
         print("\n🔌 Conexión con Base de Datos cerrada.")
 
-    print(f"\n--- VIGILANTE v2.4 (con Telegram) completado. ---")
+    print(f"\n--- VIGILANTE v2.6 (con Lógica Híbrida) completado. ---")
     print("=" * 50)
 
 if __name__ == "__main__":
