@@ -464,13 +464,17 @@ app.post('/api/telegram-webhook', async (req, res) => {
     }
     // Caso 4: Mensaje genérico / Comando
     else {
-      // ¡AQUÍ EMPIEZA LA LÓGICA DE COMANDOS!
       // 1. ¿Este chat_id está vinculado a un cliente?
+      console.log(`[TELEGRAM] Buscando cliente para chat_id: ${chat_id}`); // <-- Log de depuración
+      
       const { data: cliente, error: clienteError } = await supabase
         .from('clientes')
         .select(`
           id, 
           nombre, 
+          email,
+          telefono_whatsapp,
+          telegram_chat_id,
           en_chat_humano_hasta,
           dia_de_corte,                 
           ciclo_bimestral,              
@@ -482,12 +486,21 @@ app.post('/api/telegram-webhook', async (req, res) => {
         .eq('telegram_chat_id', chat_id)
         .single();
 
-      // 1a. Si NO está vinculado, recordarle
+      // 1a. Si NO está vinculado O HUBO UN ERROR, recordarle
       if (clienteError || !cliente) {
+        
+        // --- ¡NUEVO BLOQUE DE DIAGNÓSTICO! ---
+        if (clienteError) {
+            console.error(`[TELEGRAM DB ERROR] Falló la consulta de cliente:`, clienteError.message);
+        }
+        // --- FIN DE DIAGNÓSTICO ---
+        
         console.log(`[TELEGRAM] Chat ${chat_id} no vinculado envió: ${textoRecibido}`);
         await enviarMensajeTelegram(chat_id, "No entendí ese comando. Si quieres vincular tu cuenta, envía tu correo electrónico.");
         return res.sendStatus(200);
       }
+      
+      console.log(`[TELEGRAM] Cliente encontrado: ${cliente.nombre} (ID: ${cliente.id})`); // <-- Log de depuración
       
       // 1b. Si SÍ está vinculado, ¡procesar!
       // (En el futuro, aquí revisaremos 'en_chat_humano_hasta' para el Policía)
@@ -980,71 +993,130 @@ async function llamarAGemini(textoUsuario) {
 
 // --- FUNCIÓN DE AYUDA: REENVIAR A CHATWOOT (El "Oficial") ---
 // (Esta función es compleja, maneja la API de Chatwoot)
+//
+// --- ¡¡VERSIÓN CORREGIDA!! ---
+//
 async function reenviarAChatwoot(cliente, texto) {
     if (!chatwootUrl || !chatwootAccountId || !chatwootToken) return; // Guardián
+
+    // ¡¡IMPORTANTE!! Este es el ID de tu "Bandeja de entrada" (Inbox) de tipo API
+    // que creaste en Chatwoot.
+    const INBOX_ID_TELEGRAM = '83046'; // <-- CONFIRMA QUE ESTE ID ES CORRECTO
 
     const headers = {
         'Content-Type': 'application/json; charset=utf-8',
         'api_access_token': chatwootToken
     };
 
+    let contact_id;
+
     try {
         // --- Paso 1: Buscar o Crear Contacto en Chatwoot ---
-        // Usamos el 'telegram_chat_id' como identificador único
-        const urlSearch = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/search?q=${cliente.telegram_chat_id}`;
+        
+        // ¡¡CORRECCIÓN 1: Buscar por EMAIL!!
+        // El parámetro 'q' de Chatwoot busca en 'name', 'email', 'phone_number'.
+        // NO busca en 'identifier'. Usaremos el email, que es único y requerido en tu flujo.
+        
+        if (!cliente.email) {
+            console.error(`[CHATWOOT ERR] El cliente ${cliente.id} no tiene email. No se puede buscar o crear contacto.`);
+            return; // Salir de la función si no hay email
+        }
+
+        const urlSearch = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/search?q=${encodeURIComponent(cliente.email)}`;
         let response = await fetch(urlSearch, { method: 'GET', headers });
         let data = await response.json();
         
-        let contact_id;
         if (data.payload.length > 0) {
+            // ¡Encontrado! Asumimos que es el primero.
             contact_id = data.payload[0].id;
-            console.log(`[CHATWOOT] Contacto encontrado: ${contact_id}`);
+            console.log(`[CHATWOOT] Contacto encontrado por email (${cliente.email}): ${contact_id}`);
+        
         } else {
-            console.log(`[CHATWOOT] Contacto no encontrado, creando uno nuevo...`);
+            // --- Contacto NO encontrado, proceder a crear uno ---
+            console.log(`[CHATWOOT] Contacto no encontrado por email, creando uno nuevo...`);
             const urlCreateContact = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts`;
             const contactPayload = {
                 name: cliente.nombre,
-                email: cliente.email || undefined,
+                email: cliente.email, // Ya sabemos que existe
                 phone_number: cliente.telefono_whatsapp || undefined,
-                identifier: cliente.telegram_chat_id // Identificador único
+                identifier: cliente.telegram_chat_id // Guardamos esto para referencia humana
             };
             response = await fetch(urlCreateContact, { method: 'POST', headers, body: JSON.stringify(contactPayload) });
             data = await response.json();
+            
+            if (!response.ok) {
+               console.error(`[CHATWOOT ERR] Falla al CREAR contacto:`, data);
+               throw new Error("No se pudo crear el contacto en Chatwoot.");
+            }
+            
             contact_id = data.payload.contact.id;
             console.log(`[CHATWOOT] Contacto creado: ${contact_id}`);
         }
 
-        // --- Paso 2: Buscar Conversación Activa ---
-        // (Chatwoot no tiene un "find or create" fácil para conversaciones de Telegram)
-        // Por simplicidad, crearemos una nueva conversación si no encontramos una.
-        // (En una v2, buscaríamos conversaciones existentes para este contact_id)
+        // --- ¡¡CORRECCIÓN 2: Buscar conversación activa!! ---
+        // En lugar de crear una conversación nueva CADA VEZ, buscamos una abierta.
         
-        // --- Paso 3: Crear Conversación (o mensaje) ---
-        // (Este es el "Inbox" que creaste en Chatwoot para tu bot de Telegram)
-        // ¡¡IMPORTANTE!! Debes crear un "Canal" de tipo "API" en Chatwoot
-        // y obtener el ID de ese Inbox.
-        const INBOX_ID_TELEGRAM = '83046'; // <-- ¡¡REEMPLAZA ESTO!!
-
-        const urlCreateMessage = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations`;
-        const messagePayload = {
-            inbox_id: INBOX_ID_TELEGRAM,
-            contact_id: contact_id,
-            message: {
-                content: texto,
-                message_type: "incoming" // Lo registramos como "entrante"
-            },
-            status: "open" // Abrir el ticket
-        };
-
-        response = await fetch(urlCreateMessage, { method: 'POST', headers, body: JSON.stringify(messagePayload) });
+        const urlBuscarConversaciones = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/${contact_id}/conversations`;
+        response = await fetch(urlBuscarConversaciones, { method: 'GET', headers });
         data = await response.json();
 
-        if (response.ok) {
-            console.log(`[CHATWOOT] Mensaje reenviado y conversación creada/actualizada: ${data.id}`);
-        } else {
-            console.error(`[CHATWOOT ERR] Error al crear mensaje: ${data.message}`);
+        if (!response.ok) {
+             console.error(`[CHATWOOT ERR] Falla al BUSCAR conversaciones:`, data);
+             throw new Error("No se pudieron buscar conversaciones.");
         }
 
+        // Filtramos las conversaciones de este inbox que estén 'abiertas'
+        const conversacionesActivas = data.payload.filter(conv => 
+            conv.inbox_id.toString() === INBOX_ID_TELEGRAM && conv.status === 'open'
+        );
+
+        if (conversacionesActivas.length > 0) {
+            // --- Escenario A: Conversación ABIERTA encontrada ---
+            const conversation_id = conversacionesActivas[0].id; // Usamos la primera
+            console.log(`[CHATWOOT] Conversación abierta encontrada: ${conversation_id}. Añadiendo mensaje...`);
+
+            const urlAddMessage = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations/${conversation_id}/messages`;
+            const messagePayload = {
+                content: texto,
+                message_type: "incoming", // Lo registramos como "entrante"
+                private: false
+            };
+            
+            response = await fetch(urlAddMessage, { method: 'POST', headers, body: JSON.stringify(messagePayload) });
+            data = await response.json();
+            
+            if (response.ok) {
+                console.log(`[CHATWOOT] Mensaje añadido a conversación ${conversation_id}`);
+            } else {
+                console.error(`[CHATWOOT ERR] Error al AÑADIR mensaje: ${data.message}`);
+            }
+
+        } else {
+            // --- Escenario B: NO hay conversación abierta. CREAR UNA NUEVA ---
+            // (Esta es la lógica que tenías originalmente en tu "Paso 3")
+            console.log(`[CHATWOOT] No hay conversación abierta. Creando una nueva...`);
+            
+            const urlCreateConversation = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations`;
+            const conversationPayload = {
+                inbox_id: INBOX_ID_TELEGRAM,
+                contact_id: contact_id,
+                message: {
+                    content: texto,
+                    message_type: "incoming"
+                },
+                status: "open" // Abrir el ticket
+            };
+
+            response = await fetch(urlCreateConversation, { method: 'POST', headers, body: JSON.stringify(conversationPayload) });
+            data = await response.json();
+
+            if (response.ok) {
+                console.log(`[CHATWOOT] Conversación nueva creada: ${data.id}`);
+            } else {
+                console.error(`[CHATWOOT ERR] Error al CREAR conversación: ${data.message}`);
+            }
+        }
+        
     } catch (error) {
         console.error(`[CHATWOOT ERR] Error fatal en la función: ${error.message}`);
     }
