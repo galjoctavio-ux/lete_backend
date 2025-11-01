@@ -53,7 +53,7 @@ if (!geminiApiKey) {
     console.warn("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 }
 const genAI = new GoogleGenerativeAI(geminiApiKey);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // --- ¡NUEVA CONFIGURACIÓN DE CHATWOOT! ---
 const chatwootUrl = process.env.CHATWOOT_URL;
