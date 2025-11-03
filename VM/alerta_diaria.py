@@ -110,7 +110,8 @@ def obtener_clientes():
             SELECT 
                 d.device_id, 
                 c.telefono_whatsapp, 
-                c.telegram_chat_id,                 -- <-- AÑADIDO
+                c.telegram_chat_id,
+                c.prefiere_telegram,       
                 c.kwh_promedio_diario, 
                 c.nombre, 
                 c.dia_de_corte, 
@@ -355,6 +356,32 @@ def formatear_mensaje_telegram(template_sid, variables):
         print(f"⚠️  ADVERTENCIA: Plantilla desconocida en formatear_mensaje_telegram: {template_sid}")
         return f"Alerta del sistema (SID: {template_sid}). Variables: {json.dumps(variables)}"
 
+# --- ¡NUEVA FUNCIÓN DE DECISIÓN! ---
+def enviar_alerta_dual(cliente_info, template_sid, variables):
+    """
+    Decide si enviar la alerta por WhatsApp o Telegram basándose en la
+    preferencia del cliente.
+    """
+    # Desempaquetamos solo los campos que necesitamos para esta decisión
+    telefono_whatsapp = cliente_info.get('telefono')
+    telegram_chat_id = cliente_info.get('telegram_chat_id')
+    prefiere_telegram = cliente_info.get('prefiere_telegram')
+    
+    if prefiere_telegram and telegram_chat_id:
+        # --- Canal 1: Preferencia es TELEGRAM ---
+        print(f"INFO: Cliente prefiere Telegram. Enviando a {telegram_chat_id}...")
+        mensaje_telegram = formatear_mensaje_telegram(template_sid, variables)
+        enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+        
+    elif telefono_whatsapp:
+        # --- Canal 2: Preferencia es WHATSAPP (o no ha configurado Telegram) ---
+        print(f"INFO: Cliente prefiere WhatsApp (o es default). Enviando a {telefono_whatsapp}...")
+        enviar_alerta_whatsapp(telefono_whatsapp, template_sid, variables)
+        
+    else:
+        # --- Fallback: No tiene canal de contacto ---
+        print(f"⚠️ ADVERTENCIA: Cliente sin 'telefono_whatsapp' ni 'telegram_chat_id' configurado. No se envió alerta.")
+
 # --- 7. Funciones de Lógica de Negocio ---
 def calcular_costo_estimado(kwh_consumidos, tipo_tarifa):
     """Calcula el costo aproximado del recibo de CFE usando la estructura de tarifas."""
@@ -404,47 +431,56 @@ def calcular_fechas_corte(hoy_aware, dia_de_corte, ciclo_bimestral):
 
 # --- 8. Lógica de Procesamiento de Clientes (MODIFICADA) ---
 def _enviar_alerta_3_dias(cliente, proxima_fecha_de_corte):
-    # Desempaquetado (14 campos)
-    (device_id, telefono, telegram_chat_id, _, nombre, _, _, _, _, _, _, _, _, _) = cliente
+    # Desempaquetado (15 campos)
+    (device_id, telefono, telegram_chat_id, prefiere_telegram, _, 
+     nombre, _, _, _, _, _, _, _, _, _) = cliente
+    
     print("INFO: Enviando alerta de 3 días para el corte.")
     variables = {"1": nombre, "2": proxima_fecha_de_corte.strftime('%d de %B')}
     
-    # Enviar a ambos canales
-    mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_AVISO_CORTE_3DIAS, variables)
-    enviar_alerta_whatsapp(telefono, CONTENT_SID_AVISO_CORTE_3DIAS, variables)
-    enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+    # Creamos un dict con la info del cliente para la función dual
+    cliente_info = {
+        "telefono": telefono,
+        "telegram_chat_id": telegram_chat_id,
+        "prefiere_telegram": prefiere_telegram
+    }
+    
+    # ¡Llamamos a la nueva función!
+    enviar_alerta_dual(cliente_info, CONTENT_SID_AVISO_CORTE_3DIAS, variables)
     
     marcar_notificacion_enviada(device_id, 'notificacion_corte_3dias')
 
 def _enviar_alerta_dia_de_corte(cliente, ultima_corte, proxima_corte):
-    # Desempaquetado (14 campos)
-    (device_id, telefono, telegram_chat_id, _, nombre, _, tipo_tarifa, _, _, _, _, _, _, _) = cliente
+    # Desempaquetado (15 campos)
+    (device_id, telefono, telegram_chat_id, prefiere_telegram, _, 
+     nombre, _, tipo_tarifa, _, _, _, _, _, _, _) = cliente
+    
     print("INFO: Enviando alerta de DÍA DE CORTE con resumen final.")
     
-    # Calcula el consumo final del periodo que HOY termina
     inicio_periodo = ZONA_HORARIA_LOCAL.localize(datetime.combine(ultima_corte, datetime.min.time()))
     fin_periodo = ZONA_HORARIA_LOCAL.localize(datetime.combine(proxima_corte, datetime.min.time()))
     
-    # --- ¡CAMBIO DE FUNCIÓN! ---
     consumo_final, _ = obtener_consumo_desde_influxdb(device_id, inicio_periodo, fin_periodo)
-    
     if consumo_final is None: consumo_final = 0.0
     
     costo_final = calcular_costo_estimado(consumo_final, tipo_tarifa)
-    
     variables = {"1": nombre, "2": f"{consumo_final:.2f}", "3": f"{costo_final:.2f}"}
     
-    # Enviar a ambos canales
-    mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_DIA_DE_CORTE, variables)
-    enviar_alerta_whatsapp(telefono, CONTENT_SID_DIA_DE_CORTE, variables)
-    enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+    cliente_info = {
+        "telefono": telefono,
+        "telegram_chat_id": telegram_chat_id,
+        "prefiere_telegram": prefiere_telegram
+    }
+    
+    # ¡Llamamos a la nueva función!
+    enviar_alerta_dual(cliente_info, CONTENT_SID_DIA_DE_CORTE, variables)
     
     marcar_notificacion_enviada(device_id, 'notificacion_dia_corte')
 
 def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
     # --- ¡DESEMPAQUETADO MODIFICADO! ---
-    # Ahora recibimos 14 campos del tuple de cliente
-    (device_id, telefono, telegram_chat_id, kwh_promedio, nombre, _, tipo_tarifa, 
+    # Ahora recibimos 15 campos del tuple de cliente
+    (device_id, telefono, telegram_chat_id, prefiere_telegram, kwh_promedio, nombre, _, tipo_tarifa, 
      fecha_inicio_servicio, _, _, _, 
      lectura_cierre, lectura_inicial, _) = cliente
      
@@ -506,10 +542,8 @@ def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
         # PERIODO INICIAL: Sin proyección
         print(f"   -> {nombre}: Aún en periodo inicial (sin proyección). Días del ciclo: {dias_transcurridos_ciclo}")
         variables = {"1": nombre, "2": f"{kwh_ayer:.2f}", "3": f"{kwh_periodo_actual:.2f}"}
+        template_sid = CONTENT_SID_REPORTE_INICIAL
         
-        mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_INICIAL, variables)
-        enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_INICIAL, variables)
-        enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
     else:
         # CON PROYECCIÓN: Solo proyectamos el consumo medido, NO los acarreados
         dias_del_ciclo = (proxima_fecha_de_corte - ultima_fecha_de_corte).days
@@ -554,17 +588,23 @@ def _generar_reporte_diario(cliente, hoy_aware, fechas_corte):
         }
         
         if kwh_ayer > promedio_float:
-            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_MAS, variables)
-            enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_MAS, variables)
-            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+            template_sid = CONTENT_SID_REPORTE_MAS
         else:
-            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_REPORTE_MENOS, variables)
-            enviar_alerta_whatsapp(telefono, CONTENT_SID_REPORTE_MENOS, variables)
-            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+            template_sid = CONTENT_SID_REPORTE_MENOS
+        # --- ¡NUEVA LÓGICA DE ENVÍO! ---
+    # (Toda la lógica 'if/else' de arriba solo decide el 'template_sid' y las 'variables')
+    cliente_info = {
+        "telefono": telefono,
+        "telegram_chat_id": telegram_chat_id,
+        "prefiere_telegram": prefiere_telegram
+    }    
+
+    # ¡Llamamos a la nueva función!
+    enviar_alerta_dual(cliente_info, template_sid, variables)
 
 def _realizar_cierre_de_ciclo(cliente, fechas_corte):
-    # Desempaquetado (14 campos)
-    (device_id, _, _, _, nombre, _, _, _, _, _, _, _, _, _) = cliente
+    # Desempaquetado (AHORA 15 campos)
+    (device_id, _, _, _, _, nombre, _, _, _, _, _, _, _, _, _) = cliente
     ultima_fecha_de_corte, proxima_fecha_de_corte = fechas_corte
     print(f"¡Fin de periodo para {nombre}! Realizando cierre...")
     
@@ -584,10 +624,10 @@ def _realizar_cierre_de_ciclo(cliente, fechas_corte):
 def procesar_un_cliente(cliente_data, hoy_aware):
     """Orquesta el procesamiento completo para un único cliente."""
     # --- ¡DESEMPAQUETADO MODIFICADO! ---
-    # Leemos 14 campos
-    (device_id, telefono, telegram_chat_id, _, nombre, dia_de_corte, _, fecha_inicio_servicio, ciclo_bimestral, 
-    notif_3dias_enviada, notif_corte_enviada, _, _, 
-    primera_medicion_recibida) = cliente_data
+    # Leemos 15 campos
+    (device_id, telefono, telegram_chat_id, prefiere_telegram, _, nombre, dia_de_corte, _, 
+     fecha_inicio_servicio, ciclo_bimestral, notif_3dias_enviada, notif_corte_enviada, _, _, 
+     primera_medicion_recibida) = cliente_data
      
     print(f"\n--- Procesando cliente: {nombre} ({device_id}) ---")
 
@@ -604,10 +644,13 @@ def procesar_un_cliente(cliente_data, hoy_aware):
             # CONTENT_SID_RECORDATORIO_CONEXION ya se cargó arriba
             variables = {"1": nombre}
             
-            # Enviar a ambos canales
-            mensaje_telegram = formatear_mensaje_telegram(CONTENT_SID_RECORDATORIO_CONEXION, variables)
-            enviar_alerta_whatsapp(telefono, CONTENT_SID_RECORDATORIO_CONEXION, variables)
-            enviar_alerta_telegram(telegram_chat_id, mensaje_telegram)
+            # Enviar usando la lógica dual
+            cliente_info = {
+                "telefono": telefono,
+                "telegram_chat_id": telegram_chat_id,
+                "prefiere_telegram": prefiere_telegram
+            }
+            enviar_alerta_dual(cliente_info, CONTENT_SID_RECORDATORIO_CONEXION, variables)
             
         # No marcamos ninguna bandera, se enviará de nuevo mañana
 

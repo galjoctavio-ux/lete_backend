@@ -498,7 +498,7 @@ def verificar_fuga_corriente(df, cliente):
     })
 
     # 2. Calcular datos actuales
-    fuga_actual_media = df['leakage'].mean()
+    fuga_actual_media = df['leakage'].mean().quantile(0.25)
 
     # 3. Comparar con el modelo estadístico (LÓGICA HÍBRIDA)
     media_hist = stats_fuga['media']

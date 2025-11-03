@@ -25,6 +25,7 @@ import time
 import logging
 import sys
 import threading
+import subprocess
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -36,7 +37,9 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.exceptions import InfluxDBError
 
 # --- 2. Carga de Configuración ---
-load_dotenv()
+load_dotenv(override=True)
+
+
 
 # Configuración de Logging
 logger = logging.getLogger(__name__)
@@ -46,8 +49,13 @@ DB_HOST = os.environ.get("DB_HOST")
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
-# String de conexión para threads (ya que psycopg2 no es thread-safe)
-DB_CONN_STRING = f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} password={DB_PASS}"
+# Cargar el puerto de la BD
+DB_PORT = os.environ.get("DB_PORT", 5432) 
+# DEBUG: Imprime el usuario que realmente se está cargando
+print(f"--- DEBUG --- Intentando conectar con USUARIO: '{DB_USER}' y PUERTO: '{DB_PORT}'")
+
+# String de conexión para threads (psycopg2 maneja el DNS)
+DB_CONN_STRING = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASS}"
 
 # Configuración de MQTT
 MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST")
@@ -71,7 +79,7 @@ BATCH_TIMEOUT = int(os.environ.get("BATCH_TIMEOUT", 10))
 MAX_RETRY_ATTEMPTS = int(os.environ.get("MAX_RETRY_ATTEMPTS", 3))
 
 # --- Configuración de Lógica de Suscripción ---
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 300)) # 5 minutos
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 1000)) # 5 minutos
 GRACE_PERIOD_DAYS = int(os.environ.get("GRACE_PERIOD_DAYS", 30))
 
 # --- 3. Clientes y Conexiones Globales ---
@@ -89,23 +97,33 @@ device_status_cache = {}
 cache_lock = threading.Lock()
 
 
-# --- 4. Lógica de Base de Datos (PostgreSQL) ---
-
 def connect_db():
     """Conecta (o reconecta) a la base de datos PostgreSQL."""
     global db_conn
     max_retries = 3
     retry_count = 0
     
+    conn_string = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASS}"
+
     while retry_count < max_retries:
         try:
             if db_conn and not db_conn.closed:
                 db_conn.close()
-            logger.info(f"Conectando a PostgreSQL en {DB_HOST}...")
-            db_conn = psycopg2.connect(DB_CONN_STRING, connect_timeout=10)
+            logger.info(f"Conectando a PostgreSQL en {DB_HOST}:{DB_PORT}...")
+            
+            db_conn = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                dbname=DB_NAME,
+                user=DB_USER,      # <-- Esto fuerza el uso de tu variable correcta
+                password=DB_PASS,
+                connect_timeout=10
+            )
+            
             db_conn.autocommit = True
             logger.info("✅ Conexión con PostgreSQL (Supabase) exitosa.")
             return True
+            
         except psycopg2.OperationalError as e:
             retry_count += 1
             logger.error(f"❌ Error al conectar con PostgreSQL: {e}")
@@ -115,6 +133,7 @@ def connect_db():
     
     logger.critical(f"❌ CRÍTICO: No se pudo conectar a PostgreSQL después de {max_retries} intentos")
     return False
+
 
 def setup_database_schema():
     """Asegura que las tablas necesarias existan en PostgreSQL."""
@@ -549,7 +568,14 @@ def resend_local_buffer(device_id):
     logger.info(f"[Resend Thread {device_id}] Iniciando.")
     local_db_conn = None
     try:
-        local_db_conn = psycopg2.connect(DB_CONN_STRING)
+        local_db_conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            connect_timeout=10
+        )
         
         points_to_resend = []
         ids_to_delete = []
@@ -617,7 +643,14 @@ def delete_local_buffer(device_id):
     logger.info(f"[Purge Thread {device_id}] Iniciando purga.")
     local_db_conn = None
     try:
-        local_db_conn = psycopg2.connect(DB_CONN_STRING)
+        local_db_conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            connect_timeout=10
+        )
         local_db_conn.autocommit = True
         
         with local_db_conn.cursor() as cursor:

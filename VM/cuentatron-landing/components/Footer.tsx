@@ -36,16 +36,16 @@ export const Footer = () => {
             <h4 className="font-bold text-blanco mb-4">Legal</h4>
             <ul className="space-y-2 text-sm">
               {/* Estos enlaces funcionarán en Fase 3 */}
-              <li><a href="/terminos-venta" target="_blank" className="hover:text-blanco">Términos y Condiciones</a></li>
-              <li><a href="/garantia" target="_blank" className="hover:text-blanco">Garantía</a></li>
-              <li><a href="/privacidad-ecommerce" target="_blank" className="hover:text-blanco">Aviso de Privacidad</a></li>
+              <li><a href="/cuentatron/terminos-venta/" target="_blank" className="hover:text-blanco">Términos y Condiciones</a></li>
+              <li><a href="/cuentatron/garantia/" target="_blank" className="hover:text-blanco">Garantía</a></li>
+              <li><a href="/cuentatron/privacidad-ecommerce/" target="_blank" className="hover:text-blanco">Aviso de Privacidad</a></li>
             </ul>
             
             {/* --- CORRECCIÓN AQUÍ ---
               Añadimos URLs de ejemplo. Reemplaza "tu-pagina"
             */}
             <div className="flex space-x-4 mt-6">
-              <a href="https://www.facebook.com/tu-pagina" target="_blank" rel="noopener noreferrer" className="text-xl hover:text-blanco"><FiFacebook /></a>
+              <a href="https://www.facebook.com/tesivil.electricidad/" target="_blank" rel="noopener noreferrer" className="text-xl hover:text-blanco"><FiFacebook /></a>
               <a href="https://www.instagram.com/tu-pagina" target="_blank" rel="noopener noreferrer" className="text-xl hover:text-blanco"><FiInstagram /></a>
             </div>
           </div>
@@ -54,7 +54,7 @@ export const Footer = () => {
 
         {/* Copyright */}
         <div className="border-t border-gris-perla/20 mt-12 pt-8 text-center text-xs">
-          <p>© 2025 Cuentatrón. Todos los derechos reservados.</p>
+          <p>© 2025 Cuentatrón - TESIVIL. Todos los derechos reservados.</p>
         </div>
       </div>
     </footer>

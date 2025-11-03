@@ -10,7 +10,7 @@ export default function GarantiaPage() {
           El dispositivo Cuentatrón cuenta con una garantía limitada de 6 meses a partir de la fecha de compra, contra defectos de fabricación o funcionamiento que impidan su uso normal bajo condiciones de instalación y operación adecuadas.
         </p>
         <p>
-          Durante este periodo, Ingeniería y Distribución de Aires Acondicionados S.A.S. de C.V. se compromete a reparar o sustituir el producto sin costo alguno para el cliente, siempre que el defecto sea atribuible a materiales o procesos de manufactura.
+          Durante este periodo, Tecnología y Software en la Ingeniería Civil S.A. de C.V. se compromete a reparar o sustituir el producto sin costo alguno para el cliente, siempre que el defecto sea atribuible a materiales o procesos de manufactura.
         </p>
 
         <h2 className="text-2xl font-bold mt-8 mb-4">2. Condiciones para hacer válida la garantía</h2>
@@ -44,8 +44,8 @@ export default function GarantiaPage() {
         </p>
         <p>
           📧{' '}
-          <a href="mailto:soporte@cuentatron.mx" className="text-azul-confianza hover:underline">
-            soporte@cuentatron.mx
+          <a href="mailto:soporte-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            soporte-cuentatron@tesivil.com
           </a>
         </p>
         <p>En el correo deberá incluir:</p>
@@ -81,12 +81,12 @@ export default function GarantiaPage() {
 
         <h2 className="text-2xl font-bold mt-8 mb-4">6. Limitación de responsabilidad</h2>
         <p>
-          Ingeniería y Distribución de Aires Acondicionados S.A.S. de C.V. no será responsable por daños indirectos, incidentales o consecuenciales derivados del uso o imposibilidad de uso del dispositivo, incluyendo pérdida de datos, interrupciones del servicio o fallas en la red eléctrica o de internet.
+          Tecnología y Software en la Ingeniería Civil S.A. de C.V. no será responsable por daños indirectos, incidentales o consecuenciales derivados del uso o imposibilidad de uso del dispositivo, incluyendo pérdida de datos, interrupciones del servicio o fallas en la red eléctrica o de internet.
         </p>
 
         <h2 className="text-2xl font-bold mt-8 mb-4">7. Vigencia y contacto</h2>
         <p>
-          Esta política de garantía entra en vigor a partir del 1 de noviembre de 2025 y aplica únicamente para dispositivos Cuentatrón adquiridos en México a través de distribuidores autorizados o directamente en el sitio oficial cuentatron.mx.
+          Esta política de garantía entra en vigor a partir del 1 de noviembre de 2025 y aplica únicamente para dispositivos Cuentatrón adquiridos en México a través de distribuidores autorizados o directamente en el sitio oficial https://www.tesivil.com/cuentatron.
         </p>
       </div>
     </main>

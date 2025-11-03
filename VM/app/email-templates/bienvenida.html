@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bienvenido a Mr. Frío</title>
+    <title>Bienvenido a Cuentatrón</title>
     <style>
         body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 0; }
         .container { width: 90%; max-width: 600px; margin: 20px auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
@@ -11,6 +11,8 @@
         /* .header img { max-width: 150px; } */ /* Descomenta esto si pones un logo */
         .content { padding: 30px; }
         .content p { margin-bottom: 20px; }
+        .content ul { list-style-type: disc; margin-left: 20px; padding-left: 10px; }
+        .content li { margin-bottom: 10px; }
         .button { display: inline-block; background-color: #007bff; color: #ffffff; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold; }
         .button-secondary { background-color: #6c757d; }
         .warning { background-color: #fff3cd; border-left: 5px solid #ffecb5; padding: 15px 20px; margin-bottom: 20px; }
@@ -20,12 +22,12 @@
 <body>
     <div class="container">
         <div class="header">
-            <h2>¡Bienvenido a Mr. Frío!</h2>
+            <h2>¡Bienvenido a Cuentatrón!</h2>
         </div>
         <div class="content">
             <h3>Hola, {{NombreDelCliente}}!</h3>
             
-            <p>¡Felicidades y bienvenido a bordo! Tu suscripción a Mr. Frío ha sido activada.</p>
+            <p>¡Felicidades y bienvenido a bordo! Tu suscripción a Cuentatrón ha sido activada.</p>
             <p>Tu dispositivo está listo para ser <strong>instalado y empezar a monitorear</strong> tu consumo.</p>
             <p>Tu primer mes es completamente gratis. Tu primer cobro programado será el <strong>{{FechaDelProximoPago}}</strong>.</p>
             
@@ -33,7 +35,7 @@
 
             <h4>1. Accede a tu Portal de Cliente</h4>
             <p>Desde aquí podrás administrar tu cuenta, actualizar tu número de WhatsApp para notificaciones y cancelar tu suscripción.</p>
-            <a href="https://api.mrfrio.mx/mi-cuenta.html" class="button">Acceder a Mi Portal</a>
+            <a href="https://www.tesivil.com/mi-cuenta.html" class="button">Acceder a Mi Portal</a>
             <p style="font-size: 13px; margin-top: 15px;">
                 <em>Nota: Te pediremos el correo con el que te registraste (<strong>{{user_email}}</strong>) para enviarte un enlace de acceso seguro.</em>
             </p>
@@ -48,7 +50,7 @@
             </div>
             
             <p>Descarga las instrucciones detalladas para tu instalador:</p>
-            <a href="https://api.mrfrio.mx/Instrucciones.pdf" class="button button-secondary">Descargar Manual de Instalación (PDF)</a>
+            <a href="https://www.tesivil.com/Instrucciones.pdf" class="button button-secondary">Descargar Manual de Instalación (PDF)</a>
 
             <hr style="border:0; border-top: 1px solid #eee; margin: 30px 0;">
 
@@ -56,7 +58,7 @@
             <p>Estamos aquí para ti. Si tienes cualquier duda, contáctanos:</p>
             <p>
             <strong>📲 Vía WhatsApp (Recomendado):</strong><br>
-            <a href="https://wa.me/5213326395038?text=Hola,%20equipo%20de%20Mr.%20Frío.%20Acabo%20de%20recibir%20mi%20correo%20de%20bienvenida%20y%20tengo%20una%20consulta%20sobre%20mi%20cuenta.%0A%0AMi%20correo%20de%20registro%20es%3A%20">
+            <a href="https://wa.me/5213326395038?text=Hola,%20equipo%20de%20Cuentatr%C3%B3n.%20Acabo%20de%20recibir%20mi%20correo%20de%20bienvenida%20y%20tengo%20una%20consulta%20sobre%20mi%20cuenta.%0A%0AMi%20correo%20de%20registro%20es%3A%20">
             Inicia un chat aquí
             </a> 
             </p>
@@ -65,11 +67,24 @@
                 Llámanos al +52 33 2639 5038<br>
                 <em>Lunes a Viernes, 9:00 am - 5:00 pm.</em>
             </p>
+            
+            <hr style="border:0; border-top: 1px solid #eee; margin: 30px 0;">
 
-            <p style="margin-top: 30px;">Gracias por unirte a nosotros,<br>— El equipo de Mr. Frío</p>
+            <h4>4. ✨ ¡Potencia tu Experiencia con Telegram!</h4>
+            <p>Mientras que WhatsApp es ideal para alertas, nuestro bot de Telegram funciona como un <strong>asistente de energía interactivo y bidireccional</strong>. Te invitamos a probarlo:</p>
+            <ul>
+                <li><strong>Consultas en Tiempo Real:</strong> Pregúntale al bot tu voltaje, watts actuales o cuánto gastaste ayer (en kWh y pesos).</li>
+                <li><strong>Soporte Inteligente:</strong> Recibe respuestas instantáneas a dudas comunes (ej. "¿qué es un kWh?").</li>
+                <li><strong>Reportes y Gráficas:</strong> Solicita gráficas de tu consumo semanal o diario.</li>
+                <li><strong>Asistencia Integrada:</strong> Si el bot detecta un problema, escalará la conversación a un agente humano sin que tengas que cambiar de app.</li>
+            </ul>
+            <p style="margin-top: 25px;">
+                <a href="https://t.me/Cuentatron_bot" class="button">Activar Asistente en Telegram</a>
+            </p>
+            <p style="margin-top: 30px;">Gracias por unirte a nosotros,<br>— El equipo de Cuentatrón</p>
         </div>
         <div class="footer">
-            <p>© 2025 Mr. Frío. Todos los derechos reservados.</p>
+            <p>© 2025 Cuentatrón - TESIVIL. Todos los derechos reservados.</p>
         </div>
     </div>
 </body>

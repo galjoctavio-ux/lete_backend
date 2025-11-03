@@ -43,10 +43,12 @@ export const PricingSection = () => {
     setError(null)
 
     try {
-      // 3. Modificamos la llamada a la API
-      //    Ahora enviamos el *priceIdEnvVar* del producto seleccionado
-      const response = await fetch('/api/checkout_sessions', {
-        method: 'POST',
+  // 3. Modificamos la llamada a la API
+  const apiUrl = `${window.location.origin}/cuentatron/api/checkout_sessions`
+  console.log('🔍 Llamando API en:', apiUrl)
+  
+  const response = await fetch(apiUrl, {
+    method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           terms_version: TERMS_VERSION,
@@ -149,7 +151,7 @@ export const PricingSection = () => {
             />
             <span className="text-sm text-gris-grafito/90">
               He leído y acepto los{' '}
-              <a href="/terminos-venta" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
+              <a href="/cuentatron/terminos-venta" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
                 Términos y Condiciones de Venta
               </a>.
             </span>
@@ -163,14 +165,14 @@ export const PricingSection = () => {
             />
             <span className="text-sm text-gris-grafito/90">
               He leído la{' '}
-              <a href="/garantia" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
+              <a href="/cuentatron/garantia" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
                 Política de Garantía (6 meses)
               </a>.
             </span>
           </label>
           <div className="text-sm text-gris-grafito/90 pt-2">
             Al comprar, tus datos serán tratados según nuestro{' '}
-            <a href="/privacidad-ecommerce" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
+            <a href="/cuentatron/privacidad-ecommerce" target="_blank" rel="noopener noreferrer" className="text-azul-confianza underline">
               Aviso de Privacidad E-Commerce
             </a>.
           </div>
@@ -201,7 +203,7 @@ export const PricingSection = () => {
               <FiLock className="mr-1.5" /> Pago 100% Seguro con Stripe
             </span>
             <span className="flex items-center text-sm">
-              <FiCheckCircle className="mr-1.5" /> 1 Año de Garantía en Hardware
+              <FiCheckCircle className="mr-1.5" /> 6 Meses de Garantía en Hardware
             </span>
           </div>
         </div>

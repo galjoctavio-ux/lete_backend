@@ -6,7 +6,7 @@ export default function PrivacidadPage() {
       {/* La clase "prose" ahora funcionará gracias al plugin */}
       <div className="prose prose-lg max-w-none">
         <p>
-          Ingenieros Eléctricos Luz en tu Espacio S.A. de C.V., con domicilio en Zapopan, Jalisco, México, y responsable de la marca comercial Cuentatrón, es el responsable del tratamiento de los datos personales que usted nos proporciona a través de nuestro sitio web www.cuentatron.mx y de otros medios electrónicos relacionados con la compra, activación o uso del dispositivo.
+          Tecnología y Software en la Ingeniería Civil S.A. de C.V., con domicilio en Zapopan, Jalisco, México, y responsable de la marca comercial Cuentatrón, es el responsable del tratamiento de los datos personales que usted nos proporciona a través de nuestro sitio web www.tesivil.com/cuentatron y de otros medios electrónicos relacionados con la compra, activación o uso del dispositivo.
         </p>
         <p>
           El presente Aviso de Privacidad se emite en cumplimiento de la Ley Federal de Protección de Datos Personales en Posesión de los Particulares (LFPDPPP) y tiene como objetivo informarle sobre el uso, protección y tratamiento de sus datos personales.
@@ -50,8 +50,8 @@ export default function PrivacidadPage() {
         </ul>
         <p>
           En caso de no desear que sus datos se utilicen para finalidades secundarias, puede enviar un correo a{' '}
-          <a href="mailto:privacidad@cuentatron.mx" className="text-azul-confianza hover:underline">
-            privacidad@cuentatron.mx
+          <a href="mailto:privacidad-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            privacidad-cuentatron@tesivil.com
           </a>
           {' '}indicando en el asunto “No deseo uso secundario de datos”.
         </p>
@@ -76,8 +76,8 @@ export default function PrivacidadPage() {
         </ul>
         <p>
           Para ejercer cualquiera de estos derechos, deberá enviar una solicitud al correo electrónico{' '}
-          <a href="mailto:privacidad@cuentatron.mx" className="text-azul-confianza hover:underline">
-            privacidad@cuentatron.mx
+          <a href="mailto:privacidad-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            privacidad-cuentatron@tesivil.com
           </a>
           {' '}con el asunto “Solicitud ARCO”, indicando su nombre completo, medio de contacto y una descripción del derecho que desea ejercer.
         </p>
@@ -111,7 +111,7 @@ export default function PrivacidadPage() {
           Nos reservamos el derecho de modificar o actualizar este Aviso de Privacidad en cualquier momento.
         </p>
         <p>
-          Las modificaciones serán publicadas en www.cuentatron.mx/privacidad y entrarán en vigor automáticamente a partir de su publicación.
+          Las modificaciones serán publicadas en https://www.tesivil.com/cuentatron/privacidad-ecommerce/ y entrarán en vigor automáticamente a partir de su publicación.
         </p>
 
         <h2 className="text-2xl font-bold mt-8 mb-4">9. Contacto</h2>
@@ -120,12 +120,12 @@ export default function PrivacidadPage() {
         </p>
         <p>
           📧{' '}
-          <a href="mailto:privacidad@cuentatron.mx" className="text-azul-confianza hover:underline">
-            privacidad@cuentatron.mx
+          <a href="mailto:privacidad-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            privacidad-cuentatron@tesivil.com
           </a>
         </p>
         <p>
-          📍 Ingenieros Eléctricos Luz en tu Espacio S.A. de C.V.
+          📍 Tecnología y Software en la Ingeniería Civil S.A. de C.V.
           <br />
           Zapopan, Jalisco, México.
         </p>

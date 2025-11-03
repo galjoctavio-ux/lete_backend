@@ -34,9 +34,9 @@
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
 // <-- CAMBIO: Actualizada la versión para reflejar las nuevas características
-const float FIRMWARE_VERSION = 15.1; 
+const float FIRMWARE_VERSION = 15.7; 
 const bool OLED_CONECTADA = true;
-const bool DEBUG_MODE = true;
+const bool DEBUG_MODE = falsej;
 
 // --- 3. CONFIGURACIÓN DE PINES ---
 #define BUTTON_PIN 13

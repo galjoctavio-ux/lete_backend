@@ -9,12 +9,12 @@ export default function TerminosPage() {
           <strong>Última actualización: 26 de octubre de 2025</strong>
         </p>
         <p>
-          <strong>Razón social:</strong> Ingeniería y Distribución de Aires Acondicionados Mr. Frío S.A.S. de C.V.
+          <strong>Razón social:</strong> Tecnología y Software en la Ingeniería Civil S.A. de C.V. - TESIVIL
         </p>
         <p>
           <strong>Correo de contacto:</strong>{' '}
-          <a href="mailto:contacto@cuentatron.com" className="text-azul-confianza hover:underline">
-            contacto@cuentatron.com
+          <a href="mailto:contacto-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            contacto-cuentatron@tesivil.com
           </a>
         </p>
         <p>
@@ -23,7 +23,7 @@ export default function TerminosPage() {
 
         <h2 className="text-2xl font-bold mt-8 mb-4">1. Objeto</h2>
         <p>
-          El presente documento establece los términos que regulan la compra y uso inicial del dispositivo Cuentatrón (en adelante, el “Dispositivo”) adquirido por el cliente (en adelante, el “Usuario”) a través del sitio web cuentatron.com o de canales oficiales autorizados.
+          El presente documento establece los términos que regulan la compra y uso inicial del dispositivo Cuentatrón (en adelante, el “Dispositivo”) adquirido por el cliente (en adelante, el “Usuario”) a través del sitio web www.tesivil.com/cuentatron o de canales oficiales autorizados.
         </p>
 
         <h2 className="text-2xl font-bold mt-8 mb-4">2. Naturaleza del producto</h2>
@@ -90,8 +90,8 @@ export default function TerminosPage() {
         </ul>
         <p>
           Para hacer válida la garantía, el Usuario deberá contactar a{' '}
-          <a href="mailto:garantias@cuentatron.com" className="text-azul-confianza hover:underline">
-            garantias@cuentatron.com
+          <a href="mailto:garantias-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            garantias-cuentatron@tesivil.com
           </a>, adjuntando:
         </p>
         <ul className="list-disc list-inside space-y-1 my-2 pl-4">
@@ -153,8 +153,8 @@ export default function TerminosPage() {
         </p>
         <p>
           📩{' '}
-          <a href="mailto:contacto@cuentatron.com" className="text-azul-confianza hover:underline">
-            contacto@cuentatron.com
+          <a href="mailto:contacto-cuentatron@tesivil.com" className="text-azul-confianza hover:underline">
+            contacto-cuentatron@tesivil.com
           </a>
         </p>
         <p>

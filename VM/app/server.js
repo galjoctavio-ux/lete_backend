@@ -13,6 +13,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const twilio = require('twilio');
 const { InfluxDB } = require('@influxdata/influxdb-client'); // <-- AÑADIR ESTA LÍNEA
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const QuickChart = require('quickchart-js');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -240,15 +241,15 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
                               .replace(/{{user_email}}/g, email);
       } catch (readError) {
           console.error("[DEBUG] ❌ ERROR CRÍTICO: No se pudo leer la plantilla bienvenida.html.", readError.message);
-          htmlBody = `<h1>¡Hola y bienvenido a Mr. Frío!</h1><p>Tu suscripción ha sido activada exitosamente.</p><p>Puedes acceder a tu panel de control en https://api.mrfrio.mx/mi-cuenta.html</p>`;
+          htmlBody = `<h1>¡Hola y bienvenido a Cuentatrón!</h1><p>Tu suscripción ha sido activada exitosamente.</p><p>Puedes acceder a tu panel de control en https://www.tesivil.com/mi-cuenta.html</p>`;
       }
 
       // Enviar correo de bienvenida
       console.log(`[DEBUG] Enviando correo de bienvenida (plantilla HTML) a ${email}...`);
       await resend.emails.send({
-          from: 'Mr. Frío <bienvenido@mrfrio.mx>',
+          from: 'Cuentatrón <bienvenido@tesivil.com>',
           to: [email],
-          subject: '¡Bienvenido a Mr. Frío! Siguientes Pasos 🚀',
+          subject: '¡Bienvenido a Cuentatrón! Siguientes Pasos 🚀',
           html: htmlBody
       });
       console.log("[DEBUG] ✅ Correo de bienvenida enviado con éxito.");
@@ -258,7 +259,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
           console.log(`[DEBUG] Enviando WhatsApp de bienvenida a ${telefono_whatsapp}...`);
           try {
               await twilioClient.messages.create({
-                  body: `¡Hola ${nombreCliente}! 👋 Bienvenido a Mr. Frío. Tu suscripción está activa y tu dispositivo está listo para ser instalado. Revisa tu correo (${email}) para ver las instrucciones.`,
+                  body: `¡Hola ${nombreCliente}! 👋 Bienvenido a Cuentatrón. Tu suscripción está activa y tu dispositivo está listo para ser instalado. Revisa tu correo (${email}) para ver las instrucciones.`,
                   from: process.env.TWILIO_FROM_NUMBER, // Usa tu variable de entorno
                   to: `whatsapp:${telefono_whatsapp}`
               });
@@ -323,8 +324,88 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   res.status(200).send({ received: true });
 });
 
+// --- LÓGICA DE NEGOCIO Y REGLAS (Port de Python) ---
+const IVA = 1.16;
+const TARIFAS_CFE = {
+    '01': [
+        { hasta_kwh: 150, precio: 1.08 },
+        { hasta_kwh: 280, precio: 1.32 },
+        { hasta_kwh: Infinity, precio: 3.85 }
+    ],
+    '01A': [
+        { hasta_kwh: 150, precio: 1.08 },
+        { hasta_kwh: 300, precio: 1.32 },
+        { hasta_kwh: Infinity, precio: 3.85 }
+    ],
+    'PDBT': [
+        { hasta_kwh: Infinity, precio: 5.60 }
+    ],
+    'DAC': [
+        { hasta_kwh: Infinity, precio: 7.80 }
+    ]
+};
+// --- FIN DE LÓGICA DE NEGOCIO ---
+
 // --- AHORA SÍ, USAMOS express.json() PARA EL RESTO DE RUTAS ---
 app.use(express.json());
+
+// --- ¡NUEVO ENDPOINT! WEBHOOK DE CHATWOOT (VERSIÓN FINAL v6) ---
+app.post('/api/chatwoot-webhook', async (req, res) => {
+    const event = req.body;
+
+    try {
+        // --- CASO 1: Mensaje nuevo de un agente ---
+        if (event.event === 'message_created' && 
+            event.message_type === 'outgoing' && 
+            event.private === false) {
+
+            console.log('[CHATWOOT WEBHOOK] Es una respuesta de un agente.');
+            const agentMessage = event.content;
+            const telegram_chat_id = event.conversation?.meta?.sender?.identifier;
+
+            if (telegram_chat_id) {
+                if (agentMessage) {
+                    console.log(`[CHATWOOT WEBHOOK] Reenviando a Telegram (${telegram_chat_id}): ${agentMessage}`);
+                    await enviarMensajeTelegram(telegram_chat_id, agentMessage);
+                } else {
+                    console.warn(`[CHATWOOT WEBHOOK] El mensaje del agente no tenía contenido de texto. No se reenvió.`);
+                }
+            } else {
+                console.warn('[CHATWOOT WEBHOOK] (message_created) NO SE ENCONTRÓ EL CHAT_ID en event.conversation.meta.sender.identifier');
+            }
+        
+        // --- CASO 2: El estado de la conversación cambió ---
+        } else if (event.event === 'conversation_status_changed') {
+            
+            console.log(`[CHATWOOT WEBHOOK] Cambio de estado detectado: ${event.status}`);
+            const telegram_chat_id = event.meta?.sender?.identifier;
+
+            if (event.status === 'resolved' && telegram_chat_id) {
+                console.log(`[POLICIA] Chatwoot resolvió el chat. Devolviendo control a Gemini para ${telegram_chat_id}.`);
+                
+                // 1. Limpiamos el temporizador en la DB
+                await supabase
+                    .from('clientes')
+                    .update({ en_chat_humano_hasta: null }) 
+                    .eq('telegram_chat_id', telegram_chat_id);
+                
+                // --- ¡NUEVA LÍNEA! Notificamos al usuario ---
+                await enviarMensajeTelegram(telegram_chat_id, 
+                    "✅ ¡Chat finalizado! Tu conversación con nuestro agente humano ha terminado. El asistente de IA (yo) vuelve a tomar el control.\n\nSi tienes otra duda o problema, solo escribe de nuevo."
+                );
+            
+            } else if (event.status === 'resolved') {
+                console.warn(`[CHATWOOT WEBHOOK] (status_changed) El chat se resolvió, pero NO SE PUDO encontrar el telegram_chat_id.`);
+            }
+        }
+
+    } catch (err) {
+        console.error('[CHATWOOT WEBHOOK] Error fatal en el webhook:', err.message);
+    }
+
+    // Responder siempre 200 a Chatwoot
+    res.sendStatus(200);
+});
 
 // --- ¡NUEVA FUNCIÓN DE AYUDA PARA TELEGRAM! ---
 async function enviarMensajeTelegram(chat_id, text) {
@@ -480,10 +561,12 @@ app.post('/api/telegram-webhook', async (req, res) => {
           ciclo_bimestral,              
           fecha_inicio_servicio,        
           lectura_cierre_periodo_anterior, 
-          lectura_medidor_inicial,       
+          lectura_medidor_inicial,  
+          tipo_tarifa,     
           dispositivos_lete ( device_id )
         `)
         .eq('telegram_chat_id', chat_id)
+        .limit(1)
         .single();
 
       // 1a. Si NO está vinculado O HUBO UN ERROR, recordarle
@@ -517,251 +600,159 @@ app.post('/api/telegram-webhook', async (req, res) => {
       console.log(`[TELEGRAM] Comando de ${cliente.nombre} (${device_id}): ${textoRecibido}`);
       const comando = textoRecibido.toLowerCase().trim().replace('/', '');
 
-      // --- PROCESADOR DE COMANDOS ---
+      // --- PROCESADOR DE COMANDOS (REFACTORIZADO Y CORREGIDO) ---
       switch (comando) {
         
         case 'voltaje':
-          const fluxQuery = `
-            from(bucket: "${influxBucket}")
-              |> range(start: 0) // Buscamos en todo el historial
-              |> filter(fn: (r) => r._measurement == "energia")
-              |> filter(fn: (r) => r._field == "vrms")
-              |> filter(fn: (r) => r.device_id == "${device_id}")
-              |> last()
-          `;
-          
-          let voltaje = null;
-          let timestamp = null; // <-- Variable para guardar la fecha
-          console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQuery.replace(/\s+/g, ' ')}`);
-
-          try {
-            // Usamos 'for await...of' para consumir el stream de Influx
-            for await (const { values, tableMeta } of queryApi.iterateRows(fluxQuery)) {
-              const o = tableMeta.toObject(values);
-              voltaje = o._value;
-              timestamp = o._time; // <-- Capturamos la fecha del registro
-            }
-
-            if (voltaje !== null) {
-              // Formateamos la fecha a la zona horaria local
-              const fechaReporte = new Date(timestamp).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
-              await enviarMensajeTelegram(chat_id, `⚡ El último voltaje reportado fue: *${voltaje.toFixed(2)} V* (registrado el ${fechaReporte})`);
-            } else {
-              // Mensaje de error actualizado (ya no menciona 15 min)
-              await enviarMensajeTelegram(chat_id, "No pude encontrar ningún dato de voltaje para tu dispositivo. ¿Está tu dispositivo conectado y enviando datos?");
-            }
-
-          } catch (err) {
-            console.error(`[INFLUX ERR] Error consultando voltaje: ${err.message}`);
-            await enviarMensajeTelegram(chat_id, "Hubo un error al consultar la base de datos de mediciones.");
-          }
+          await handleVoltaje(chat_id, device_id);
           break;
 
-        // ... (código del case 'voltaje' que termina en 'break;')
-
         case 'watts':
-        case 'potencia': // Alias
-          const fluxQueryWatts = `
-            from(bucket: "${influxBucket}")
-              |> range(start: 0) // Buscamos en todo el historial
-              |> filter(fn: (r) => r._measurement == "energia")
-              |> filter(fn: (r) => r._field == "power") // <-- CAMBIO A "power"
-              |> filter(fn: (r) => r.device_id == "${device_id}")
-              |> last()
-          `;
-          
-          let watts = null;
-          let timestampWatts = null;
-          console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryWatts.replace(/\s+/g, ' ')}`);
-
-          try {
-            for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryWatts)) {
-              const o = tableMeta.toObject(values);
-              watts = o._value;
-              timestampWatts = o._time;
-            }
-
-            if (watts !== null) {
-              const fechaReporte = new Date(timestampWatts).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
-              await enviarMensajeTelegram(chat_id, `💡 El último consumo instantáneo fue: *${watts.toFixed(2)} W* (registrado el ${fechaReporte})`);
-            } else {
-              await enviarMensajeTelegram(chat_id, "No pude encontrar ningún dato de potencia (Watts) para tu dispositivo.");
-            }
-
-          } catch (err) {
-            console.error(`[INFLUX ERR] Error consultando watts: ${err.message}`);
-            await enviarMensajeTelegram(chat_id, "Hubo un error al consultar la base de datos de mediciones.");
-          }
+        case 'potencia':
+          await handleWatts(chat_id, device_id);
           break;
 
         case 'consumo_hoy':
         case 'consumo_de_hoy':
-        case 'hoy': { // <-- LLAVE DE APERTURA
-          const fechasHoy = getFechasParaQuery('hoy');
-          const fluxQueryHoy = `
-            from(bucket: "${influxBucket}")
-              |> range(start: ${fechasHoy.start}, stop: ${fechasHoy.stop})
-              |> filter(fn: (r) => r._measurement == "energia")
-              |> filter(fn: (r) => r._field == "power")
-              |> filter(fn: (r) => r.device_id == "${device_id}")
-              |> integral(unit: 1s)
-              |> map(fn: (r) => ({ _value: r._value / 3600000.0 }))
-              |> sum()
-          `;
-          
-          let consumoHoy = null; // Esta variable ahora vive SÓLO aquí
-          console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryHoy.replace(/\s+/g, ' ')}`);
-
-          try {
-            for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryHoy)) {
-              const o = tableMeta.toObject(values);
-              consumoHoy = o._value;
-            }
-
-            // --- ¡NUEVA LÓGICA! ---
-            // 1. Preparamos el mensaje principal
-            let mensaje = "Aún no se registran datos de consumo para el día de hoy.";
-            if (consumoHoy !== null) {
-              mensaje = `📊 Tu consumo acumulado de *hoy* es: *${consumoHoy.toFixed(3)} kWh*`;
-            }
-            
-            // 2. Obtenemos el acumulado del periodo
-            const { kwh_periodo_actual, error_periodo } = await getConsumoAcumuladoPeriodo(cliente, device_id);
-
-            // 3. Añadimos la línea extra si no hubo error
-            if (!error_periodo) {
-                mensaje += `\n\nLlevas un total de *${kwh_periodo_actual.toFixed(3)} kWh* acumulados en tu periodo actual.`;
-            }
-            
-            // 4. Enviamos el mensaje combinado
-            await enviarMensajeTelegram(chat_id, mensaje);
-            // --- FIN DE LÓGICA NUEVA ---
-
-          } catch (err) {
-            console.error(`[INFLUX ERR] Error consultando consumo_hoy: ${err.message}`);
-            await enviarMensajeTelegram(chat_id, "Hubo un error al calcular tu consumo de hoy.");
-          }
+        case 'hoy':
+          await handleConsumoHoy(chat_id, device_id, cliente);
           break;
-        } // <-- LLAVE DE CIERRE
 
         case 'consumo_ayer':
         case 'consumo_de_ayer':
-        case 'ayer': { // <-- LLAVE DE APERTURA
-          const fechasAyer = getFechasParaQuery('ayer');
-          const fluxQueryAyer = `
-            from(bucket: "${influxBucket}")
-              |> range(start: ${fechasAyer.start}, stop: ${fechasAyer.stop})
-              |> filter(fn: (r) => r._measurement == "energia")
-              |> filter(fn: (r) => r._field == "power")
-              |> filter(fn: (r) => r.device_id == "${device_id}")
-              |> integral(unit: 1s)
-              |> map(fn: (r) => ({ _value: r._value / 3600000.0 }))
-              |> sum()
-          `;
-          
-          // --- ¡ESTA ES LA CORRECCIÓN CLAVE! ---
-          let consumoAyer = null; // Se llama 'consumoAyer', no 'consumoHoy'
-          
-          console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryAyer.replace(/\s+/g, ' ')}`);
+        case 'ayer':
+          await handleConsumoAyer(chat_id, device_id, cliente);
+          break;
 
+        case 'grafica_ayer':
+        case 'grafica':
+          await handleGraficaAyer(chat_id, device_id);
+          break;
+
+        case 'grafica_semanal':
+        case 'semanal':
+          await handleGraficaSemanal(chat_id, device_id);
+          break;
+
+        case 'usar_telegram': {
+          console.log(`[PREFERENCIA] ${cliente.nombre} solicita cambiar a Telegram.`);
           try {
-            for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryAyer)) {
-              const o = tableMeta.toObject(values);
-              consumoAyer = o._value; // Asignar a 'consumoAyer'
-            }
-
-            // --- ¡NUEVA LÓGICA! ---
-            // 1. Preparamos el mensaje principal
-            let mensaje = "No se encontraron datos de consumo para el día de ayer.";
-            if (consumoAyer !== null) { // Usar 'consumoAyer'
-              mensaje = `🗓️ Tu consumo total de *ayer* fue: *${consumoAyer.toFixed(3)} kWh*`; // Usar 'consumoAyer'
-            }
-            
-            // 2. Obtenemos el acumulado del periodo
-            const { kwh_periodo_actual, error_periodo } = await getConsumoAcumuladoPeriodo(cliente, device_id);
-
-            // 3. Añadimos la línea extra si no hubo error
-            if (!error_periodo) {
-                mensaje += `\n\nLlevas un total de *${kwh_periodo_actual.toFixed(3)} kWh* acumulados en tu periodo actual.`;
-            }
-            
-            // 4. Enviamos el mensaje combinado
-            await enviarMensajeTelegram(chat_id, mensaje);
-            // --- FIN DE LÓGICA NUEVA ---
-
+            await supabase
+              .from('clientes')
+              .update({ prefiere_telegram: true })
+              .eq('id', cliente.id);
+            await enviarMensajeTelegram(chat_id, "✅ ¡Listo! A partir de ahora, tus reportes diarios y alertas llegarán *solo* por Telegram.");
           } catch (err) {
-            console.error(`[INFLUX ERR] Error consultando consumo_ayer: ${err.message}`);
-            await enviarMensajeTelegram(chat_id, "Hubo un error al calcular tu consumo de ayer.");
+            console.error(`[DB ERR] Error al cambiar preferencia a Telegram: ${err.message}`);
+            await enviarMensajeTelegram(chat_id, "Hubo un error al guardar tu preferencia. Por favor, intenta de nuevo.");
           }
           break;
-        } // <-- LLAVE DE CIERRE
+        }
 
-        // ... (aquí va el 'default:')  
+        case 'usar_whatsapp': {
+          console.log(`[PREFERENCIA] ${cliente.nombre} solicita cambiar a WhatsApp.`);
+          try {
+            await supabase
+              .from('clientes')
+              .update({ prefiere_telegram: false })
+              .eq('id', cliente.id);
+            await enviarMensajeTelegram(chat_id, "✅ ¡Entendido! Tus reportes diarios y alertas volverán a enviarse por WhatsApp.");
+          } catch (err) {
+            console.error(`[DB ERR] Error al cambiar preferencia a WhatsApp: ${err.message}`);
+            await enviarMensajeTelegram(chat_id, "Hubo un error al guardar tu preferencia. Por favor, intenta de nuevo.");
+          }
+          break;
+        }
 
-        // ... aquí irán /consumo_hoy, /watts, etc. ...
+        // --- LOS CASES 'agregar_numero' Y 'quitar_numero' HAN SIDO ELIMINADOS ---
 
-        default: { // <-- Encerramos en llaves para crear un ámbito seguro
-          console.log(`[POLICIA] Mensaje no reconocido de ${cliente.nombre}. Iniciando lógica de desvío.`);
+        default: { // <-- LÓGICA DEL "ASISTENTE" (v2)
+          console.log(`[ASISTENTE] Mensaje no reconocido de ${cliente.nombre}. Iniciando lógica de IA.`);
           
-          // 1. Revisar la DB. ¿Está en un chat humano?
+          // 1. Lógica "Policía": ¿Está en un chat humano?
           const ahora = new Date();
           const fechaLimiteHumano = cliente.en_chat_humano_hasta ? new Date(cliente.en_chat_humano_hasta) : null;
 
           // --- Escenario 1: Chat Humano ACTIVO ---
-          // (El temporizador 'en_chat_humano_hasta' está en el futuro)
           if (fechaLimiteHumano && fechaLimiteHumano > ahora) {
             console.log(`[POLICIA] Chat humano activo. Reenviando a Chatwoot y reiniciando timer.`);
-            
-            // Paso A: Reenviar mensaje al CRM
-            // (La variable 'cliente' y 'textoRecibido' están disponibles desde el inicio del 'Caso 4')
             await reenviarAChatwoot(cliente, textoRecibido); 
-            
-            // Paso B: Reiniciar el temporizador (ej. 1 hora más desde ahora)
             const nuevaHoraLimite = new Date(Date.now() + 60 * 60 * 1000).toISOString();
             await supabase
                 .from('clientes')
                 .update({ en_chat_humano_hasta: nuevaHoraLimite })
                 .eq('id', cliente.id);
-            
-            // NO respondemos nada. El agente humano en Chatwoot lo hará.
+            // NO respondemos nada. El agente humano lo hará.
           
-          // --- Escenario 2: Chat Humano INACTIVO (Llamar al Detective Gemini) ---
+          // --- Escenario 2: Chat Humano INACTIVO (Llamar al Asistente Gemini) ---
           } else {
-            console.log(`[POLICIA] Chat humano inactivo. Llamando a Gemini...`);
+            console.log(`[ASISTENTE] Chat humano inactivo. Llamando a Gemini v2...`);
             
-            // Paso A: Enviar mensaje a Gemini para clasificar la intención
+            // ¡Llama al nuevo cerebro que detecta MÚLTIPLES intenciones!
             const respuestaGemini = await llamarAGemini(textoRecibido);
-            
-            // --- Sub-escenario 2a: ¡Necesita soporte humano! ---
-            if (respuestaGemini.intencion === 'soporte_humano') {
-              console.log(`[POLICIA] Gemini detectó 'soporte_humano'. Transfiriendo a Chatwoot.`);
-              
-              // Paso A: Reenviar al CRM
-              await reenviarAChatwoot(cliente, textoRecibido);
-              
-              // Paso B: Actualizar la DB para INICIAR el chat humano (1 hora)
-              const horaLimite = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-              await supabase
-                  .from('clientes')
-                  .update({ en_chat_humano_hasta: horaLimite })
-                  .eq('id', cliente.id);
-                  
-              // Paso C: Responder al cliente en Telegram
-              await enviarMensajeTelegram(chat_id, "Entendido, tu mensaje requiere atención especial. Estoy transfiriendo tu chat a un agente humano, un momento por favor... 🧑‍💻");
-            
-            // --- Sub-escenario 2b: No es soporte (intención desconocida) ---
-            } else {
-              console.log(`[POLICIA] Gemini detectó 'desconocido'. Respondiendo con menú.`);
-              
-              // Respondemos con el menú de ayuda estándar
-              await enviarMensajeTelegram(chat_id, 
-                "No reconocí ese comando. Prueba con alguna de estas opciones:\n\n" +
-                "*/hoy* - _Consumo acumulado del día_\n" +
-                "*/ayer* - _Consumo total de ayer_\n" +
-                "*/voltaje* - _Último voltaje registrado_\n" +
-                "*/watts* - _Consumo instantáneo (potencia)_" +
-                "\n\n_Si tienes un problema o quieres cancelar, solo escríbelo y te transferiré con un humano._"
-              );
+            const intencion = respuestaGemini.intencion;
+
+            console.log(`[ASISTENTE] Intención detectada: ${intencion}`);
+
+            // --- ¡NUEVO! Router de Intenciones ---
+            // --- ¡NUEVO! Router de Intenciones (v3) ---
+            switch (intencion) {
+                
+                // --- Caso 1: Soporte Humano ---
+                case 'soporte_humano':
+                  console.log(`[ASISTENTE] Detectó 'soporte_humano'. Transfiriendo a Chatwoot.`);
+                  await reenviarAChatwoot(cliente, textoRecibido);
+                  const horaLimite = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+                  await supabase
+                      .from('clientes')
+                      .update({ en_chat_humano_hasta: horaLimite })
+                      .eq('id', cliente.id);
+                  await enviarMensajeTelegram(chat_id, "Entendido, tu mensaje requiere atención especial. Estoy transfiriendo tu chat a un agente humano, un momento por favor... 🧑‍💻");
+                  break;
+
+                // --- Casos 2-7: Llamar a las funciones de comandos ---
+                case 'pedir_consumo_hoy':
+                  await handleConsumoHoy(chat_id, device_id, cliente);
+                  break;
+                case 'pedir_consumo_ayer':
+                  await handleConsumoAyer(chat_id, device_id, cliente);
+                  break;
+                case 'pedir_voltaje':
+                  await handleVoltaje(chat_id, device_id);
+                  break;
+                case 'pedir_watts':
+                  await handleWatts(chat_id, device_id);
+                  break;
+                case 'pedir_grafica_ayer':
+                  await handleGraficaAyer(chat_id, device_id);
+                  break;
+                case 'pedir_grafica_semanal':
+                  await handleGraficaSemanal(chat_id, device_id);
+                  break;
+
+                // --- ¡NUEVO CASO! Caso 8: FAQ Genérica ---
+                case 'pregunta_faq':
+                  console.log("[ASISTENTE] Detectó 'pregunta_faq'. Generando respuesta...");
+                  // (Opcional) Enviamos un mensaje de "pensando..."
+                  await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠"); 
+                  // Llamamos a la nueva función generadora
+                  const respuestaFAQ = await generarRespuestaFAQ(textoRecibido); 
+                  await enviarMensajeTelegram(chat_id, respuestaFAQ);
+                  break;
+
+                // --- Caso 9: Desconocido ---
+                case 'desconocido':
+                default:
+                  console.log(`[ASISTENTE] Gemini detectó 'desconocido'. Respondiendo con menú.`);
+                  await enviarMensajeTelegram(chat_id, 
+                    "No entendí muy bien. Puedes pedirme cosas como:\n\n" +
+                    "- _'¿cuánto gasté ayer?'_\n" +
+                    "- _'dame la gráfica de la semana'_\n" +
+                    "- _'¿cómo está el voltaje?'_\n" +
+                    "- _'¿cómo puedo ahorrar energía?'_\n" + // (Gemini ahora entenderá esto)
+                    "\nSi tienes un problema, solo escríbelo y te ayudaré."
+                  );
+                  break;
             }
           }
           break; 
@@ -799,6 +790,26 @@ function isValidEmail(email) {
   return re.test(String(email).toLowerCase());
 }
 
+// --- FUNCIÓN DE AYUDA: CALCULAR COSTO CFE (Port de Python) ---
+function calcularCostoEstimadoJS(kwh_consumidos, tipo_tarifa) {
+    if (!TARIFAS_CFE[tipo_tarifa]) {
+        console.warn(`⚠️ Advertencia: Tarifa '${tipo_tarifa}' no reconocida. No se puede calcular el costo.`);
+        return 0.0;
+    }
+    let costo_sin_iva = 0.0;
+    let kwh_restantes = kwh_consumidos;
+    let limite_anterior = 0;
+    for (const escalon of TARIFAS_CFE[tipo_tarifa]) {
+        const limite_actual = escalon.hasta_kwh;
+        const kwh_en_este_escalon = Math.min(kwh_restantes, limite_actual - limite_anterior);
+        costo_sin_iva += kwh_en_este_escalon * escalon.precio;
+        kwh_restantes -= kwh_en_este_escalon;
+        if (kwh_restantes <= 0) break;
+        limite_anterior = limite_actual;
+    }
+    return costo_sin_iva * IVA;
+}
+
 // --- FUNCIÓN DE AYUDA: OBTENER RANGOS DE FECHA (HOY/AYER) ---
 function getFechasParaQuery(tipo) {
     const zonaHoraria = 'America/Mexico_City';
@@ -821,6 +832,310 @@ function getFechasParaQuery(tipo) {
         stop: fin.toISOString()
     };
 }
+
+// --- FUNCIÓN DE AYUDA: OBTENER RANGO SEMANAL ---
+function getFechasParaQuerySemanal() {
+    const zonaHoraria = 'America/Mexico_City';
+    const ahora = new Date(new Date().toLocaleString('en-US', { timeZone: zonaHoraria }));
+
+    // Fin: Hoy a las 23:59:59
+    const fin = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate(), 23, 59, 59);
+
+    // Inicio: 6 días ANTES de hoy (para un total de 7 días)
+    const inicio = new Date(ahora.getTime() - 6 * 24 * 60 * 60 * 1000);
+    inicio.setHours(0, 0, 0, 0); // Lo ponemos a las 00:00:00
+
+    // Devolvemos las fechas en formato ISO 8601 UTC
+    return {
+        start: inicio.toISOString(),
+        stop: fin.toISOString()
+    };
+}
+
+// --- ¡NUEVO BLOQUE! FUNCIONES DE ACCIÓN PARA EL BOT ---
+// (Estas son las funciones que sacamos del 'switch')
+
+async function handleVoltaje(chat_id, device_id) {
+  const fluxQuery = `
+    from(bucket: "${influxBucket}")
+      |> range(start: 0)
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "vrms")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> last()
+  `;
+  console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQuery.replace(/\s+/g, ' ')}`);
+  try {
+    let voltaje = null;
+    let timestamp = null;
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQuery)) {
+      const o = tableMeta.toObject(values);
+      voltaje = o._value;
+      timestamp = o._time;
+    }
+    if (voltaje !== null) {
+      const fechaReporte = new Date(timestamp).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+      await enviarMensajeTelegram(chat_id, `⚡ El último voltaje reportado fue: *${voltaje.toFixed(2)} V* (registrado el ${fechaReporte})`);
+    } else {
+      await enviarMensajeTelegram(chat_id, "No pude encontrar ningún dato de voltaje para tu dispositivo. ¿Está tu dispositivo conectado y enviando datos?");
+    }
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error consultando voltaje: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al consultar la base de datos de mediciones.");
+  }
+}
+
+async function handleWatts(chat_id, device_id) {
+  const fluxQueryWatts = `
+    from(bucket: "${influxBucket}")
+      |> range(start: 0)
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> last()
+  `;
+  console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryWatts.replace(/\s+/g, ' ')}`);
+  try {
+    let watts = null;
+    let timestampWatts = null;
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryWatts)) {
+      const o = tableMeta.toObject(values);
+      watts = o._value;
+      timestampWatts = o._time;
+    }
+    if (watts !== null) {
+      const fechaReporte = new Date(timestampWatts).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+      await enviarMensajeTelegram(chat_id, `💡 El último consumo instantáneo fue: *${watts.toFixed(2)} W* (registrado el ${fechaReporte})`);
+    } else {
+      await enviarMensajeTelegram(chat_id, "No pude encontrar ningún dato de potencia (Watts) para tu dispositivo.");
+    }
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error consultando watts: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al consultar la base de datos de mediciones.");
+  }
+}
+
+async function handleConsumoHoy(chat_id, device_id, cliente) {
+  const fechasHoy = getFechasParaQuery('hoy');
+  const fluxQueryHoy = `
+    from(bucket: "${influxBucket}")
+      |> range(start: ${fechasHoy.start}, stop: ${fechasHoy.stop})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> integral(unit: 1s)
+      |> map(fn: (r) => ({ _value: r._value / 3600000.0 }))
+      |> sum()
+  `;
+  console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryHoy.replace(/\s+/g, ' ')}`);
+  try {
+    let consumoHoy = null;
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryHoy)) {
+      const o = tableMeta.toObject(values);
+      consumoHoy = o._value;
+    }
+    let mensaje = "Aún no se registran datos de consumo para el día de hoy.";
+    if (consumoHoy !== null) {
+      mensaje = `📊 Tu consumo acumulado de *hoy* es: *${consumoHoy.toFixed(3)} kWh*`;
+    }
+    
+    // --- ¡NUEVA LÓGICA DE COSTO! ---
+    const { kwh_periodo_actual, error_periodo } = await getConsumoAcumuladoPeriodo(cliente, device_id);
+    if (!error_periodo) {
+        // 1. Calcular el costo
+        const costo_periodo_actual = calcularCostoEstimadoJS(kwh_periodo_actual, cliente.tipo_tarifa);
+        
+        // 2. Añadir ambas cosas al mensaje
+        mensaje += `\n\nLlevas un total de *${kwh_periodo_actual.toFixed(3)} kWh* acumulados en tu periodo actual, con un costo estimado de *$${costo_periodo_actual.toFixed(2)}*.`;
+    }
+    // --- FIN DE LÓGICA NUEVA ---
+    
+    await enviarMensajeTelegram(chat_id, mensaje);
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error consultando consumo_hoy: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al calcular tu consumo de hoy.");
+  }
+}
+
+async function handleConsumoAyer(chat_id, device_id, cliente) {
+  const fechasAyer = getFechasParaQuery('ayer');
+  const fluxQueryAyer = `
+    from(bucket: "${influxBucket}")
+      |> range(start: ${fechasAyer.start}, stop: ${fechasAyer.stop})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> integral(unit: 1s)
+      |> map(fn: (r) => ({ _value: r._value / 3600000.0 }))
+      |> sum()
+  `;
+  console.log(`[INFLUX] Ejecutando query para ${device_id}: ${fluxQueryAyer.replace(/\s+/g, ' ')}`);
+  try {
+    let consumoAyer = null;
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryAyer)) {
+      const o = tableMeta.toObject(values);
+      consumoAyer = o._value;
+    }
+    let mensaje = "No se encontraron datos de consumo para el día de ayer.";
+    if (consumoAyer !== null) {
+      mensaje = `🗓️ Tu consumo total de *ayer* fue: *${consumoAyer.toFixed(3)} kWh*`;
+    }
+
+    // --- ¡NUEVA LÓGICA DE COSTO! ---
+    const { kwh_periodo_actual, error_periodo } = await getConsumoAcumuladoPeriodo(cliente, device_id);
+    if (!error_periodo) {
+        // 1. Calcular el costo
+        const costo_periodo_actual = calcularCostoEstimadoJS(kwh_periodo_actual, cliente.tipo_tarifa);
+        
+        // 2. Añadir ambas cosas al mensaje
+        mensaje += `\n\nLlevas un total de *${kwh_periodo_actual.toFixed(3)} kWh* acumulados en tu periodo actual, con un costo estimado de *$${costo_periodo_actual.toFixed(2)}*.`;
+    }
+    // --- FIN DE LÓGICA NUEVA ---
+
+    await enviarMensajeTelegram(chat_id, mensaje);
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error consultando consumo_ayer: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al calcular tu consumo de ayer.");
+  }
+}
+
+async function handleGraficaAyer(chat_id, device_id) {
+  console.log(`[GRAFICA] Solicitando gráfica de ayer para ${device_id}`);
+  const fechasAyer = getFechasParaQuery('ayer');
+  const fluxQueryGrafica = `
+    from(bucket: "${influxBucket}")
+      |> range(start: ${fechasAyer.start}, stop: ${fechasAyer.stop})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+      |> yield(name: "mean")
+  `;
+  const labels = [];
+  const dataPoints = [];
+  try {
+    console.log(`[INFLUX GRAFICA] Ejecutando query: ${fluxQueryGrafica.replace(/\s+/g, ' ')}`);
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryGrafica)) {
+      const o = tableMeta.toObject(values);
+      const hora = new Date(o._time).toLocaleTimeString('es-MX', { 
+          hour: '2-digit', 
+          minute: '2-digit', 
+          timeZone: 'America/Mexico_City' 
+      });
+      labels.push(hora);
+      dataPoints.push(o._value.toFixed(2));
+    }
+    if (dataPoints.length === 0) {
+      await enviarMensajeTelegram(chat_id, "No encontré suficientes datos de ayer para generar una gráfica.");
+      return; // Usamos return en lugar de break
+    }
+    const chart = new QuickChart();
+    chart.setWidth(500).setHeight(300).setBackgroundColor('#ffffff');
+    chart.setConfig({
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Consumo (Watts)',
+          data: dataPoints,
+          fill: false,
+          borderColor: 'rgb(75, 192, 192)',
+          tension: 0.1
+        }]
+      },
+      options: { title: { display: true, text: 'Consumo Promedio (Watts) de Ayer' } }
+    });
+    const chartUrl = await chart.getShortUrl();
+    console.log(`[GRAFICA] URL de QuickChart generada: ${chartUrl}`);
+    await enviarMensajeTelegram(chat_id, chartUrl);
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error generando gráfica: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al generar tu gráfica de ayer.");
+  }
+}
+
+async function handleGraficaSemanal(chat_id, device_id) {
+  console.log(`[GRAFICA] Solicitando gráfica semanal para ${device_id}`);
+  const fechasSemana = getFechasParaQuerySemanal();
+  const fluxQuerySemanal = `
+    from(bucket: "${influxBucket}")
+      |> range(start: ${fechasSemana.start}, stop: ${fechasSemana.stop})
+      |> filter(fn: (r) => r._measurement == "energia")
+      |> filter(fn: (r) => r._field == "power")
+      |> filter(fn: (r) => r.device_id == "${device_id}")
+      |> aggregateWindow(every: 1d, fn: integral, createEmpty: false)
+      |> map(fn: (r) => ({ _time: r._time, _value: r._value / 3600000.0 }))
+      |> yield(name: "sum")
+  `;
+  const labels = [];
+  const dataPoints = [];
+  try {
+    console.log(`[INFLUX GRAFICA] Ejecutando query: ${fluxQuerySemanal.replace(/\s+/g, ' ')}`);
+    for await (const { values, tableMeta } of queryApi.iterateRows(fluxQuerySemanal)) {
+      const o = tableMeta.toObject(values);
+      const dia = new Date(o._time).toLocaleDateString('es-MX', {
+          weekday: 'short',
+          day: '2-digit',
+          month: '2-digit',
+          timeZone: 'America/Mexico_City'
+      });
+      labels.push(dia.replace('.', ''));
+      dataPoints.push(o._value.toFixed(3));
+    }
+    if (dataPoints.length === 0) {
+      await enviarMensajeTelegram(chat_id, "No encontré suficientes datos de los últimos 7 días para generar una gráfica.");
+      return; // Usamos return en lugar de break
+    }
+    const chart = new QuickChart();
+    chart.setWidth(500).setHeight(300).setBackgroundColor('#ffffff');
+    chart.setConfig({
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Consumo (kWh)',
+          data: dataPoints,
+          backgroundColor: 'rgba(54, 162, 235, 0.6)'
+        }]
+      },
+      options: { title: { display: true, text: 'Consumo Diario (kWh) - Últimos 7 Días' } }
+    });
+    const chartUrl = await chart.getShortUrl();
+    console.log(`[GRAFICA] URL de QuickChart generada: ${chartUrl}`);
+    await enviarMensajeTelegram(chat_id, chartUrl);
+  } catch (err) {
+    console.error(`[INFLUX ERR] Error generando gráfica: ${err.message}`);
+    await enviarMensajeTelegram(chat_id, "Hubo un error al generar tu gráfica semanal.");
+  }
+}
+
+// ... (después de handleGraficaSemanal)
+
+async function generarRespuestaFAQ(textoUsuario) {
+    if (!geminiApiKey) return "Lo siento, mi módulo de IA no está disponible en este momento.";
+    
+    console.log(`[GEMINI FAQ] Generando respuesta para: "${textoUsuario}"`);
+    try {
+        // Un prompt simple que le pide actuar como experto
+        const prompt = `
+            Eres un asistente de Cuentatrón, experto en energía eléctrica.
+            Responde la siguiente pregunta del usuario de forma breve, amigable y fácil de entender en español.
+            
+            Pregunta: "${textoUsuario}"
+        `;
+        const result = await geminiModel.generateContent(prompt);
+        const response = await result.response;
+        return response.text(); // Devolvemos el texto generado
+    } catch (error) {
+        console.error(`[GEMINI ERR] Error al GENERAR respuesta: ${error.message}`);
+        return "Tuve un problema al procesar tu pregunta. ¿Puedes intentar de nuevo?";
+    }
+}
+
+// --- FUNCIÓN DE AYUDA: CALCULAR FECHAS DE CORTE...
+// ... (el resto de tus funciones)
+
+// --- FIN DEL NUEVO BLOQUE ---
 
 // --- FUNCIÓN DE AYUDA: CALCULAR FECHAS DE CORTE (Port de Python) ---
 // (Necesita la función getFechasParaQuery para la zona horaria)
@@ -950,27 +1265,55 @@ async function getConsumoAcumuladoPeriodo(cliente, device_id) {
 }
 
 
-// --- FUNCIÓN DE AYUDA: LLAMAR A GEMINI (El "Detective") ---
+// --- FUNCIÓN DE AYUDA: LLAMAR A GEMINI (v3 - Con FAQ Genérica) ---
 async function llamarAGemini(textoUsuario) {
     if (!geminiApiKey) return { intencion: 'desconocido' }; // Guardián
 
     try {
         const prompt = `
-          Eres un clasificador de intenciones para un bot de monitoreo de energía llamado "Cuentatrón".
-          Analiza el siguiente mensaje del usuario y clasifícalo en una de estas dos intenciones:
-          1. "soporte_humano": Si el usuario expresa frustración, enojo, confusión, quiere cancelar, reporta un error grave, o pide explícitamente hablar con una persona.
-          2. "desconocido": Si es un saludo, una pregunta general, o cualquier otra cosa que no sea una solicitud de soporte urgente.
-          
-          Responde SOLAMENTE con un objeto JSON válido, nada más.
-          
-          Ejemplos:
-          - Usuario: "Esto no sirve, quiero cancelar mi suscripción ya" -> {"intencion": "soporte_humano"}
-          - Usuario: "Hola buenos días" -> {"intencion": "desconocido"}
-          - Usuario: "mi dispositivo no reporta desde ayer" -> {"intencion": "soporte_humano"}
-          - Usuario: "cuanto cuesta el kwh" -> {"intencion": "desconocido"}
-          - Usuario: "ayuda por favor" -> {"intencion": "soporte_humano"}
-          - Usuario: "gracias" -> {"intencion": "desconocido"}
-          
+          Eres un asistente de IA para "Cuentatrón", un servicio de monitoreo de energía.
+          Tu trabajo es clasificar la intención del usuario en UNA de las siguientes categorías.
+          Responde SOLAMENTE con un objeto JSON válido con la clave "intencion".
+
+          --- CATEGORÍAS DE INTENCIÓN ---
+
+          1. "soporte_humano":
+             - El usuario está frustrado, enojado o confundido, quiere cancelar, o pide un humano.
+             - Ejemplos: "Esto no sirve", "Quiero cancelar", "ayuda por favor", "mi dispositivo está en rojo"
+
+          2. "pedir_consumo_hoy":
+             - El usuario quiere saber su consumo del día actual.
+             - Ejemplos: "¿Cuánto he gastado hoy?", "consumo de hoy"
+
+          3. "pedir_consumo_ayer":
+             - El usuario quiere saber su consumo del día anterior.
+             - Ejemplos: "¿Cuánto consumí ayer?", "reporte de ayer"
+
+          4. "pedir_voltaje":
+             - El usuario pregunta por el voltaje actual.
+             - Ejemplos: "¿Cómo está el voltaje?", "dame el voltaje"
+
+          5. "pedir_watts":
+             - El usuario pregunta por la potencia (consumo instantáneo) actual.
+             - Ejemplos: "¿Cuántos watts estoy gastando?", "potencia actual"
+
+          6. "pedir_grafica_ayer":
+             - El usuario pide una gráfica del día anterior.
+             - Ejemplos: "muéstrame la gráfica de ayer", "quiero ver la gráfica"
+
+          7. "pedir_grafica_semanal":
+             - El usuario pide una gráfica de la semana.
+             - Ejemplos: "muéstrame la gráfica de la semana", "consumo semanal"
+
+          8. "pregunta_faq":
+             - El usuario tiene una duda de conocimiento general sobre electricidad, tarifas o el servicio.
+             - Ejemplos: "¿qué es un kilowatt hora?", "¿cómo puedo ahorrar energía?", "¿qué es un voltio?", "¿qué mide el aparato?"
+
+          9. "desconocido":
+              - El usuario solo saluda, da las gracias, o dice algo no relacionado.
+              - Ejemplos: "hola", "gracias", "ok", "buenos días"
+
+          ---
           Mensaje del usuario a clasificar:
           "${textoUsuario}"
         `;
@@ -979,11 +1322,10 @@ async function llamarAGemini(textoUsuario) {
         const response = await result.response;
         const text = response.text();
         
-        // Limpiar la respuesta de Gemini (a veces añade ```json ... ```)
         const jsonText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        console.log(`[GEMINI] Respuesta cruda: ${text}. JSON Limpio: ${jsonText}`);
+        console.log(`[GEMINI v3] Respuesta cruda: ${text}. JSON Limpio: ${jsonText}`);
         
-        return JSON.parse(jsonText); // Debería ser { intencion: "..." }
+        return JSON.parse(jsonText);
 
     } catch (error) {
         console.error(`[GEMINI ERR] Error al llamar a la API: ${error.message}`);
@@ -996,127 +1338,122 @@ async function llamarAGemini(textoUsuario) {
 //
 // --- ¡¡VERSIÓN CORREGIDA!! ---
 //
+// --- FUNCIÓN DE AYUDA: REENVIAR A CHATWOOT (v4 - Sincronizado) ---
 async function reenviarAChatwoot(cliente, texto) {
-    if (!chatwootUrl || !chatwootAccountId || !chatwootToken) return; // Guardián
+    if (!chatwootUrl || !chatwootAccountId || !chatwootToken) return;
 
-    // ¡¡IMPORTANTE!! Este es el ID de tu "Bandeja de entrada" (Inbox) de tipo API
-    // que creaste en Chatwoot.
-    const INBOX_ID_TELEGRAM = '83046'; // <-- CONFIRMA QUE ESTE ID ES CORRECTO
-
+    const INBOX_ID_TELEGRAM = '83046'; // <-- ID de tu bandeja
     const headers = {
         'Content-Type': 'application/json; charset=utf-8',
         'api_access_token': chatwootToken
     };
-
     let contact_id;
 
     try {
-        // --- Paso 1: Buscar o Crear Contacto en Chatwoot ---
-        
-        // ¡¡CORRECCIÓN 1: Buscar por EMAIL!!
-        // El parámetro 'q' de Chatwoot busca en 'name', 'email', 'phone_number'.
-        // NO busca en 'identifier'. Usaremos el email, que es único y requerido en tu flujo.
-        
+        // --- Paso 1: Buscar, Crear O ACTUALIZAR Contacto ---
         if (!cliente.email) {
-            console.error(`[CHATWOOT ERR] El cliente ${cliente.id} no tiene email. No se puede buscar o crear contacto.`);
-            return; // Salir de la función si no hay email
+            console.error(`[CHATWOOT ERR] El cliente ${cliente.id} no tiene email.`);
+            return;
         }
-
         const urlSearch = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/search?q=${encodeURIComponent(cliente.email)}`;
         let response = await fetch(urlSearch, { method: 'GET', headers });
         let data = await response.json();
         
         if (data.payload.length > 0) {
-            // ¡Encontrado! Asumimos que es el primero.
+            // --- Contacto Encontrado ---
             contact_id = data.payload[0].id;
+            const chatwootIdentifier = data.payload[0].identifier;
+            
             console.log(`[CHATWOOT] Contacto encontrado por email (${cliente.email}): ${contact_id}`);
-        
+
+            // --- ¡NUEVA LÓGICA DE ACTUALIZACIÓN! ---
+            // Comparamos el ID de Chatwoot con el ID de Supabase
+            if (chatwootIdentifier !== cliente.telegram_chat_id) {
+                console.warn(`[CHATWOOT SYNC] ¡Identifier desactualizado! Actualizando ${chatwootIdentifier} -> ${cliente.telegram_chat_id}`);
+                
+                const urlUpdateContact = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/${contact_id}`;
+                const updatePayload = {
+                    identifier: cliente.telegram_chat_id // Actualizamos el ID de Telegram
+                };
+                // Usamos PATCH para actualizar solo este campo
+                await fetch(urlUpdateContact, { 
+                    method: 'PATCH', 
+                    headers, 
+                    body: JSON.stringify(updatePayload) 
+                });
+            }
+            // --- FIN DE LÓGICA DE ACTUALIZACIÓN ---
+
         } else {
-            // --- Contacto NO encontrado, proceder a crear uno ---
-            console.log(`[CHATWOOT] Contacto no encontrado por email, creando uno nuevo...`);
+            // --- Contacto No Encontrado ---
+            console.log(`[CHATWOOT] Contacto no encontrado, creando uno nuevo...`);
             const urlCreateContact = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts`;
             const contactPayload = {
                 name: cliente.nombre,
-                email: cliente.email, // Ya sabemos que existe
+                email: cliente.email,
                 phone_number: cliente.telefono_whatsapp || undefined,
-                identifier: cliente.telegram_chat_id // Guardamos esto para referencia humana
+                identifier: cliente.telegram_chat_id // Guardamos el ID correcto
             };
             response = await fetch(urlCreateContact, { method: 'POST', headers, body: JSON.stringify(contactPayload) });
             data = await response.json();
-            
-            if (!response.ok) {
-               console.error(`[CHATWOOT ERR] Falla al CREAR contacto:`, data);
-               throw new Error("No se pudo crear el contacto en Chatwoot.");
-            }
-            
             contact_id = data.payload.contact.id;
             console.log(`[CHATWOOT] Contacto creado: ${contact_id}`);
         }
 
-        // --- ¡¡CORRECCIÓN 2: Buscar conversación activa!! ---
-        // En lugar de crear una conversación nueva CADA VEZ, buscamos una abierta.
-        
+        // --- Paso 2: Buscar Conversación (Lógica de Historial) ---
         const urlBuscarConversaciones = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/contacts/${contact_id}/conversations`;
         response = await fetch(urlBuscarConversaciones, { method: 'GET', headers });
         data = await response.json();
 
-        if (!response.ok) {
-             console.error(`[CHATWOOT ERR] Falla al BUSCAR conversaciones:`, data);
-             throw new Error("No se pudieron buscar conversaciones.");
-        }
+        if (!response.ok) throw new Error("No se pudieron buscar conversaciones.");
 
-        // Filtramos las conversaciones de este inbox que estén 'abiertas'
-        const conversacionesActivas = data.payload.filter(conv => 
+        let conversacion = data.payload.find(conv => 
             conv.inbox_id.toString() === INBOX_ID_TELEGRAM && conv.status === 'open'
         );
 
-        if (conversacionesActivas.length > 0) {
+        if (conversacion) {
             // --- Escenario A: Conversación ABIERTA encontrada ---
-            const conversation_id = conversacionesActivas[0].id; // Usamos la primera
-            console.log(`[CHATWOOT] Conversación abierta encontrada: ${conversation_id}. Añadiendo mensaje...`);
-
-            const urlAddMessage = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations/${conversation_id}/messages`;
-            const messagePayload = {
-                content: texto,
-                message_type: "incoming", // Lo registramos como "entrante"
-                private: false
-            };
+            console.log(`[CHATWOOT] Conversación abierta encontrada: ${conversacion.id}. Añadiendo mensaje...`);
+            const urlAddMessage = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations/${conversacion.id}/messages`;
+            const messagePayload = { content: texto, message_type: "incoming" };
+            await fetch(urlAddMessage, { method: 'POST', headers, body: JSON.stringify(messagePayload) });
+            console.log(`[CHATWOOT] Mensaje añadido a conversación ${conversacion.id}`);
             
-            response = await fetch(urlAddMessage, { method: 'POST', headers, body: JSON.stringify(messagePayload) });
-            data = await response.json();
-            
-            if (response.ok) {
-                console.log(`[CHATWOOT] Mensaje añadido a conversación ${conversation_id}`);
-            } else {
-                console.error(`[CHATWOOT ERR] Error al AÑADIR mensaje: ${data.message}`);
-            }
-
         } else {
-            // --- Escenario B: NO hay conversación abierta. CREAR UNA NUEVA ---
-            // (Esta es la lógica que tenías originalmente en tu "Paso 3")
-            console.log(`[CHATWOOT] No hay conversación abierta. Creando una nueva...`);
-            
-            const urlCreateConversation = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations`;
-            const conversationPayload = {
-                inbox_id: INBOX_ID_TELEGRAM,
-                contact_id: contact_id,
-                message: {
-                    content: texto,
-                    message_type: "incoming"
-                },
-                status: "open" // Abrir el ticket
-            };
+            conversacion = data.payload.find(conv => 
+                conv.inbox_id.toString() === INBOX_ID_TELEGRAM && conv.status === 'resolved'
+            );
 
-            response = await fetch(urlCreateConversation, { method: 'POST', headers, body: JSON.stringify(conversationPayload) });
-            data = await response.json();
+            if (conversacion) {
+                // --- Escenario B: Conversación RESUELTA encontrada ---
+                console.log(`[CHATWOOT] Conversación resuelta encontrada: ${conversacion.id}. Reabriendo y añadiendo mensaje...`);
+                const urlAddMessage = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations/${conversacion.id}/messages`;
+                const messagePayload = { content: texto, message_type: "incoming" };
+                await fetch(urlAddMessage, { method: 'POST', headers, body: JSON.stringify(messagePayload) });
+                
+                const urlToggleStatus = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations/${conversacion.id}/toggle_status`;
+                await fetch(urlToggleStatus, { 
+                    method: 'POST', 
+                    headers, 
+                    body: JSON.stringify({ status: 'open' })
+                });
+                console.log(`[CHATWOOT] Conversación ${conversacion.id} re-abierta.`);
 
-            if (response.ok) {
-                console.log(`[CHATWOOT] Conversación nueva creada: ${data.id}`);
             } else {
-                console.error(`[CHATWOOT ERR] Error al CREAR conversación: ${data.message}`);
+                // --- Escenario C: No hay historial. Crear una nueva ---
+                console.log(`[CHATWOOT] No hay conversación abierta o resuelta. Creando una nueva...`);
+                const urlCreateConversation = `${chatwootUrl}/api/v1/accounts/${chatwootAccountId}/conversations`;
+                const conversationPayload = {
+                    inbox_id: INBOX_ID_TELEGRAM,
+                    contact_id: contact_id,
+                    message: { content: texto, message_type: "incoming" },
+                    status: "open"
+                };
+                response = await fetch(urlCreateConversation, { method: 'POST', headers, body: JSON.stringify(conversationPayload) });
+                data = await response.json();
+                console.log(`[CHATWOOT] Conversación nueva creada: ${data.id}`);
             }
         }
-        
     } catch (error) {
         console.error(`[CHATWOOT ERR] Error fatal en la función: ${error.message}`);
     }
@@ -1304,8 +1641,8 @@ app.post('/api/registrar-cliente', async (req, res) => {
         cliente_id: nuevoClienteId.toString()
       },
       subscription_data: { trial_period_days: 30 },
-      success_url: `https://api.mrfrio.mx/bienvenido.html?email=${encodeURIComponent(email)}`,
-      cancel_url: `https://api.mrfrio.mx/registro.html?dispositivo=${device_id}&error=cancelado`,
+      success_url: `https://www.tesivil.com/bienvenido.html?email=${encodeURIComponent(email)}`,
+      cancel_url: `https://www.tesivil.com/registro.html?dispositivo=${device_id}&error=cancelado`,
     });
 
     // Paso 6: Vincular dispositivo con el cliente (estado 'pendiente_pago')
@@ -1323,21 +1660,45 @@ app.post('/api/registrar-cliente', async (req, res) => {
   }
 });
 
-// RUTA 4: LOGIN CON MAGIC LINK (MEJORADA Y CON LINK CLOAKING)
+// RUTA 4: LOGIN CON MAGIC LINK (CORREGIDA Y SEGURA)
 app.post('/api/login', async (req, res) => {
     const { email } = req.body;
-    const miPropiaUrlBase = 'https://api.mrfrio.mx'; // La URL base de tu API
+    const miPropiaUrlBase = 'https://www.tesivil.com'; // La URL base de tu API
     const supabaseUrlBase = process.env.SUPABASE_URL;
 
     try {
-        console.log(`[LOGIN] Solicitando magic link para: ${email}`);
-        
+        console.log(`[LOGIN] Solicitud de magic link para: ${email}`);
+
+        // --- ¡NUEVA VERIFICACIÓN! ---
+        // 1. Buscar si el cliente existe en tu tabla 'clientes'
+        // Usamos .select('id') porque solo necesitamos saber si existe, es más rápido.
+        const { data: cliente, error: clienteError } = await supabase
+            .from('clientes')
+            .select('id') 
+            .eq('email', email)
+            .single();
+
+        // 2. Si hay un error o el cliente NO se encuentra
+        if (clienteError || !cliente) {
+            console.warn(`[LOGIN] Intento de login para email no registrado: ${email}`);
+            
+            // --- NOTA DE SEGURIDAD IMPORTANTE ---
+            // NUNCA le decimos al usuario "El correo no existe".
+            // Eso permite a un atacante adivinar qué correos SÍ están registrados.
+            // Siempre damos una respuesta genérica, aunque no hagamos nada.
+            return res.status(200).json({ message: 'Si tu correo está registrado, recibirás un enlace en breve.' });
+        }
+        // --- FIN DE LA VERIFICACIÓN ---
+
+        // Si llegamos aquí, el email SÍ existe en nuestra DB.
+        console.log(`[LOGIN] Email ${email} verificado (Cliente ID: ${cliente.id}). Generando enlace...`);
+
         // Paso 1: Pedirle a Supabase (admin) que GENERE el enlace
         const { data, error: linkError } = await supabase.auth.admin.generateLink({
             type: 'magiclink',
             email: email,
             options: {
-                redirectTo: 'https://api.mrfrio.mx/mi-cuenta.html'
+                redirectTo: 'https://www.tesivil.com/mi-cuenta.html'
             }
         });
 
@@ -1353,11 +1714,11 @@ app.post('/api/login', async (req, res) => {
 
         // Paso 3: ENVIAR el correo nosotros mismos usando Resend
         const { error: resendError } = await resend.emails.send({
-            from: 'Mr. Frío <bienvenido@mrfrio.mx>',
+            from: 'Cuentatrón <bienvenido@tesivil.com>',
             to: [email],
-            subject: 'Inicia sesión en Mr. Frío',
+            subject: 'Inicia sesión en Cuentatrón',
             html: `<h1>Hola de nuevo!</h1>
-                    <p>Haz clic en el siguiente enlace para iniciar sesión en tu cuenta de Mr. Frío:</p>
+                    <p>Haz clic en el siguiente enlace para iniciar sesión en tu cuenta de Cuentatrón:</p>
                     <a href="${cloakedLink}" style="font-size: 16px; color: white; background-color: #007bff; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
                         Iniciar Sesión
                     </a>
@@ -1367,26 +1728,67 @@ app.post('/api/login', async (req, res) => {
 
         if (resendError) throw resendError;
 
-        res.status(200).json({ message: 'Enlace de inicio de sesión enviado a tu correo.' });
+        // Damos la misma respuesta genérica para que el atacante no sepa si tuvo éxito o no.
+        res.status(200).json({ message: 'Si tu correo está registrado, recibirás un enlace en breve.' });
 
     } catch (err) {
         console.error("Error en /api/login:", err.message);
-        res.status(500).json({ error: err.message });
+        // En caso de un error real del servidor, también damos una respuesta genérica
+        res.status(200).json({ message: 'Si tu correo está registrado, recibirás un enlace en breve.' });
     }
 });
 
 // --- 5. RUTAS SEGURAS (Requieren Login de Usuario) ---
+// server.js (línea 1113 aprox)
 app.get('/api/mi-cuenta', verificarUsuario, async (req, res) => {
+  // --- INICIO DE NUEVO CÓDIGO DE DIAGNÓSTICO ---
+  console.log('--- [DIAGNÓSTICO /api/mi-cuenta] ---');
+  console.log('1. Objeto req.user del middleware:', JSON.stringify(req.user, null, 2));
+  
   const userId = req.user.id;
+  console.log('2. userId extraído:', userId);
+  // --- FIN DE NUEVO CÓDIGO DE DIAGNÓSTICO ---
+
   try {
-    const { data: cliente, error: clienteError } = await supabase.from('clientes').select('*').eq('auth_user_id', userId).single();
+    const { data: cliente, error: clienteError } = await supabase
+      .from('clientes')
+      .select('*')
+      .eq('auth_user_id', userId)
+      .single();
+    
+    // --- MÁS DIAGNÓSTICO ---
+    console.log('3. Resultado de la consulta de cliente:', JSON.stringify(cliente, null, 2));
+    console.log('4. Error de la consulta de cliente:', clienteError ? clienteError.message : 'No hay error');
+    // --- FIN DE DIAGNÓSTICO ---
+
     if (clienteError) throw clienteError;
     
-    const { data: dispositivos, error: dispositivosError } = await supabase.from('dispositivos_lete').select(`device_id, estado, planes_lete ( nombre_plan, precio )`).eq('cliente_id', cliente.id);
+    // --- ¡NUEVA GUARDIA! ---
+    // Si el cliente es nulo, no podemos continuar.
+    if (!cliente) {
+        console.error('¡ERROR FATAL! No se encontró el cliente en la DB para el auth_user_id:', userId);
+        return res.status(404).json({ error: 'No se pudo encontrar el perfil de cliente asociado a esta cuenta.' });
+    }
+    // --- FIN DE GUARDIA ---
+
+    const { data: dispositivos, error: dispositivosError } = await supabase
+      .from('dispositivos_lete')
+      .select(`device_id, estado, planes_lete ( nombre_plan, precio )`)
+      .eq('cliente_id', cliente.id); // Si llegamos aquí, cliente.id SÍ existe
+    
     if (dispositivosError) throw dispositivosError;
     
+    console.log('5. ¡Éxito! Enviando datos al frontend.');
     res.status(200).json({ perfil: cliente, dispositivos: dispositivos });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  
+  } catch (err) { 
+    // --- MEJORA DEL CATCH ---
+    console.error('--- [ERROR EN CATCH /api/mi-cuenta] ---');
+    console.error('Error completo:', err);
+    console.error('Mensaje de error:', err.message);
+    // --- FIN DE MEJORA ---
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // RUTA 5: ACTUALIZAR PERFIL DE USUARIO
@@ -1537,7 +1939,7 @@ app.post('/api/admin/provision-device', async (req, res) => {
       throw new Error(`Error en DB al insertar: ${error.message}`);
     }
 
-    const registroUrl = `https://api.mrfrio.mx/registro.html?dispositivo=${device_id}`;
+    const registroUrl = `https://www.tesivil.com/registro.html?dispositivo=${device_id}`;
     const qrImageDataUrl = await QRCode.toDataURL(registroUrl);
 
     res.status(201).json({
@@ -1552,7 +1954,7 @@ app.post('/api/admin/provision-device', async (req, res) => {
 
 // --- 8. INICIAR EL SERVIDOR ---
 app.listen(port, () => {
-  console.log(`✅ Servidor "Mr. Frío" corriendo en el puerto ${port}`);
+  console.log(`✅ Servidor "TESIVIL" corriendo en el puerto ${port}`);
   if (!process.env.SUPABASE_URL) console.warn("AVISO: SUPABASE_URL no está definida.");
   if (!process.env.SUPABASE_SERVICE_KEY) console.warn("AVISO: SUPABASE_SERVICE_KEY no está definida.");
   if (!process.env.STRIPE_SECRET_KEY) console.warn("AVISO: STRIPE_SECRET_KEY no está definida.");
