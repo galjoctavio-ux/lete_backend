@@ -391,7 +391,7 @@ app.post('/api/chatwoot-webhook', async (req, res) => {
                 
                 // --- ¡NUEVA LÍNEA! Notificamos al usuario ---
                 await enviarMensajeTelegram(telegram_chat_id, 
-                    "✅ ¡Chat finalizado! Tu conversación con nuestro agente humano ha terminado. El asistente de IA (yo) vuelve a tomar el control.\n\nSi tienes otra duda o problema, solo escribe de nuevo."
+                    "✅ ¡Chat finalizado! Tu conversación con nuestro agente ha terminado. El asistente de IA (yo) vuelve a tomar el control.\n\nSi tienes otra duda o problema, solo escribe de nuevo."
                 );
             
             } else if (event.status === 'resolved') {
@@ -562,7 +562,10 @@ app.post('/api/telegram-webhook', async (req, res) => {
           fecha_inicio_servicio,        
           lectura_cierre_periodo_anterior, 
           lectura_medidor_inicial,  
-          tipo_tarifa,     
+          tipo_tarifa,
+          fecha_proximo_pago,
+          alerta_fuga_activa,
+          alerta_voltaje_estado,     
           dispositivos_lete ( device_id )
         `)
         .eq('telegram_chat_id', chat_id)
@@ -694,8 +697,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
             console.log(`[ASISTENTE] Intención detectada: ${intencion}`);
 
-            // --- ¡NUEVO! Router de Intenciones ---
-            // --- ¡NUEVO! Router de Intenciones (v3) ---
+            // --- ¡NUEVO! Router de Intenciones (v4 - Diagnósticos) ---
             switch (intencion) {
                 
                 // --- Caso 1: Soporte Humano ---
@@ -707,10 +709,41 @@ app.post('/api/telegram-webhook', async (req, res) => {
                       .from('clientes')
                       .update({ en_chat_humano_hasta: horaLimite })
                       .eq('id', cliente.id);
-                  await enviarMensajeTelegram(chat_id, "Entendido, tu mensaje requiere atención especial. Estoy transfiriendo tu chat a un agente humano, un momento por favor... 🧑‍💻");
+                  await enviarMensajeTelegram(chat_id, "Entendido, tu mensaje requiere atención especial. Estoy transfiriendo tu chat, un momento por favor... 🧑‍💻");
                   break;
 
-                // --- Casos 2-7: Llamar a las funciones de comandos ---
+                // --- Casos 2-8: NUEVAS Funciones de Diagnóstico ---
+                case 'pedir_proyeccion_pago':
+                  await handleProyeccionPago(chat_id, device_id, cliente);
+                  break;
+                case 'pedir_diagnostico_fuga_tierra':
+                  await handleDiagnosticoFugaTierra(chat_id, cliente);
+                  break;
+                case 'pedir_diagnostico_fantasma':
+                  await handleDiagnosticoFantasma(chat_id, device_id);
+                  break;
+                case 'pedir_diagnostico_voltaje':
+                  await handleDiagnosticoVoltaje(chat_id, device_id, cliente);
+                  break;
+                case 'pedir_hora_pico':
+                  await handleHoraPico(chat_id, device_id);
+                  break;
+                case 'pedir_fecha_corte_cfe':
+                  await handleFechaCorteCFE(chat_id, cliente);
+                  break;
+                case 'pedir_pago_cuentatron':
+                  await handlePagoCuentatron(chat_id, cliente);
+                  break;
+
+                // --- Caso 9: FAQ Empresa ---
+                case 'faq_servicios_empresa':
+                  console.log("[ASISTENTE] Detectó 'faq_servicios_empresa'. Generando respuesta...");
+                  await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠");
+                  const respuestaFAQ = await handleFAQServicios(textoRecibido); 
+                  await enviarMensajeTelegram(chat_id, respuestaFAQ);
+                  break;
+
+                // --- Casos 10-15: Comandos de Datos (los que ya teníamos) ---
                 case 'pedir_consumo_hoy':
                   await handleConsumoHoy(chat_id, device_id, cliente);
                   break;
@@ -730,27 +763,24 @@ app.post('/api/telegram-webhook', async (req, res) => {
                   await handleGraficaSemanal(chat_id, device_id);
                   break;
 
-                // --- ¡NUEVO CASO! Caso 8: FAQ Genérica ---
-                case 'pregunta_faq':
-                  console.log("[ASISTENTE] Detectó 'pregunta_faq'. Generando respuesta...");
-                  // (Opcional) Enviamos un mensaje de "pensando..."
-                  await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠"); 
-                  // Llamamos a la nueva función generadora
-                  const respuestaFAQ = await generarRespuestaFAQ(textoRecibido); 
-                  await enviarMensajeTelegram(chat_id, respuestaFAQ);
-                  break;
-
-                // --- Caso 9: Desconocido ---
+                // --- Caso 16: Desconocido ---
                 case 'desconocido':
                 default:
                   console.log(`[ASISTENTE] Gemini detectó 'desconocido'. Respondiendo con menú.`);
                   await enviarMensajeTelegram(chat_id, 
-                    "No entendí muy bien. Puedes pedirme cosas como:\n\n" +
-                    "- _'¿cuánto gasté ayer?'_\n" +
-                    "- _'dame la gráfica de la semana'_\n" +
-                    "- _'¿cómo está el voltaje?'_\n" +
-                    "- _'¿cómo puedo ahorrar energía?'_\n" + // (Gemini ahora entenderá esto)
-                    "\nSi tienes un problema, solo escríbelo y te ayudaré."
+                    "¡Hola, soy tu asistente de energía! Puedes pedirme cosas como:\n\n" +
+                    "📊 *Diagnósticos y Proyecciones*\n" +
+                    "- _'¿Cuánto voy a pagar de luz?'_\n" +
+                    "- _'¿Mi voltaje es normal?'_\n" +
+                    "- _'¿Tengo una fuga de corriente?'_\n" +
+                    "- _'¿Tengo consumo fantasma?'_\n" +
+                    "- _'¿A qué hora del día gasto más?'_\n\n" +
+                    "🗓️ *Fechas y Datos Rápidos*\n" +
+                    "- _'¿Cuánto gasté ayer?'_\n" +
+                    "- _'Muéstrame la gráfica semanal.'_\n" +
+                    "- _'¿Cuándo es mi corte de CFE?'_\n" +
+                    "- _'¿Cuándo pago mi suscripción?'_\n\n" +
+                    "Si tienes un problema o una pregunta diferente (como '¿qué es un volt?' o '¿ustedes instalan focos?'), solo escríbelo y te ayudaré."
                   );
                   break;
             }
@@ -1109,6 +1139,222 @@ async function handleGraficaSemanal(chat_id, device_id) {
   }
 }
 
+// --- ¡NUEVO BLOQUE! FUNCIONES DE DIAGNÓSTICO Y CUENTA ---
+
+async function handleProyeccionPago(chat_id, device_id, cliente) {
+    await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠");
+    try {
+        // 1. Obtener consumo acumulado (ya lo tenemos)
+        const { kwh_periodo_actual, error_periodo } = await getConsumoAcumuladoPeriodo(cliente, device_id);
+        if (error_periodo) throw new Error(error_periodo);
+
+        // 2. Calcular fechas y días
+        const zonaHoraria = 'America/Mexico_City';
+        const hoy_date_obj = new Date(new Date().toLocaleString('en-US', { timeZone: zonaHoraria }));
+        const hoy_aware = {
+            date: new Date(hoy_date_obj.getFullYear(), hoy_date_obj.getMonth(), hoy_date_obj.getDate())
+        };
+        const { ultima_fecha_de_corte, proxima_fecha_de_corte } = calcularFechasCorteJS(hoy_aware, cliente.dia_de_corte, cliente.ciclo_bimestral);
+        
+        if (!ultima_fecha_de_corte || !proxima_fecha_de_corte) throw new Error("No se pudieron calcular las fechas del ciclo.");
+
+        const dias_transcurridos = Math.max(1, (hoy_aware.date - ultima_fecha_de_corte) / (1000 * 60 * 60 * 24));
+        const dias_totales_del_ciclo = (proxima_fecha_de_corte - ultima_fecha_de_corte) / (1000 * 60 * 60 * 24);
+
+        // 3. Calcular proyección
+        const promedio_diario_real = kwh_periodo_actual / dias_transcurridos;
+        const proyeccion_kwh = promedio_diario_real * dias_totales_del_ciclo;
+        const costo_proyectado = calcularCostoEstimadoJS(proyeccion_kwh, cliente.tipo_tarifa);
+
+        // 4. Formatear respuesta
+        let mensaje = `¡Hola ${cliente.nombre}! Basado en tu consumo hasta hoy, aquí tienes tu proyección para este bimestre:\n\n` +
+                      `Llevas *${kwh_periodo_actual.toFixed(2)} kWh* consumidos en ${dias_transcurridos.toFixed(0)} días.\n` +
+                      `Tu promedio es de *${promedio_diario_real.toFixed(2)} kWh* por día.\n\n` +
+                      `Si continúas a este ritmo, tu proyección de pago de CFE será de aprox.:\n` +
+                      `**$${costo_proyectado.toFixed(2)} MXN** (IVA incluido).`;
+        
+        await enviarMensajeTelegram(chat_id, mensaje);
+
+    } catch (err) {
+        console.error(`[ERR Proyección Pago] ${err.message}`);
+        await enviarMensajeTelegram(chat_id, "Tuve problemas para calcular tu proyección. Intenta más tarde.");
+    }
+}
+
+async function handleDiagnosticoFugaTierra(chat_id, cliente) {
+    await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠");
+    // Lógica simple: solo leemos la bandera que actualiza el script de Python
+    if (cliente.alerta_fuga_activa === true) {
+        await enviarMensajeTelegram(chat_id, "⚠️ **¡Alerta!** Mi sistema de vigilancia (que corre cada hora) **sí ha detectado una fuga de corriente a tierra** en tu instalación.\n\nEsto es un riesgo de seguridad y puede aumentar tu recibo. Te recomendamos contactar a un electricista certificado lo antes posible.");
+    } else {
+        await enviarMensajeTelegram(chat_id, "✅ **¡Buenas noticias!** Mi sistema de vigilancia **no detecta una fuga a tierra** activa en este momento.\n\n¿Te gustaría que revise si tienes 'consumo fantasma' (aparatos gastando sin uso)?");
+    }
+}
+
+async function handleDiagnosticoFantasma(chat_id, device_id) {
+    await enviarMensajeTelegram(chat_id, "Consultando al experto.... 🧠");
+    // Query a Influx por el consumo base de las últimas 3 madrugadas (3-5 AM)
+    const fluxQueryFantasma = `
+        import "date" // <-- 1. Importar el paquete
+
+        from(bucket: "${influxBucket}")
+          |> range(start: -3d)
+          |> filter(fn: (r) => r._measurement == "energia" and r._field == "power" and r.device_id == "${device_id}")
+          // --- 2. USAR EL PAQUETE ---
+          |> filter(fn: (r) => date.hour(t: r._time) >= 3 and date.hour(t: r._time) < 5) 
+          |> mean()
+    `;
+    try {
+        let consumoBase = 0.0;
+        for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryFantasma)) {
+            const o = tableMeta.toObject(values);
+            consumoBase = o._value || 0.0;
+        }
+
+        let mensaje = `Analicé tu consumo de las últimas madrugadas (3-5 AM) para buscar "consumo fantasma":\n\n` +
+                      `Tu consumo base constante es de **${consumoBase.toFixed(1)} Watts**.\n\n`;
+
+        if (consumoBase <= 50) {
+            mensaje += "¡Felicidades! Ese es un consumo base muy bajo, probablemente solo tu refrigerador y módems.";
+        } else if (consumoBase <= 150) {
+            mensaje += "Esto es normal si incluye tu refri, módems y algún decodificador de TV. Si te parece alto, prueba desconectando cargadores o TVs que no estés usando.";
+        } else {
+            mensaje += "¡Es un consumo base algo alto! Es muy probable que tengas aparatos " +
+                       "como computadoras, consolas o TVs en 'standby' gastando energía sin necesidad. ¡Desconéctalos por la noche y ahorra!";
+        }
+        await enviarMensajeTelegram(chat_id, mensaje);
+    } catch (err) {
+        console.error(`[ERR Fantasma] ${err.message}`);
+        await enviarMensajeTelegram(chat_id, "Tuve problemas para calcular tu consumo fantasma. Intenta más tarde.");
+    }
+}
+
+async function handleDiagnosticoVoltaje(chat_id, device_id, cliente) {
+    await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠");
+    
+    // Lógica simple: leemos el estado que actualiza el script de Python
+    const estado = cliente.alerta_voltaje_estado;
+
+    if (estado === 'alto') {
+        await enviarMensajeTelegram(chat_id, "⚡ **¡Cuidado!** Mi sistema de vigilancia (que corre cada hora) ha detectado **picos de voltaje ALTO** (arriba de 132V) recientemente en tu instalación.\n\nEsto puede dañar electrónicos sensibles. Te recomendamos usar reguladores.");
+    } else if (estado === 'bajo') {
+        await enviarMensajeTelegram(chat_id, "📉 **¡Atención!** Mi sistema de vigilancia ha detectado **caídas de voltaje BAJO** (debajo de 108V) recientemente.\n\nEl voltaje bajo puede forzar y dañar motores (refrigerador, bombas). Sería bueno que un electricista revise.");
+    } else {
+        // Si el estado es 'normal', le damos el dato en tiempo real
+        await enviarMensajeTelegram(chat_id, "Revisé el estado de tu voltaje y mi sistema de vigilancia reporta que está **normal y estable**.");
+        // Opcional: Llamar a la función que ya teníamos
+        await handleVoltaje(chat_id, device_id);
+    }
+}
+
+async function handleHoraPico(chat_id, device_id) {
+    await enviarMensajeTelegram(chat_id, "Consultando al experto... 🧠");
+    
+    // --- ¡QUERY CORREGIDA! ---
+    // Esta query agrupa todas las "1 AMs", "2 AMs", etc. de los últimos 7 días,
+    // calcula el PROMEDIO de cada hora, y luego ordena para encontrar la más alta.
+    const fluxQueryPico = `
+        import "date"
+        
+        from(bucket: "${influxBucket}")
+          |> range(start: -7d)
+          |> filter(fn: (r) => r._measurement == "energia" and r._field == "power" and r.device_id == "${device_id}")
+          // 1. Añadimos una columna "hour" (0-23) a cada registro
+          |> map(fn: (r) => ({ r with hour: date.hour(t: r._time) }))
+          // 2. Agrupamos todos los registros por esa "hour"
+          |> group(columns: ["hour"])
+          // 3. Calculamos el promedio de 'power' para cada grupo de hora
+          |> mean(column: "_value")
+          // 4. Ordenamos de mayor a menor consumo
+          |> sort(columns: ["_value"], desc: true)
+          // 5. Tomamos solo el #1
+          |> limit(n: 1)
+    `;
+    
+    try {
+        console.log(`[INFLUX HORA PICO] Ejecutando query: ${fluxQueryPico.replace(/\s+/g, ' ')}`);
+        let horaPico = null; // Será un número de 0-23
+        let valorPico = 0.0; // Será el promedio en Watts
+
+        // El loop solo correrá una vez gracias a limit(n: 1)
+        for await (const { values, tableMeta } of queryApi.iterateRows(fluxQueryPico)) {
+            const o = tableMeta.toObject(values);
+            horaPico = o.hour; // <-- Leemos la columna 'hour'
+            valorPico = o._value;
+        }
+        
+        if (horaPico !== null) {
+            // --- Formateamos la hora (ej. 17 -> "5 PM" y 18 -> "6 PM") ---
+            const horaSiguiente = (horaPico + 1) % 24;
+            
+            // Creamos un objeto de fecha falso solo para usar el formateador
+            const fechaHoraPico = new Date(2000, 0, 1, horaPico);
+            const fechaHoraSiguiente = new Date(2000, 0, 1, horaSiguiente);
+
+            const horaFormateada = fechaHoraPico.toLocaleTimeString('es-MX', {
+                hour: 'numeric', hour12: true, timeZone: 'America/Mexico_City'
+            });
+            const horaSiguienteFormateada = fechaHoraSiguiente.toLocaleTimeString('es-MX', {
+                hour: 'numeric', hour12: true, timeZone: 'America/Mexico_City'
+            });
+
+            await enviarMensajeTelegram(chat_id, `Analizando tu última semana, tu "hora pico" de consumo (la hora en que *en promedio* gastas más) es entre las **${horaFormateada} y las ${horaSiguienteFormateada}**, con un consumo promedio de **${valorPico.toFixed(0)} Watts**.`);
+        } else {
+            await enviarMensajeTelegram(chat_id, "No tengo suficientes datos de la semana para encontrar tu 'hora pico'.");
+        }
+    } catch (err) {
+        console.error(`[ERR Hora Pico] ${err.message}`);
+        await enviarMensajeTelegram(chat_id, "Tuve problemas para calcular tu hora pico. Intenta más tarde.");
+    }
+}
+
+async function handleFechaCorteCFE(chat_id, cliente) {
+    const zonaHoraria = 'America/Mexico_City';
+    const hoy_date_obj = new Date(new Date().toLocaleString('en-US', { timeZone: zonaHoraria }));
+    const hoy_aware = {
+        date: new Date(hoy_date_obj.getFullYear(), hoy_date_obj.getMonth(), hoy_date_obj.getDate())
+    };
+    const { proxima_fecha_de_corte } = calcularFechasCorteJS(hoy_aware, cliente.dia_de_corte, cliente.ciclo_bimestral);
+    
+    if (proxima_fecha_de_corte) {
+        const fechaFormateada = proxima_fecha_de_corte.toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
+        await enviarMensajeTelegram(chat_id, `🗓️ Según tu configuración, tu próxima fecha de corte de CFE es el **${fechaFormateada}**.`);
+    } else {
+        await enviarMensajeTelegram(chat_id, "No pude determinar tu próxima fecha de corte. Verifica tu configuración en el panel web.");
+    }
+}
+
+async function handlePagoCuentatron(chat_id, cliente) {
+    if (cliente.fecha_proximo_pago) {
+        const fechaFormateada = new Date(cliente.fecha_proximo_pago).toLocaleDateString('es-MX', { day: 'numeric', month: 'long', year: 'numeric' });
+        await enviarMensajeTelegram(chat_id, `💳 Tu suscripción a Cuentatrón se renueva el **${fechaFormateada}**.`);
+    } else {
+        await enviarMensajeTelegram(chat_id, "No encontré una fecha de renovación para tu suscripción. Contacta a soporte.");
+    }
+}
+
+async function handleFAQServicios(textoUsuario) {
+    // Usamos la función que ya teníamos, pero con un contexto específico
+    if (!geminiApiKey) return "Lo siento, mi módulo de IA no está disponible.";
+    
+    console.log(`[GEMINI FAQ Empresa] Generando respuesta para: "${textoUsuario}"`);
+    try {
+        const prompt = `
+            Eres un asistente de Cuentatrón, experto en monitoreo de energía.
+            Tu trabajo NO es vender, sino aclarar qué servicios ofreces.
+            Tu servicio es monitorear, NO reparar ni instalar.
+            Responde la siguiente pregunta del usuario de forma amigable, breve, y dejando claro que Cuentatrón solo monitorea.
+            
+            Pregunta: "${textoUsuario}"
+        `;
+        const result = await geminiModel.generateContent(prompt);
+        const response = await result.response;
+        return response.text();
+    } catch (error) {
+        console.error(`[GEMINI ERR] Error al GENERAR respuesta de servicios: ${error.message}`);
+        return "Tuve un problema al procesar tu pregunta.";
+    }
+}
 // ... (después de handleGraficaSemanal)
 
 async function generarRespuestaFAQ(textoUsuario) {
@@ -1265,10 +1511,9 @@ async function getConsumoAcumuladoPeriodo(cliente, device_id) {
 }
 
 
-// --- FUNCIÓN DE AYUDA: LLAMAR A GEMINI (v3 - Con FAQ Genérica) ---
+// --- FUNCIÓN DE AYUDA: LLAMAR A GEMINI (v4 - Con Diagnósticos) ---
 async function llamarAGemini(textoUsuario) {
-    if (!geminiApiKey) return { intencion: 'desconocido' }; // Guardián
-
+    if (!geminiApiKey) return { intencion: 'desconocido' };
     try {
         const prompt = `
           Eres un asistente de IA para "Cuentatrón", un servicio de monitoreo de energía.
@@ -1278,40 +1523,62 @@ async function llamarAGemini(textoUsuario) {
           --- CATEGORÍAS DE INTENCIÓN ---
 
           1. "soporte_humano":
-             - El usuario está frustrado, enojado o confundido, quiere cancelar, o pide un humano.
+             - El usuario está frustrado, enojado, confundido, quiere cancelar, o pide un humano.
              - Ejemplos: "Esto no sirve", "Quiero cancelar", "ayuda por favor", "mi dispositivo está en rojo"
 
-          2. "pedir_consumo_hoy":
-             - El usuario quiere saber su consumo del día actual.
-             - Ejemplos: "¿Cuánto he gastado hoy?", "consumo de hoy"
+          2. "pedir_proyeccion_pago":
+             - El usuario quiere saber cuánto va a pagar de luz en su recibo.
+             - Ejemplos: "¿Cuánto voy a pagar de luz?", "¿De cuánto va a llegar mi recibo?", "dame mi proyección de pago"
 
-          3. "pedir_consumo_ayer":
-             - El usuario quiere saber su consumo del día anterior.
-             - Ejemplos: "¿Cuánto consumí ayer?", "reporte de ayer"
+          3. "pedir_diagnostico_fuga_tierra":
+             - El usuario pregunta si tiene una fuga de corriente o fuga a tierra.
+             - Ejemplos: "¿Tengo una fuga?", "¿Por qué me llegó una alerta de fuga?", "revisa si tengo fugas"
 
-          4. "pedir_voltaje":
-             - El usuario pregunta por el voltaje actual.
-             - Ejemplos: "¿Cómo está el voltaje?", "dame el voltaje"
+          4. "pedir_diagnostico_fantasma":
+             - El usuario pregunta por consumo "vampiro" o "fantasma", o consumo base.
+             - Ejemplos: "¿Tengo consumo fantasma?", "¿Cuánto gasto en la madrugada?"
 
-          5. "pedir_watts":
-             - El usuario pregunta por la potencia (consumo instantáneo) actual.
-             - Ejemplos: "¿Cuántos watts estoy gastando?", "potencia actual"
+          5. "pedir_diagnostico_voltaje":
+             - El usuario pregunta si su voltaje es normal, alto o bajo.
+             - Ejemplos: "¿Mi voltaje está bien?", "¿Es normal el voltaje?", "revisa mi voltaje"
+          
+          6. "pedir_hora_pico":
+             - El usuario pregunta a qué hora del día consume más energía.
+             - Ejemplos: "¿A qué hora gasto más luz?", "dame mi hora pico"
 
-          6. "pedir_grafica_ayer":
-             - El usuario pide una gráfica del día anterior.
-             - Ejemplos: "muéstrame la gráfica de ayer", "quiero ver la gráfica"
+          7. "pedir_fecha_corte_cfe":
+             - El usuario pregunta por su fecha de corte de CFE.
+             - Ejemplos: "¿Cuándo es mi corte de CFE?", "¿Cuándo pago la luz?"
 
-          7. "pedir_grafica_semanal":
-             - El usuario pide una gráfica de la semana.
-             - Ejemplos: "muéstrame la gráfica de la semana", "consumo semanal"
+          8. "pedir_pago_cuentatron":
+             - El usuario pregunta por su pago del servicio Cuentatrón.
+             - Ejemplos: "¿Cuándo pago Cuentatrón?", "fecha de pago de mi suscripción"
 
-          8. "pregunta_faq":
-             - El usuario tiene una duda de conocimiento general sobre electricidad, tarifas o el servicio.
-             - Ejemplos: "¿qué es un kilowatt hora?", "¿cómo puedo ahorrar energía?", "¿qué es un voltio?", "¿qué mide el aparato?"
+          9. "faq_servicios_empresa":
+             - El usuario pregunta por servicios que no ofreces (instalaciones, reparaciones).
+             - Ejemplos: "¿Ustedes pueden cambiar mi foco?", "¿Reparan refrigeradores?"
 
-          9. "desconocido":
-              - El usuario solo saluda, da las gracias, o dice algo no relacionado.
-              - Ejemplos: "hola", "gracias", "ok", "buenos días"
+          10. "pedir_consumo_hoy":
+              - Ejemplos: "¿Cuánto he gastado hoy?", "consumo de hoy"
+
+          11. "pedir_consumo_ayer":
+              - Ejemplos: "¿Cuánto consumí ayer?", "reporte de ayer"
+          
+          12. "pedir_voltaje":
+              - Ejemplos: "¿Cómo está el voltaje?", "dame el voltaje"
+          
+          13. "pedir_watts":
+              - Ejemplos: "¿Cuántos watts estoy gastando?", "potencia actual"
+          
+          14. "pedir_grafica_ayer":
+              - Ejemplos: "muéstrame la gráfica de ayer", "quiero ver la gráfica"
+          
+          15. "pedir_grafica_semanal":
+              - Ejemplos: "muéstrame la gráfica de la semana", "consumo semanal"
+
+          16. "desconocido":
+              - Saludos, gracias, o algo no relacionado.
+              - Ejemplos: "hola", "gracias", "ok"
 
           ---
           Mensaje del usuario a clasificar:
@@ -1321,15 +1588,13 @@ async function llamarAGemini(textoUsuario) {
         const result = await geminiModel.generateContent(prompt);
         const response = await result.response;
         const text = response.text();
-        
         const jsonText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        console.log(`[GEMINI v3] Respuesta cruda: ${text}. JSON Limpio: ${jsonText}`);
-        
+        console.log(`[GEMINI v4] Respuesta cruda: ${text}. JSON Limpio: ${jsonText}`);
         return JSON.parse(jsonText);
 
     } catch (error) {
         console.error(`[GEMINI ERR] Error al llamar a la API: ${error.message}`);
-        return { intencion: 'desconocido' }; // Fallback
+        return { intencion: 'desconocido' };
     }
 }
 
