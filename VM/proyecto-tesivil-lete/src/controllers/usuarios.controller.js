@@ -1,24 +1,37 @@
-import { supabaseAdmin } from '../services/supabaseClient.js';
+
+import { supabaseAdmin, supabaseKey } from '../services/supabaseClient.js'; // ¡Asegúrate que importe 'supabaseKey'!
 
 // GET /usuarios/tecnicos
 export const getTecnicos = async (req, res) => {
   try {
+    console.log('Obteniendo lista de técnicos...');
+
     // 1. Obtenemos SÓLO id y nombre de los perfiles de técnicos
     const { data: profilesData, error: profilesError } = await supabaseAdmin
       .from('profiles')
-      .select('id, nombre') // <-- CORREGIDO: quitamos 'email'
+      .select('id, nombre')
       .eq('rol', 'tecnico');
 
-    if (profilesError) throw profilesError;
+    if (profilesError) {
+      console.error('Error al obtener perfiles:', profilesError.message);
+      throw profilesError;
+    }
 
-    // 2. Obtenemos la lista de TODOS los usuarios desde Auth
-    const { data: usersData, error: usersError } = await supabaseAdmin.auth.admin.listUsers();
-    if (usersError) throw usersError;
+    console.log(`Perfiles encontrados: ${profilesData.length}`);
+
+    // 2. Obtenemos la lista de usuarios desde Auth usando el método correcto
+    const { data: usersResponse, error: usersError } = await supabaseAdmin.auth.admin.listUsers();
+    
+    if (usersError) {
+      console.error('Error al listar usuarios:', usersError.message);
+      throw usersError;
+    }
+
+    console.log(`Usuarios en Auth: ${usersResponse.users.length}`);
 
     // 3. Combinamos las listas en el backend
-    // Mapeamos los perfiles de técnicos con sus emails correspondientes
     const tecnicos = profilesData.map(profile => {
-      const authUser = usersData.users.find(u => u.id === profile.id);
+      const authUser = usersResponse.users.find(u => u.id === profile.id);
       return {
         id: profile.id,
         nombre: profile.nombre,
@@ -26,10 +39,15 @@ export const getTecnicos = async (req, res) => {
       };
     });
 
+    console.log(`Técnicos procesados: ${tecnicos.length}`);
     res.status(200).json(tecnicos);
 
   } catch (error) {
-    res.status(500).json({ error: 'Error al obtener técnicos', details: error.message });
+    console.error('Error completo:', error);
+    res.status(500).json({ 
+      error: 'Error al obtener técnicos', 
+      details: error.message 
+    });
   }
 };
 
@@ -42,27 +60,43 @@ export const createTecnico = async (req, res) => {
   }
 
   try {
+    console.log('Creando nuevo técnico:', email);
+
     // 1. Crear el usuario en Supabase Auth
     const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
       email: email,
       password: password,
-      email_confirm: true, // Puedes ponerlo en 'false' si no quieres que confirmen
+      email_confirm: true,
     });
 
-    if (authError) throw authError;
+    if (authError) {
+      console.error('Error al crear usuario en Auth:', authError.message);
+      throw authError;
+    }
+
+supabaseAdmin.global.headers['Authorization'] = `Bearer ${supabaseKey}`;
+
+    console.log('Usuario creado en Auth:', authData.user.id);
 
     // 2. Crear el perfil en nuestra tabla 'profiles'
     const { data: profileData, error: profileError } = await supabaseAdmin
       .from('profiles')
       .insert({
-        id: authData.user.id, // Vinculamos con el ID de Auth
+        id: authData.user.id,
         nombre: nombre,
         rol: 'tecnico'
       })
       .select()
       .single();
 
-    if (profileError) throw profileError;
+    if (profileError) {
+      console.error('Error al crear perfil:', profileError.message);
+      // Si falla el perfil, intentamos eliminar el usuario de Auth
+      await supabaseAdmin.auth.admin.deleteUser(authData.user.id);
+      throw profileError;
+    }
+
+    console.log('Perfil creado exitosamente');
 
     res.status(201).json({
       message: 'Técnico creado exitosamente',
@@ -75,10 +109,16 @@ export const createTecnico = async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Error completo al crear técnico:', error);
+    
     // Manejo de error (ej. email ya existe)
-    if (error.code === '23505') { // Error de violación de unicidad
-       return res.status(409).json({ error: 'El email ya está en uso' });
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'El email ya está en uso' });
     }
-    res.status(500).json({ error: 'Error al crear técnico', details: error.message });
+    
+    res.status(500).json({ 
+      error: 'Error al crear técnico', 
+      details: error.message 
+    });
   }
 };
