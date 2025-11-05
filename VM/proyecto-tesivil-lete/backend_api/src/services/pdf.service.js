@@ -109,7 +109,7 @@ export const generarPDF = async (datos) => {
   const page = await browser.newPage();
 
   // Cargamos nuestro HTML
-  await page.setContent(html, { waitUntil: 'networkidle0' });
+  await page.setContent(html, { waitUntil: 'domcontentloaded' });
 
   // "Imprimimos" a PDF
   const pdfBuffer = await page.pdf({

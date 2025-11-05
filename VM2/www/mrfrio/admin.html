@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Aprovisionar Dispositivo</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        /* Estilo para ocultar campos de calibración por defecto */
+        .calibracion-current {
+            display: none;
+        }
+        small {
+            margin-top: -0.75rem;
+            margin-bottom: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Aprovisionar Nuevo Dispositivo</h1>
+            <p>Rellena los datos para añadir un nuevo dispositivo al inventario.</p>
+            <form id="form-provision" novalidate>
+                
+                <label for="device_id">Device ID (MAC Address)</label>
+                <input type="text" id="device_id" name="device_id" required title="Formato MAC: XX:XX:XX:XX:XX:XX o XXXXXXXXXXXX">
+                <small id="mac-error" style="color:red; display:none;">Formato MAC inválido (ej: 1A:2B:3C:4D:5E:6F)</small>
+
+                <label for="plan_id">Plan Asignado</label>
+                <select id="plan_id" name="plan_id" required>
+                    <option value="">Cargando planes...</option>
+                </select>
+
+                <hr>
+                <h3>Datos de Calibración</h3>
+                <label for="voltage_cal">Voltage CAL</label>
+                <input type="number" step="any" id="voltage_cal" name="voltage_cal" required>
+
+                <div id="campos-corriente">
+                    <div id="cal-current-1" class="calibracion-current"><label for="current_cal_1">Current CAL 1</label><input type="number" step="any" id="current_cal_1" name="current_cal_1"></div>
+                    <div id="cal-current-2" class="calibracion-current"><label for="current_cal_2">Current CAL 2</label><input type="number" step="any" id="current_cal_2" name="current_cal_2"></div>
+                    <div id="cal-current-3" class="calibracion-current"><label for="current_cal_3">Current CAL 3</label><input type="number" step="any" id="current_cal_3" name="current_cal_3"></div>
+                    <div id="cal-current-4" class="calibracion-current"><label for="current_cal_4">Current CAL 4</label><input type="number" step="any" id="current_cal_4" name="current_cal_4"></div>
+                    <div id="cal-current-5" class="calibracion-current"><label for="current_cal_5">Current CAL 5</label><input type="number" step="any" id="current_cal_5" name="current_cal_5"></div>
+                    <div id="cal-current-6" class="calibracion-current"><label for="current_cal_6">Current CAL 6</label><input type="number" step="any" id="current_cal_6" name="current_cal_6"></div>
+                    <div id="cal-current-7" class="calibracion-current"><label for="current_cal_7">Current CAL 7</label><input type="number" step="any" id="current_cal_7" name="current_cal_7"></div>
+                </div>
+
+                <label for="power_cal">Power CAL</label>
+                <input type="number" step="any" id="power_cal" name="power_cal" required>
+                <hr>
+
+                <label for="secret_key">Llave Secreta de Admin</label>
+                <input type="password" id="secret_key" name="secret_key" required>
+
+                <button type="submit" id="btn-submit">Añadir y Descargar QR</button>
+            </form>
+            <div id="mensaje-admin" class="mensaje"></div>
+        </div>
+    </div>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', async () => {
+        const planSelect = document.getElementById('plan_id');
+        const formProvision = document.getElementById('form-provision');
+        const mensajeAdmin = document.getElementById('mensaje-admin');
+        const btnSubmit = document.getElementById('btn-submit');
+        const deviceIdInput = document.getElementById('device_id');
+        const macError = document.getElementById('mac-error');
+        
+        let listaPlanes = [];
+
+        // 1. Cargar los planes desde el backend
+        try {
+            const response = await fetch('/api/admin/get-plans');
+            listaPlanes = await response.json();
+            if (!response.ok) throw new Error('No se pudieron cargar los planes.');
+
+            planSelect.innerHTML = '<option value="">-- Selecciona un plan --</option>'; 
+            listaPlanes.forEach(plan => {
+                const option = document.createElement('option');
+                option.value = plan.id;
+                option.setAttribute('data-nombre', plan.nombre_plan.toLowerCase()); 
+                option.textContent = `${plan.nombre_plan} ($${plan.precio} MXN)`;
+                planSelect.appendChild(option);
+            });
+        } catch (error) {
+            planSelect.innerHTML = `<option value="">Error al cargar planes</option>`;
+            console.error(error);
+        }
+
+        // 2. Lógica para mostrar/ocultar campos de calibración
+        planSelect.addEventListener('change', () => {
+            const selectedOption = planSelect.options[planSelect.selectedIndex];
+            const nombrePlan = selectedOption.getAttribute('data-nombre') || '';
+            
+            // Ocultar todos y quitar 'required'
+            document.querySelectorAll('.calibracion-current').forEach(div => {
+                div.style.display = 'none';
+                div.querySelector('input').removeAttribute('required');
+            });
+
+            let camposAMostrar = 0;
+            if (nombrePlan.includes('monofásico')) camposAMostrar = 2;
+            else if (nombrePlan.includes('bifásico') && !nombrePlan.includes('paneles')) camposAMostrar = 3;
+            else if (nombrePlan.includes('bifásico') && nombrePlan.includes('paneles')) camposAMostrar = 5;
+            else if (nombrePlan.includes('trifásico') && !nombrePlan.includes('paneles')) camposAMostrar = 4;
+            else if (nombrePlan.includes('trifásico') && nombrePlan.includes('paneles')) camposAMostrar = 7;
+            
+            // Mostrar los necesarios y añadir 'required'
+            for (let i = 1; i <= camposAMostrar; i++) {
+                const divCampo = document.getElementById(`cal-current-${i}`);
+                if (divCampo) {
+                    divCampo.style.display = 'block';
+                    divCampo.querySelector('input').setAttribute('required', '');
+                }
+            }
+        });
+        
+        // 3. Validación de formato MAC
+        const validarMAC = () => {
+            const macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{12})$/;
+            const esValido = macRegex.test(deviceIdInput.value);
+            macError.style.display = esValido || deviceIdInput.value === '' ? 'none' : 'block';
+            return esValido;
+        };
+        deviceIdInput.addEventListener('input', validarMAC);
+
+        // 4. Manejar el envío del formulario
+        formProvision.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!validarMAC()) return;
+
+            btnSubmit.disabled = true;
+            btnSubmit.textContent = 'Procesando...';
+            mensajeAdmin.style.display = 'none';
+
+            const formData = new FormData(formProvision);
+            const data = Object.fromEntries(formData.entries());
+            data.data_server_url = 'http://34.53.115.235:8000/datos';
+
+            try {
+                const response = await fetch('/api/admin/provision-device', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Ocurrió un error.');
+
+                // Lógica de descarga del QR
+                if (result.qrCodeDataUrl) {
+                    const link = document.createElement('a');
+                    link.href = result.qrCodeDataUrl;
+                    link.download = `QR_${result.dispositivo.device_id}.png`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    
+                    mensajeAdmin.textContent = `✅ ¡Éxito! Dispositivo ${result.dispositivo.device_id} añadido. El QR se ha descargado.`;
+                } else {
+                    mensajeAdmin.textContent = `✅ ¡Éxito! Dispositivo añadido, pero no se pudo generar el QR.`;
+                }
+                
+                mensajeAdmin.className = 'mensaje mensaje-exito';
+                formProvision.reset(); 
+                planSelect.dispatchEvent(new Event('change')); // Resetea campos dinámicos
+            } catch (error) {
+                mensajeAdmin.textContent = `❌ Error: ${error.message}`;
+                mensajeAdmin.className = 'mensaje mensaje-error';
+            } finally {
+                mensajeAdmin.style.display = 'block';
+                btnSubmit.disabled = false;
+                btnSubmit.textContent = 'Añadir y Descargar QR';
+            }
+        });
+    });
+    </script>
+</body>
+</html>
