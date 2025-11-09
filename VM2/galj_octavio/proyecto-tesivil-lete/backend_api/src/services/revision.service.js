@@ -41,6 +41,7 @@ export const processRevision = async (payload, tecnico) => {
       .from('revisiones')
       .insert({ 
           ...revisionData,
+          tecnico_id: tecnico.id, // ¡AÑADIDO! Asociamos la revisión con el técnico.
           diagnosticos_automaticos: diagnosticos
       })
       .select()
