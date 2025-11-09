@@ -1,0 +1,28 @@
+/* 1. Importa la fuente Inter (como pide el brief) */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
+
+/* 2. Importa la base de Tailwind */
+@import "tailwindcss";
+
+
+
+/* 3. Define tu tema personalizado (Colores del Brief V5.2) */
+@theme {
+  /* Colores personalizados */
+  --color-verde-ahorro: #9BEA00;
+  --color-gris-grafito: #333333;
+  --color-azul-confianza: #007AFF;
+
+  /* Fuente personalizada (como pide el brief) */
+  --font-family-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+/* 4. Ajustes globales adicionales */
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-family-sans);
+  color: var(--color-gris-grafito); /* Aplicamos el color base del brief */
+}
